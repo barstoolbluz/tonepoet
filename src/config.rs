@@ -35,6 +35,58 @@ pub struct TonepoetConfig {
     pub naming: NamingConfig,
     #[serde(default)]
     pub metadata: MetadataConfig,
+    #[serde(default, skip_serializing_if = "ImagesConfig::is_empty")]
+    pub images: ImagesConfig,
+}
+
+/// Native terminal image sizing. This setting describes the *outer* terminal's
+/// character cell, not the tmux pane's (potentially synthesized) PTY metrics.
+/// TODO(config-screen): offer width and height in the future Settings UI.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImagesConfig {
+    /// Optional [width, height] in physical pixels per character cell.
+    /// Omit for automatic detection. A user-supplied value overrides detected
+    /// geometry but never overrides terminal graphics capability checks.
+    #[serde(default, skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_image_cell_size_pixels")]
+    pub cell_size_pixels: Option<[u16; 2]>,
+}
+
+fn valid_image_cell_size(width: u16, height: u16) -> bool {
+    // Match the bounds used by the existing terminal-image geometry probe.
+    (1..=256).contains(&width) && (1..=512).contains(&height)
+}
+
+fn deserialize_image_cell_size_pixels<'de, D>(deserializer: D) -> Result<Option<[u16; 2]>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Deserialize to Vec first: a fixed-size array visitor in some TOML/Serde
+    // versions accepts surplus elements. Do not silently discard a third value.
+    let values = Vec::<u16>::deserialize(deserializer)?;
+    let [width, height]: [u16; 2] = values.try_into().map_err(|_| {
+        serde::de::Error::custom("images.cell_size_pixels must have exactly two integers")
+    })?;
+    if !valid_image_cell_size(width, height) {
+        return Err(serde::de::Error::custom(
+            "images.cell_size_pixels must be [width, height] with width 1..=256 and height 1..=512",
+        ));
+    }
+    Ok(Some([width, height]))
+}
+
+impl ImagesConfig {
+    fn is_empty(&self) -> bool {
+        self.cell_size_pixels.is_none()
+    }
+
+    /// Return only usable geometry, including when a config was constructed
+    /// directly in code rather than deserialized from TOML.
+    pub fn configured_cell_size(&self) -> Option<(u16, u16)> {
+        self.cell_size_pixels.and_then(|[width, height]| {
+            valid_image_cell_size(width, height).then_some((width, height))
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -659,6 +711,7 @@ impl Default for TonepoetConfig {
             file_operations: FileOperationsConfig::default(),
             naming: NamingConfig::default(),
             metadata: MetadataConfig::default(),
+            images: ImagesConfig::default(),
         }
     }
 }
@@ -2380,6 +2433,38 @@ fn require_durable_config_save(outcome: ConfigSaveOutcome) -> anyhow::Result<()>
 #[cfg(test)]
 mod theme_config_tests {
     use super::*;
+
+    #[test]
+    fn image_cell_pixels_roundtrip_and_legacy_default() {
+        let mut config = TonepoetConfig::default();
+        assert_eq!(config.images.configured_cell_size(), None);
+        let legacy = toml::to_string_pretty(&config).expect("serialize default config");
+        assert!(!legacy.contains("[images]"), "absent setting should not expand default config");
+        let decoded: TonepoetConfig = toml::from_str(&legacy).expect("load legacy config");
+        assert_eq!(decoded.images.configured_cell_size(), None);
+
+        config.images.cell_size_pixels = Some([9, 18]);
+        let encoded = toml::to_string_pretty(&config).expect("serialize override");
+        assert!(encoded.contains("[images]"));
+        assert!(encoded.contains("cell_size_pixels"), "serialization must retain the option");
+        let roundtrip: TonepoetConfig = toml::from_str(&encoded).expect("load override");
+        assert_eq!(roundtrip.images.configured_cell_size(), Some((9, 18)));
+        let saved = serialize_public_config(&roundtrip).expect("save config");
+        let restored: TonepoetConfig = toml::from_str(&saved).expect("reload saved config");
+        assert_eq!(restored.images.configured_cell_size(), Some((9, 18)));
+    }
+
+    #[test]
+    fn image_cell_pixels_reject_invalid_configurations() {
+        for size in ["[0, 18]", "[9, 0]", "[257, 18]", "[9, 513]",
+                     "[9]", "[9, 18, 1]", "[]", "[9, 18, 19, 20]", "[-1, 18]", "[\"9\", 18]"] {
+            let source = format!("cell_size_pixels = {size}\n");
+            assert!(toml::from_str::<ImagesConfig>(&source).is_err(),
+                "invalid pixel-cell dimensions must be rejected: {size}");
+        }
+        let invalid = ImagesConfig { cell_size_pixels: Some([0, 18]) };
+        assert_eq!(invalid.configured_cell_size(), None);
+    }
 
     #[test]
     fn aggregate_metadata_target_priority_defaults_and_normalizes_stably() {

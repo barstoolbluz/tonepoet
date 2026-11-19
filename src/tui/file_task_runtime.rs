@@ -811,6 +811,31 @@ impl FileTaskJournalHandle {
         Ok(true)
     }
 
+    /// Consume the supervisor's lease only after `child.wait()` has reaped
+    /// the native extraction helper. A successful journal checkpoint is
+    /// necessary, but not sufficient on its own: the helper could still be
+    /// publishing output when the checkpoint first becomes visible.
+    pub(crate) fn retire_reaped_completed_native_reservation(self) -> Result<(), String> {
+        let record = self.load()?;
+        if !record.is_native_extraction()
+            || record.lifecycle != DurableFileTaskLifecycle::Completed
+            || !record.temp_artifacts.is_empty()
+        {
+            return Err("Native extraction has not completed cleanly".into());
+        }
+        let expected = LeaseFamily::JournalOperation {
+            job_id: uuid::Uuid::parse_str(&record.job_id)
+                .map_err(|error| format!("Invalid completed native job identifier: {error}"))?,
+        };
+        let lease = self.lease.as_ref()
+            .ok_or_else(|| "Completed native supervisor lost its ownership lease".to_owned())?;
+        if lease.family() != &expected || record.lease_descriptor.as_deref() != Some(lease.descriptor_path()) {
+            return Err("Completed native reservation descriptor does not match its supervisor".into());
+        }
+        crate::concurrency::retire_reaped_journal_worker_lease(lease)?;
+        Ok(()) // self is consumed; the journal remains an inspection receipt.
+    }
+
 
     pub fn path(&self) -> &Path {
         &self.path
@@ -3106,6 +3131,71 @@ mod tests {
             &audio,ClaimMode::Write,ClaimScope::Exact,
             PathResolutionSemantics::NamespaceObject).unwrap();
         assert!(writes.iter().any(|claim|claim.conflicts_with(&same_audio)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reaped_completed_native_extraction_frees_all_source_and_output_claims_immediately() {
+        let _lock = test_environment_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let _environment = JournalDirGuard::install(&temp.path().join("journals"));
+        let source = temp.path().join("disc.iso");
+        let dest = temp.path().join("Extracted");
+        fs::write(&source, b"disc fixture").unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        let job = native_reservation_fixture(&source, &dest);
+        let handle = FileTaskJournalHandle::create(
+            uuid::Uuid::new_v4().to_string(), 1, 10, false,
+            tui_file_picker::VerificationMode::Standard, 600,
+            vec![tui_file_picker::PasteMapping { source: source.clone(), destination: dest.clone() }],
+            None, serde_json::json!({"native_extraction": job, "dest": dest.to_string_lossy()}),
+        ).expect("admit native extraction");
+        let record = handle.load().unwrap();
+        assert_eq!(record.path_claims.len(), 3); // source, media, extraction log
+        let descriptor = record.lease_descriptor.clone().unwrap();
+        let shared_fd = unsafe { libc::dup(handle.lease_fd().unwrap()) };
+        assert!(shared_fd >= 0, "worker inherited this exact open-file description");
+        // While the helper is running, none of its output claims can be
+        // concurrently renamed, deleted, or replaced.
+        assert!(crate::concurrency::MutationClaimGuard::acquire_ephemeral(
+            record.path_claims.clone()).is_err());
+        handle.mark_lifecycle(DurableFileTaskLifecycle::Completed, "eight tracks published")
+            .expect("durable terminal checkpoint");
+        // Model the supervisor's post-wait boundary. The extra OFD duplicate
+        // recreates the field's one-shot live-owned retirement failure.
+        handle.retire_reaped_completed_native_reservation()
+            .expect("completed job must retire its exported lease at once");
+        assert!(!descriptor.exists(), "no completed reservation remains on disk");
+        let admitted = crate::concurrency::MutationClaimGuard::acquire_ephemeral(
+            record.path_claims.clone()).expect("all previously held paths must be reusable");
+        drop(admitted);
+        // A late-closing fork-time duplicate cannot resurrect the retired
+        // claim because it shared the explicitly unlocked OFD.
+        unsafe { libc::close(shared_fd); }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_native_extraction_keeps_its_recovery_reservation() {
+        let _lock = test_environment_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let _environment = JournalDirGuard::install(&temp.path().join("journals"));
+        let source = temp.path().join("disc.iso");
+        let dest = temp.path().join("Extracted");
+        fs::write(&source, b"disc fixture").unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        let job = native_reservation_fixture(&source, &dest);
+        let handle = FileTaskJournalHandle::create(
+            uuid::Uuid::new_v4().to_string(), 1, 10, false,
+            tui_file_picker::VerificationMode::Standard, 600,
+            vec![tui_file_picker::PasteMapping { source, destination: dest.clone() }],
+            None, serde_json::json!({"native_extraction": job, "dest": dest.to_string_lossy()}),
+        ).expect("admit native extraction");
+        let descriptor = handle.load().unwrap().lease_descriptor.unwrap();
+        handle.mark_lifecycle(DurableFileTaskLifecycle::AwaitingReconciliation,
+            "interrupted; await recovery").unwrap();
+        assert!(handle.retire_reaped_completed_native_reservation().is_err());
+        assert!(descriptor.exists(), "interrupted work must retain recovery authority");
     }
 
     #[test]

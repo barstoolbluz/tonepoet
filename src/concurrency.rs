@@ -2555,6 +2555,44 @@ pub fn retire_descriptor_after_lifecycle_release(path: &Path, expected_family: &
     Ok(())
 }
 
+/// Retire the exact journal lease still held by a supervisor *after* its
+/// exported worker has exited and a clean terminal checkpoint was verified.
+///
+/// Exporting the supervisor's OFD to a child disables the ordinary final
+/// logical-owner unlock. A concurrently forked process can inherit that OFD
+/// before exec, even after the worker itself has been reaped. Closing the
+/// supervisor's fd and immediately attempting a new lock can therefore leave
+/// a completed operation permanently RecoveryReserved. Under the registry
+/// lock, explicitly unlock this known, finished OFD and unlink its verified
+/// descriptor. No other claimant can enter between those two steps.
+pub(crate) fn retire_reaped_journal_worker_lease(lease: &PersistentLease) -> Result<(), String> {
+    if !matches!(lease.family, LeaseFamily::JournalOperation { .. }) {
+        return Err("Only a completed journal operation can retire its exported lease".into());
+    }
+    let root = coordination_root();
+    create_private_dir(&root)?;
+    let _registry = RegistryLock::acquire(&root)?;
+    let path = &lease.descriptor_path;
+    verify_coordination_path_binding(lease.file.as_ref(), path, "finished journal lease")?;
+    let mut reader = lease.file.try_clone()
+        .map_err(|error| format!("read finished journal lease {}: {error}", path.display()))?;
+    let descriptor = read_descriptor_from(&mut reader, path)?;
+    if descriptor.family != lease.family || descriptor.descriptor_id != lease.descriptor_id {
+        return Err(format!("finished journal lease identity changed: {}", path.display()));
+    }
+    // `read_descriptor_from` and the path-binding check validate the exact
+    // regular file, not merely a matching UUID in a replaced pathname.
+    FileExt::unlock(lease.file.as_ref())
+        .map_err(|error| format!("release finished journal worker lease {}: {error}", path.display()))?;
+    std::fs::remove_file(path)
+        .map_err(|error| format!("retire finished journal lease {}: {error}", path.display()))?;
+    log::info!(
+        "filesystem mutation claim lease retired: family={:?} lifecycle={} descriptor_id={} descriptor_path={:?} claim_count={}",
+        lease.family, lease.family.lifecycle_id(), lease.descriptor_id, path, lease.claims.len(),
+    );
+    Ok(())
+}
+
 fn first_conflict<'a>(requested: &'a [PathClaim], existing: &'a [PathClaim]) -> Option<(&'a PathClaim, &'a PathClaim)> {
     requested.iter().find_map(|left| {
         existing.iter().find_map(|right| left.conflicts_with(right).then_some((left, right)))

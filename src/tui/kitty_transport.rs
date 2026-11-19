@@ -245,3 +245,375 @@ mod tests {
         assert!(compress_kitty_upload(&original).is_none());
     }
 }
+
+// tmux requires DCS passthrough *around each Kitty APC*, not around the whole
+// image cell (which also contains ordinary cursor control and Unicode image
+// placeholders). The latter must reach tmux itself to remain pane-local.
+const TMUX_DCS: &str = "\x1bPtmux;";
+
+/// Wrap raw Kitty upload commands for the tmux server while retaining their
+/// normal Unicode placeholder cells. Every command carries q=2, including
+/// continuations; neither tmux nor the terminal should reply to the TUI.
+/// An unrecognized command is a hard failure, not a raw passthrough attempt.
+pub(super) fn wrap_tmux_kitty_apcs(symbol: &str) -> Result<Option<String>, ()> {
+    if !symbol.contains(APC_START) && !symbol.contains(TMUX_DCS) { return Ok(None); }
+    let bytes = symbol.as_bytes();
+    let mut output = String::with_capacity(symbol.len().saturating_add(128));
+    let mut pos = 0;
+    let mut changed = false;
+    while pos < bytes.len() {
+        let dcs = symbol[pos..].find(TMUX_DCS).map(|offset| pos + offset);
+        let apc = symbol[pos..].find(APC_START).map(|offset| pos + offset);
+        // Already-wrapped commands are left unchanged. Scan escape-doubled
+        // tmux bytes rather than treating the inner APC's ST as a DCS end.
+        if let Some(start) = dcs.filter(|start| apc.is_none_or(|apc| *start < apc)) {
+            output.push_str(&symbol[pos..start]);
+            let end = tmux_dcs_end(symbol, start).ok_or(())?;
+            if !quiet_tmux_kitty_dcs(symbol, start, end) { return Err(()); }
+            output.push_str(&symbol[start..end]);
+            pos = end;
+            continue;
+        }
+        let Some(start) = apc else {
+            output.push_str(&symbol[pos..]);
+            break;
+        };
+        output.push_str(&symbol[pos..start]);
+        let content = &symbol[start + APC_START.len()..];
+        let separator = content.find(';').ok_or(())?;
+        let header = &content[..separator];
+        if header.is_empty() || header.len() > 256 || header.bytes().any(|byte|
+            !matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'=' | b',' | b'-'))
+        {
+            return Err(());
+        }
+        // Only stream uploads (not capability queries, file paths, or shared
+        // memory) are valid here. These are the actions emitted by the pinned
+        // ratatui-image Kitty upload path.
+        if !safe_tmux_kitty_upload_header(header) { return Err(()); }
+        let body = &content[separator + 1..];
+        let end = body.find(APC_END).ok_or(())?;
+        let payload = &body[..end];
+        if payload.len() > 64 * 1024 || !payload.bytes().all(|byte|
+            matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'='))
+        {
+            return Err(());
+        }
+        let mut quiet = false;
+        let mut safe_header = String::with_capacity(header.len() + 4);
+        for part in header.split(',') {
+            if part.is_empty() { return Err(()); }
+            if part.starts_with("q=") {
+                if quiet { return Err(()); }
+                quiet = true;
+                if !safe_header.is_empty() { safe_header.push(','); }
+                safe_header.push_str("q=2");
+            } else {
+                if !safe_header.is_empty() { safe_header.push(','); }
+                safe_header.push_str(part);
+            }
+        }
+        if !quiet { safe_header.push_str(",q=2"); }
+        let mut raw_apc = String::with_capacity(safe_header.len() + payload.len() + 8);
+        raw_apc.push_str(APC_START);
+        raw_apc.push_str(&safe_header);
+        raw_apc.push(';');
+        raw_apc.push_str(payload);
+        raw_apc.push_str(APC_END);
+        output.push_str(TMUX_DCS);
+        for character in raw_apc.chars() {
+            if character == '\x1b' { output.push('\x1b'); }
+            output.push(character);
+        }
+        output.push_str(APC_END);
+        pos = start + APC_START.len() + separator + 1 + end + APC_END.len();
+        changed = true;
+    }
+    Ok(changed.then_some(output))
+}
+
+fn tmux_dcs_end(symbol: &str, start: usize) -> Option<usize> {
+    let bytes = symbol.as_bytes();
+    let mut pos = start + TMUX_DCS.len();
+    while pos < bytes.len() {
+        if bytes[pos] == 0x1b {
+            match *bytes.get(pos + 1)? {
+                0x1b => { pos += 2; continue; }
+                b'\\' => return Some(pos + 2),
+                _ => return None,
+            }
+        }
+        pos += 1;
+    }
+    None
+}
+
+fn safe_tmux_kitty_upload_header(header: &str) -> bool {
+    if parameter(header, "t").is_some_and(|transport| transport != "d") {
+        return false; // file/shm paths are not available over SSH
+    }
+    match parameter(header, "a") {
+        Some("T" | "t") => true,
+        None => parameter(header, "m").is_some(), // continuation chunk
+        _ => false,
+    }
+}
+
+/// A pinned image crate may itself wrap Kitty commands when TMUX is set.
+/// Never trust that opaque DCS blindly: validate that it holds one quiet,
+/// direct stream upload, without a reply-producing capability query.
+fn quiet_tmux_kitty_dcs(symbol: &str, start: usize, end: usize) -> bool {
+    let bytes = symbol.as_bytes();
+    let interior = &bytes[start + TMUX_DCS.len()..end - APC_END.len()];
+    if interior.len() > 64 * 1024 + 512 { return false; }
+    let mut raw = Vec::with_capacity(interior.len());
+    let mut pos = 0;
+    while pos < interior.len() {
+        if interior[pos] == 0x1b {
+            if interior.get(pos + 1) != Some(&0x1b) { return false; }
+            pos += 2;
+            raw.push(0x1b);
+        } else {
+            raw.push(interior[pos]);
+            pos += 1;
+        }
+    }
+    let Ok(apc) = std::str::from_utf8(&raw) else { return false; };
+    let Some(command) = apc.strip_prefix(APC_START).and_then(|part| part.strip_suffix(APC_END))
+    else { return false; };
+    let Some((header, payload)) = command.split_once(';') else { return false; };
+    safe_tmux_kitty_upload_header(header)
+        && header.split(',').filter(|part| part.starts_with("q=")).eq(["q=2"])
+        && payload.len() <= 64 * 1024
+        && payload.bytes().all(|byte| matches!(byte,
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'='))
+}
+
+/// Only a fresh graphics upload needs a forwarding check. Ordinary redraws
+/// may contain Unicode placeholders but no Kitty APC; do not spawn tmux for
+/// those frames. Check before wrapping to avoid committing a one-shot upload
+/// to a hidden pane with allow-passthrough=on.
+pub(super) fn buffer_has_kitty_upload(buffer: &ratatui::buffer::Buffer) -> bool {
+    buffer.content.iter().any(|cell|
+        cell.symbol().contains(APC_START) || cell.symbol().contains(TMUX_DCS))
+}
+
+/// Called only when tmux capability was established. Every protocol-producing
+/// widget, including Browse, metadata previews, and file-picker images, uses
+/// this one final-buffer transport before ratatui sends output to the pane.
+pub(super) fn wrap_tmux_kitty_buffer(buffer: &mut ratatui::buffer::Buffer) -> Result<(), ()> {
+    for cell in &mut buffer.content {
+        match wrap_tmux_kitty_apcs(cell.symbol()) {
+            Ok(Some(wrapped)) => { cell.set_symbol(&wrapped); },
+            Ok(None) => {},
+            Err(()) => return Err(()),
+        };
+    }
+    Ok(())
+}
+
+
+// Sixel transport is implemented in sixel_tmux. Every passthrough there
+// contains one complete Sixel command; a Sixel DCS must not cross packets.
+const SIXEL_DCS: &str = "\x1bP";
+
+/// A Sixel payload is repeated on ordinary widget redraws. Fingerprint each
+/// image *individually* at its buffer origin: a newly opened viewer must not
+/// invalidate an unchanged Info image sharing the same frame. No image data
+/// is copied, and the work is proportional to the emitted payload bytes.
+fn sixel_command_identity(index: usize, symbol: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    index.hash(&mut hasher);
+    symbol.hash(&mut hasher);
+    hasher.finish()
+}
+
+pub(super) fn sixel_upload_identities(buffer: &ratatui::buffer::Buffer) -> Vec<u64> {
+    buffer.content.iter().enumerate()
+        .filter(|(_, cell)| cell.symbol().contains(SIXEL_DCS))
+        .map(|(index, cell)| sixel_command_identity(index, cell.symbol()))
+        .collect()
+}
+
+/// While a new Sixel image awaits a forwarding check, retain any previously
+/// verified images in this frame. The caller still wraps the surviving
+/// commands for tmux. Only the transient buffer changes, not image caches.
+pub(super) fn suppress_unverified_tmux_sixel_uploads(
+    buffer: &mut ratatui::buffer::Buffer,
+    verified: &[u64],
+) {
+    for (index, cell) in buffer.content.iter_mut().enumerate() {
+        if cell.symbol().contains(SIXEL_DCS)
+            && !verified.contains(&sixel_command_identity(index, cell.symbol()))
+        {
+            cell.set_symbol(" ");
+        }
+    }
+}
+
+/// Never send an unverified native image or Kitty placeholder to tmux. This
+/// affects only the transient frame, not the protocol picker/cache: once the
+/// worker replies, a single cache rebuild can perform the real upload.
+pub(super) fn suppress_unverified_tmux_graphics(buffer: &mut ratatui::buffer::Buffer) {
+    for cell in &mut buffer.content {
+        let symbol = cell.symbol();
+        if symbol.contains(SIXEL_DCS) || symbol.contains(APC_START)
+            || symbol.contains(TMUX_DCS) || symbol.contains('\u{10eeee}')
+        {
+            cell.set_symbol(" ");
+        }
+    }
+}
+
+/// All native-Sixel surfaces use the same final-buffer transport.
+pub(super) fn wrap_tmux_sixel_buffer(
+    buffer: &mut ratatui::buffer::Buffer,
+    font: (u16, u16),
+) -> Result<(), ()> {
+    super::sixel_tmux::wrap_buffer(buffer, font)
+}
+#[cfg(test)]
+mod tmux_tests {
+    use super::*;
+
+    #[test]
+    fn sixel_identity_changes_only_with_payload_or_placement() {
+        use ratatui::{buffer::Buffer, layout::Rect};
+        let mut buf = Buffer::empty(Rect::new(0, 0, 3, 1));
+        buf.get_mut(0, 0).set_symbol("\x1bPq#0~\x1b\\");
+        let first = sixel_upload_identities(&buf);
+        assert_eq!(first.len(), 1);
+        buf.get_mut(2, 0).set_symbol("new status text");
+        assert_eq!(sixel_upload_identities(&buf), first,
+            "ordinary text redraws do not invalidate an image upload");
+        buf.get_mut(0, 0).set_symbol("\x1bPq#1~\x1b\\");
+        let different = sixel_upload_identities(&buf);
+        assert_ne!(different, first);
+        buf.get_mut(0, 0).set_symbol(" ");
+        buf.get_mut(1, 0).set_symbol("\x1bPq#0~\x1b\\");
+        assert_ne!(sixel_upload_identities(&buf), first,
+            "moving the origin requires another forwarding check");
+    }
+
+    #[test]
+    fn second_sixel_image_waits_without_hiding_or_rechecking_the_first() {
+        use ratatui::{buffer::Buffer, layout::Rect};
+        let first = "\x1bPq#0~\x1b\\";
+        let second = "\x1bPq#1~\x1b\\";
+        let mut buf = Buffer::empty(Rect::new(0, 0, 5, 1));
+        buf.get_mut(0, 0).set_symbol(first);
+        buf.get_mut(1, 0).set_symbol("status");
+        buf.get_mut(3, 0).set_symbol(second);
+        let identities = sixel_upload_identities(&buf);
+        assert_eq!(identities.len(), 2);
+
+        // Only the Info preview was in the previous verified frame. Withhold
+        // the viewer while an async inspection runs, preserving Info and UI.
+        let mut pending = buf.clone();
+        suppress_unverified_tmux_sixel_uploads(&mut pending, &identities[..1]);
+        assert_eq!(pending.get(0, 0).symbol(), first);
+        assert_eq!(pending.get(1, 0).symbol(), "status");
+        assert_eq!(pending.get(3, 0).symbol(), " ");
+        wrap_tmux_sixel_buffer(&mut pending, (10, 20)).unwrap();
+        assert!(pending.get(0, 0).symbol().contains(TMUX_DCS));
+        assert!(!pending.get(3, 0).symbol().contains(SIXEL_DCS));
+
+        // The Sixel cache can be rendered again after the worker replies;
+        // neither command requires a new picker or a new decode. Once both
+        // are verified, ordinary redrawing creates no new preflight request.
+        assert_eq!(sixel_upload_identities(&buf), identities);
+        suppress_unverified_tmux_sixel_uploads(&mut buf, &identities);
+        assert_eq!(buf.get(0, 0).symbol(), first);
+        assert_eq!(buf.get(3, 0).symbol(), second);
+        wrap_tmux_sixel_buffer(&mut buf, (10, 20)).unwrap();
+        assert!(buf.get(0, 0).symbol().contains(TMUX_DCS));
+        assert!(buf.get(3, 0).symbol().contains(TMUX_DCS));
+    }
+
+    #[test]
+    fn an_unverified_image_is_suppressed_without_erasing_other_ui() {
+        use ratatui::{buffer::Buffer, layout::Rect};
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 1));
+        buf.get_mut(0, 0).set_symbol("\x1bPq#0~\x1b\\");
+        buf.get_mut(1, 0).set_symbol("\x1b_Ga=T,q=2,m=0;QUJD\x1b\\");
+        buf.get_mut(2, 0).set_symbol("\u{10eeee}");
+        buf.get_mut(3, 0).set_symbol("status");
+        suppress_unverified_tmux_graphics(&mut buf);
+        for x in 0..3 { assert_eq!(buf.get(x, 0).symbol(), " "); }
+        assert_eq!(buf.get(3, 0).symbol(), "status");
+        suppress_unverified_tmux_graphics(&mut buf);
+        assert_eq!(buf.get(3, 0).symbol(), "status");
+    }
+
+    #[test]
+    fn sixel_is_wrapped_without_hiding_tmux_owned_cursor_commands() {
+        use ratatui::{buffer::Buffer, layout::Rect};
+        let mut buf = Buffer::empty(Rect::new(0, 0, 1, 1));
+        buf.get_mut(0,0).set_symbol("\x1b[2K\x1bPq#0;2;100;0;0~\x1b\\");
+        assert!(!sixel_upload_identities(&buf).is_empty());
+        wrap_tmux_sixel_buffer(&mut buf, (10, 20)).unwrap();
+        let symbol = buf.get(0,0).symbol();
+        assert!(symbol.starts_with("\x1b[2K\x1bPtmux;"));
+        assert!(symbol.ends_with("\x1b\x1b\\\x1b\\"));
+    }
+
+    #[test]
+    fn prewrapped_sixel_is_not_double_wrapped() {
+        use ratatui::{buffer::Buffer, layout::Rect};
+        let mut buf = Buffer::empty(Rect::new(0, 0, 1, 1));
+        let symbol = "\x1bPtmux;\x1b\x1b[2K\x1b\x1bPq#0~\x1b\x1b\\\x1b\\";
+        buf.get_mut(0,0).set_symbol(symbol);
+        wrap_tmux_sixel_buffer(&mut buf, (10, 20)).unwrap();
+        assert_eq!(buf.get(0,0).symbol(), symbol);
+        buf.get_mut(0,0).set_symbol("\x1bPnot-sixel\x1b\\");
+        assert!(wrap_tmux_sixel_buffer(&mut buf, (10, 20)).is_err());
+    }
+
+    #[test]
+    fn wraps_every_chunk_while_retaining_placeholders_and_silencing_replies() {
+        let input = "\x1b[0m\x1b_Ga=T,f=24,i=7,q=1,m=1;QUJD\x1b\\\x1b_Gi=7,m=0;REVG\x1b\\\u{10eeee}rest";
+        let wrapped = wrap_tmux_kitty_apcs(input).unwrap().unwrap();
+        assert_eq!(wrapped.matches(TMUX_DCS).count(), 2);
+        assert_eq!(wrapped.matches("q=2").count(), 2);
+        assert!(wrapped.starts_with("\x1b[0m"));
+        assert!(wrapped.ends_with("\u{10eeee}rest"));
+        assert!(wrapped.contains("\x1bPtmux;\x1b\x1b_Ga=T"));
+        assert!(wrapped.contains("\x1b\x1b\\\x1b\\"));
+        assert!(wrap_tmux_kitty_apcs(&wrapped).unwrap().is_none(),
+            "a second transport pass must not double-wrap APCs");
+        let unsafe_wrapped = wrapped.replacen("q=2", "q=1", 1);
+        assert!(wrap_tmux_kitty_apcs(&unsafe_wrapped).is_err(),
+            "already-wrapped commands must still suppress terminal replies");
+    }
+
+    #[test]
+    fn forwarding_check_is_only_needed_for_a_first_upload_not_placeholders() {
+        use ratatui::{buffer::Buffer, layout::Rect};
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 2, 1));
+        buffer.get_mut(0, 0).set_symbol("\u{10eeee}");
+        assert!(!buffer_has_kitty_upload(&buffer),
+            "a normal redraw must not recheck tmux or retransmit an image");
+
+        buffer.get_mut(1, 0).set_symbol("\x1b_Ga=T,q=2,m=0;QUJD\x1b\\");
+        assert!(buffer_has_kitty_upload(&buffer),
+            "a new one-shot upload needs a fresh forwarding check");
+        buffer.get_mut(1, 0).set_symbol("\x1bPtmux;\x1b\x1b_Ga=T,q=2,m=0;QUJD\x1b\x1b\\\x1b\\");
+        assert!(buffer_has_kitty_upload(&buffer),
+            "already-wrapped Kitty streams need the same forwarding check");
+    }
+
+    #[test]
+    fn malformed_kitty_commands_never_pass_through_raw() {
+        for command in [
+            "\x1b_Ga=T,q=1,q=0;QUJD\x1b\\",
+            "\x1b_Ga=T;QUJD",
+            "\x1b_Ga=T;ABC\x1b[31m\x1b\\",
+            "\x1b_Ga=T;ABC!!\x1b\\",
+            "\x1b_G;AAA\x1b\\",
+        ] {
+            assert!(wrap_tmux_kitty_apcs(command).is_err(), "{command:?}");
+        }
+        assert!(wrap_tmux_kitty_apcs("normal text\u{10eeee}").unwrap().is_none());
+    }
+}

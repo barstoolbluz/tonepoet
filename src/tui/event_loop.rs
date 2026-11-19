@@ -31,11 +31,8 @@ const MAX_INPUT_EVENTS_PER_BATCH: usize = 256;
 // is inexpensive compared with image encoding or terminal writes.
 const SLOW_UI_STAGE_WARNING: Duration = Duration::from_millis(200);
 const DEAD_QUEUE_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
-// Timed app maintenance (status expiry, queue recovery, browse debounce) must
-// still run when no input arrives. Rendering a full terminal buffer on every
-// such timeout is unnecessary; a slow heartbeat covers changes that have no
-// explicit message or state-change signal.
-const IDLE_REDRAW_INTERVAL: Duration = Duration::from_secs(5);
+// Timed maintenance still runs when no input arrives. Only real state changes
+// request a draw; an idle tick must not resend Sixel or clear the terminal.
 
 /// Only the chosen real child is eligible for automatic recursive accounting.
 /// In Browse Info, `..` refers to current_dir but never authorizes recursion.
@@ -76,9 +73,8 @@ fn should_draw_frame(
     requested: bool,
     visible_state_changed: bool,
     force_redraw: bool,
-    since_last_draw: Duration,
 ) -> bool {
-    requested || visible_state_changed || force_redraw || since_last_draw >= IDLE_REDRAW_INTERVAL
+    requested || visible_state_changed || force_redraw
 }
 
 /// A native image's one-shot background repair must render without waiting for
@@ -105,17 +101,13 @@ mod idle_redraw_tests {
 
     #[test]
     fn inactive_timeout_skips_draw_but_events_and_progress_draw_immediately() {
-        assert!(!should_draw_frame(false, false, false, Duration::from_millis(100)));
-        assert!(should_draw_frame(true, false, false, Duration::ZERO));
-        assert!(should_draw_frame(false, true, false, Duration::ZERO));
-        assert!(should_draw_frame(false, false, true, Duration::ZERO));
-        assert!(!should_draw_frame(
-            false,
-            false,
-            false,
-            IDLE_REDRAW_INTERVAL - Duration::from_millis(1)
-        ));
-        assert!(should_draw_frame(false, false, false, IDLE_REDRAW_INTERVAL));
+        assert!(!should_draw_frame(false, false, false));
+        assert!(should_draw_frame(true, false, false));
+        assert!(should_draw_frame(false, true, false));
+        assert!(should_draw_frame(false, false, true));
+        // Idle time alone must never repaint a still native image. Status,
+        // progress, input, and a newly prepared preview remain event-driven.
+        assert!(!should_draw_frame(false, false, false));
     }
 }
 
@@ -360,7 +352,6 @@ pub async fn run_app(
     let mut last_recovery_progress = Instant::now();
     let mut last_dead_queue_recovery_attempt = Instant::now();
     let mut redraw_requested = true;
-    let mut last_draw = Instant::now();
     let mut has_drawn_frame = false;
 
     loop {
@@ -517,7 +508,11 @@ pub async fn run_app(
         // prepares protocols after genuine source/geometry changes. Mouse
         // movement cannot invalidate the cached native graphics protocol.
         // Post-draw prepare remains necessary for geometry first seen here.
-        let image_changed = timed_prepare_image_preview_protocols(app);
+        // Consume worker observations without blocking drawing. Unlike the
+        // previous three-second check, no process is spawned on an idle tick.
+        let tmux_capabilities_changed = app.poll_tmux_image_refresh();
+        let preview_changed = timed_prepare_image_preview_protocols(app);
+        let image_changed = preview_changed || tmux_capabilities_changed;
         // `force_redraw` means the terminal diff buffer is suspected to be
         // invalid and a full clear is required before drawing. Ordinary async
         // reducer progress must not set it: the loop below uses a zero-timeout
@@ -532,7 +527,6 @@ pub async fn run_app(
                 || app.current_screen != previous_screen
                 || std::mem::discriminant(&app.active_overlay) != previous_overlay,
             app.force_redraw,
-            last_draw.elapsed(),
         ) {
             if app.force_redraw {
                 terminal.clear()?;
@@ -542,7 +536,6 @@ pub async fn run_app(
             terminal.draw(|f| draw_ui(f, app))?;
             warn_if_slow_ui_stage("terminal.draw", draw_started.elapsed());
             has_drawn_frame = true;
-            last_draw = Instant::now();
             redraw_requested = false;
         }
         // Geometry discovered by this draw may complete a preview protocol.
@@ -696,6 +689,12 @@ fn dispatch_terminal_input(app: &mut AppState, input: Event, tx: &mpsc::Sender<A
             && matches!(app.active_overlay, ActiveOverlay::None)
     ) {
         return false;
+    }
+    // User input (including focus gain and resize) is a natural, bounded
+    // trigger to notice tmux attachment changes. The inspection runs on a
+    // worker; passive mouse movement does not create processes.
+    if !matches!(&input, Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved)) {
+        app.request_tmux_image_refresh(false);
     }
     match input {
         Event::Key(key) => handle_key(app, key, tx),

@@ -16242,6 +16242,23 @@ pub struct AppState {
     pub queried_image_cell_size: Option<(u16, u16)>,
     /// Terminal image protocol picker detected once at startup and refreshed on resize.
     pub image_picker: ratatui_image::picker::Picker,
+    /// Attached-client capabilities proved by tmux's control plane, not TERM.
+    tmux_image_support: Option<super::tmux_images::ImageSupport>,
+    /// At most one bounded tmux inquiry runs on a worker. The UI only tries
+    /// this receiver; drawing, input, and startup never run tmux commands.
+    tmux_image_check_rx: Option<mpsc::Receiver<Option<super::tmux_images::ImageSupport>>>,
+    tmux_image_last_check_started: Option<std::time::Instant>,
+    tmux_image_recheck_after_pending: bool,
+    /// A first upload deferred pending fresh forwarding evidence must be
+    /// regenerated on worker completion (Kitty's send is one-shot).
+    tmux_image_retry_upload: bool,
+    tmux_image_upload_preflight: bool,
+    /// Sixel is emitted on each render. Track the verified image commands at
+    /// their individual buffer origins: adding a viewer must not revoke the
+    /// Info image's proof just because the frame now contains two images.
+    tmux_verified_sixel_uploads: Vec<u64>,
+    /// Malformed native output disables native tmux images until restart.
+    tmux_image_transport_fault: bool,
     /// Monotonic generation for terminal image protocol/cell-size changes.
     pub image_picker_generation: usize,
     /// Render-only image repaint generation for auxiliary preview widgets.
@@ -16255,32 +16272,89 @@ pub struct AppState {
     pub tool_check_cache: once_cell::sync::OnceCell<Vec<(String, String, bool)>>,
 }
 
+/// A just-inspected pane authorizes the deferred upload. Once a Sixel command
+/// was verified, its unchanged payload and origin may redraw without
+/// rechecking, even when another image joins the same frame.
+fn tmux_native_upload_needs_preflight(
+    protocol: super::tmux_images::NativeProtocol,
+    fresh_proof: bool,
+    verified_sixel: &[u64],
+    current_sixel: &[u64],
+) -> bool {
+    if fresh_proof { return false; }
+    match protocol {
+        super::tmux_images::NativeProtocol::Kitty => true,
+        super::tmux_images::NativeProtocol::Sixel =>
+            current_sixel.is_empty() || current_sixel.iter().any(|id| !verified_sixel.contains(id)),
+    }
+}
+
+/// The Sixel renderer can re-emit a withheld command from its existing cache.
+/// Kitty's one-shot transmission state, by contrast, must be rebuilt after a
+/// deferred upload. A real capability change invalidates both protocols.
+fn tmux_inspection_needs_picker_rebuild(
+    changed: bool,
+    retry_upload: bool,
+    protocol: Option<super::tmux_images::NativeProtocol>,
+) -> bool {
+    changed || (retry_upload && protocol == Some(super::tmux_images::NativeProtocol::Kitty))
+}
+
+/// A session override takes precedence over persistent settings. Both only
+/// supply geometry; neither changes the all-clients capability decision.
+fn preferred_image_cell_size_override(
+    environment: Option<(u16, u16)>,
+    config: Option<(u16, u16)>,
+) -> Option<(u16, u16)> {
+    environment.or(config)
+}
+
+/// The tmux pane's PTY and window size may both carry tmux's synthesized
+/// 16x32 default when the SSH client reports 0x0. Neither proves the outer
+/// emulator's font. Only measured client metrics or an explicit setting
+/// authorize native raster placement.
+fn trusted_tmux_picker_cell_size(
+    configured: Option<(u16, u16)>,
+    tmux_support: Option<&super::tmux_images::ImageSupport>,
+) -> Option<(u16, u16)> {
+    configured.or_else(|| tmux_support.and_then(|support| support.observed_cell_size()))
+}
+
 fn new_terminal_image_picker(
     queried_cell_size: Option<(u16, u16)>,
+    tmux_support: Option<&super::tmux_images::ImageSupport>,
+    config_cell_size: Option<(u16, u16)>,
 ) -> ratatui_image::picker::Picker {
     use ratatui_image::picker::{Picker, ProtocolType};
 
-    // A user's explicit setting overrides both ioctl and the escape-sequence
-    // query. Otherwise prefer live ioctl dimensions (which can change with a
-    // font resize), then the last terminal response over SSH.
-    let configured = super::terminal_image_geometry::configured_cell_size();
-    let termios = Picker::from_termios().ok().filter(|picker| {
+    // Never query the terminal through tmux. In particular, do not accept
+    // from_termios() in the inner PTY as independent evidence: tmux may have
+    // populated its TIOCGWINSZ pixels from the same unverified window default.
+    let configured = preferred_image_cell_size_override(
+        super::terminal_image_geometry::configured_cell_size(), config_cell_size,
+    );
+    let in_tmux = tmux_like_current_environment();
+    let (mut picker, reliable_metrics) = if in_tmux {
+        match trusted_tmux_picker_cell_size(configured, tmux_support) {
+            Some(size) => (Picker::new(size), true),
+            None => (Picker::new((10, 20)), false), // Halfblocks do not need pixels.
+        }
+    } else if let Some(size) = configured {
+        (Picker::new(size), true)
+    } else if let Some(picker) = Picker::from_termios().ok().filter(|picker| {
         picker.font_size.0 > 0 && picker.font_size.1 > 0
-    });
-    let reliable_metrics = configured.is_some() || termios.is_some() || queried_cell_size.is_some();
-    let mut picker = if let Some(size) = configured {
-        Picker::new(size)
-    } else if let Some(picker) = termios {
-        picker
+    }) {
+        (picker, true)
     } else if let Some(size) = queried_cell_size {
-        Picker::new(size)
+        (Picker::new(size), true)
     } else {
-        // With no measured cell size, pixel-based protocols cannot map
-        // images to terminal cells safely. Halfblocks are cell-based and
-        // need only a plausible pixel aspect ratio (1:2, not 8:12).
-        Picker::new((10, 20))
+        (Picker::new((10, 20)), false)
     };
-    configure_terminal_image_picker_protocol_for_current_environment(&mut picker);
+    configure_terminal_image_picker_protocol(&mut picker,
+        terminal_image_protocol_probe_decision_for_current_environment_with_support(
+            tmux_support.filter(|_| reliable_metrics).map(|support| support.protocol),
+        ),
+    );
     if !reliable_metrics {
         picker.protocol_type = ProtocolType::Halfblocks;
     }
@@ -16290,12 +16364,16 @@ fn new_terminal_image_picker(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalImageProtocolProbeDecision {
     ForceHalfblocks,
+    ForceKitty,
+    ForceSixel,
     GuessProtocol,
 }
 
 trait TerminalImagePickerProtocolProbe {
     fn protocol_type(&self) -> ratatui_image::picker::ProtocolType;
     fn force_halfblocks_protocol(&mut self);
+    fn force_kitty_protocol(&mut self);
+    fn force_sixel_protocol(&mut self);
     fn guess_terminal_protocol(&mut self);
 }
 
@@ -16308,19 +16386,17 @@ impl TerminalImagePickerProtocolProbe for ratatui_image::picker::Picker {
         self.protocol_type = ratatui_image::picker::ProtocolType::Halfblocks;
     }
 
+    fn force_kitty_protocol(&mut self) {
+        self.protocol_type = ratatui_image::picker::ProtocolType::Kitty;
+    }
+
+    fn force_sixel_protocol(&mut self) {
+        self.protocol_type = ratatui_image::picker::ProtocolType::Sixel;
+    }
+
     fn guess_terminal_protocol(&mut self) {
         ratatui_image::picker::Picker::guess_protocol(self);
     }
-}
-
-fn configure_terminal_image_picker_protocol_for_current_environment<P>(picker: &mut P)
-where
-    P: TerminalImagePickerProtocolProbe,
-{
-    configure_terminal_image_picker_protocol(
-        picker,
-        terminal_image_protocol_probe_decision_for_current_environment(),
-    );
 }
 
 fn configure_terminal_image_picker_protocol<P>(
@@ -16332,18 +16408,37 @@ where
 {
     match decision {
         TerminalImageProtocolProbeDecision::ForceHalfblocks => picker.force_halfblocks_protocol(),
+        TerminalImageProtocolProbeDecision::ForceKitty => picker.force_kitty_protocol(),
+        TerminalImageProtocolProbeDecision::ForceSixel => picker.force_sixel_protocol(),
         TerminalImageProtocolProbeDecision::GuessProtocol => picker.guess_terminal_protocol(),
     }
 }
 
-fn terminal_image_protocol_probe_decision_for_current_environment(
+fn terminal_image_protocol_probe_decision_for_current_environment_with_support(
+    tmux_protocol: Option<super::tmux_images::NativeProtocol>,
 ) -> TerminalImageProtocolProbeDecision {
-    terminal_image_protocol_probe_decision_for_environment(
+    if std::env::var("TONEPOET_IMAGE_PROTOCOL").ok()
+        .is_some_and(|protocol| protocol.eq_ignore_ascii_case("halfblocks"))
+    {
+        return TerminalImageProtocolProbeDecision::ForceHalfblocks;
+    }
+    let decision = terminal_image_protocol_probe_decision_for_environment(
         std::env::var_os("TMUX").as_deref(),
         std::env::var_os("TERM_PROGRAM").as_deref(),
         std::env::var_os("TERM").as_deref(),
         std::env::var_os("BYOBU_BACKEND").as_deref(),
-    )
+    );
+    if decision == TerminalImageProtocolProbeDecision::ForceHalfblocks {
+        match tmux_protocol {
+            Some(super::tmux_images::NativeProtocol::Kitty) =>
+                TerminalImageProtocolProbeDecision::ForceKitty,
+            Some(super::tmux_images::NativeProtocol::Sixel) =>
+                TerminalImageProtocolProbeDecision::ForceSixel,
+            None => decision,
+        }
+    } else {
+        decision
+    }
 }
 
 fn terminal_image_protocol_probe_decision_for_environment(
@@ -16359,16 +16454,6 @@ fn terminal_image_protocol_probe_decision_for_environment(
     }
 }
 
-fn enforce_safe_terminal_image_picker_protocol_for_current_environment<P>(picker: &mut P) -> bool
-where
-    P: TerminalImagePickerProtocolProbe,
-{
-    enforce_safe_terminal_image_picker_protocol(
-        picker,
-        terminal_image_protocol_probe_decision_for_current_environment(),
-    )
-}
-
 fn enforce_safe_terminal_image_picker_protocol<P>(
     picker: &mut P,
     decision: TerminalImageProtocolProbeDecision,
@@ -16381,9 +16466,17 @@ where
     {
         return false;
     }
-
     picker.force_halfblocks_protocol();
     true
+}
+
+fn tmux_like_current_environment() -> bool {
+    tmux_like_environment(
+        std::env::var_os("TMUX").as_deref(),
+        std::env::var_os("TERM_PROGRAM").as_deref(),
+        std::env::var_os("TERM").as_deref(),
+        std::env::var_os("BYOBU_BACKEND").as_deref(),
+    )
 }
 
 fn tmux_like_environment(
@@ -17079,6 +17172,7 @@ impl AppState {
         let directory_accounting = crate::directory_accounting::AccountingService::new(
             db.accounting_database_path(),
         );
+        let config_image_cell_size = config.images.configured_cell_size();
         Self {
             config,
             theme,
@@ -17208,7 +17302,15 @@ impl AppState {
             split_cue_album_grouping_cache: std::collections::HashMap::new(),
             last_artwork_picker_dir: None,
             queried_image_cell_size: None,
-            image_picker: new_terminal_image_picker(None),
+            image_picker: new_terminal_image_picker(None, None, config_image_cell_size),
+            tmux_image_support: None,
+            tmux_image_check_rx: None,
+            tmux_image_last_check_started: None,
+            tmux_image_recheck_after_pending: false,
+            tmux_image_retry_upload: false,
+            tmux_image_upload_preflight: false,
+            tmux_verified_sixel_uploads: Vec::new(),
+            tmux_image_transport_fault: false,
             image_picker_generation: 0,
             image_repaint_generation: 0,
             image_kitty_retransmit_generation: 0,
@@ -17778,7 +17880,12 @@ impl AppState {
     /// and before crossterm's input event reader starts. A bounded XTWINOPS
     /// query gets actual cell pixels even when the SSH PTY reports 0 x 0.
     pub fn probe_image_cell_size_at_tui_startup(&mut self) {
-        if super::terminal_image_geometry::configured_cell_size().is_none()
+        // Do not send XTWINOPS or any protocol query through tmux/byobu.
+        if !tmux_like_current_environment()
+            && preferred_image_cell_size_override(
+                super::terminal_image_geometry::configured_cell_size(),
+                self.config.images.configured_cell_size(),
+            ).is_none()
             && !ratatui_image::picker::Picker::from_termios()
                 .is_ok_and(|picker| picker.font_size.0 > 0 && picker.font_size.1 > 0)
         {
@@ -17797,12 +17904,192 @@ impl AppState {
     /// StatefulProtocol values after the terminal size/cell metrics change.
     /// Do not query stdin here: crossterm already owns the event reader.
     pub fn refresh_image_picker_after_resize(&mut self) {
-        self.image_picker = new_terminal_image_picker(self.queried_image_cell_size);
-        self.image_picker_generation = self.image_picker_generation.saturating_add(1);
+        // New geometry needs new evidence. A worker observes tmux; the UI
+        // immediately renders halfblocks rather than using stale placement.
+        if tmux_like_current_environment() {
+            self.tmux_image_support = None;
+            self.tmux_image_upload_preflight = false;
+            self.tmux_verified_sixel_uploads.clear();
+            self.request_tmux_image_refresh(true);
+        }
+        self.rebuild_terminal_image_picker();
+        // A real terminal resize invalidates the screen layout even when the
+        // graphics protocol itself remains unchanged. This does not occur on
+        // ordinary tmux capability observations or image-upload retries.
+        self.force_redraw = true;
+    }
 
+    /// Initiate a bounded control-plane inspection on a worker. Called on
+    /// startup, resize, real input, and image changes; never on an idle timer.
+    /// The ordinary input path is debounced to avoid mouse-event process
+    /// bursts. The task is single-flight, with a retry for forced changes.
+    pub(super) fn request_tmux_image_refresh(&mut self, force: bool) {
+        if !tmux_like_current_environment() || self.tmux_image_transport_fault ||
+            std::env::var("TONEPOET_IMAGE_PROTOCOL").ok()
+                .is_some_and(|value| value.eq_ignore_ascii_case("halfblocks"))
+        {
+            return;
+        }
+        if self.tmux_image_check_rx.is_some() {
+            if force { self.tmux_image_recheck_after_pending = true; }
+            return;
+        }
+        if !force && self.tmux_image_last_check_started.is_some_and(|checked|
+            checked.elapsed() < std::time::Duration::from_secs(2))
+        {
+            return;
+        }
+        let (tx, rx) = mpsc::sync_channel(1);
+        if thread::Builder::new().name("tmux-image-inspect".into()).spawn(move || {
+            let _ = tx.send(super::tmux_images::inspect());
+        }).is_ok() {
+            self.tmux_image_last_check_started = Some(std::time::Instant::now());
+            self.tmux_image_check_rx = Some(rx);
+        }
+    }
+
+    /// Nonblocking reduction of the single in-flight tmux control-plane query.
+    /// A completed proof is consumed by the next native upload; preparing the
+    /// corresponding protocol cache does not itself invalidate that proof.
+    pub(super) fn poll_tmux_image_refresh(&mut self) -> bool {
+        let observation = match self.tmux_image_check_rx.as_ref() {
+            Some(rx) => match rx.try_recv() {
+                Ok(support) => support,
+                Err(mpsc::TryRecvError::Empty) => return false,
+                Err(mpsc::TryRecvError::Disconnected) => None,
+            },
+            None => return false,
+        };
+        self.tmux_image_check_rx = None;
+        if self.tmux_image_recheck_after_pending {
+            self.tmux_image_recheck_after_pending = false;
+            self.request_tmux_image_refresh(true);
+            if self.tmux_image_check_rx.is_none() {
+                self.disable_failed_tmux_image_transport();
+                return true;
+            }
+            return false;
+        }
+        let changed = self.tmux_image_support != observation;
+        if changed { self.tmux_verified_sixel_uploads.clear(); }
+        self.tmux_image_support = observation;
+        // Only an upload already withheld for this check may use its result
+        // immediately. A capability-only observation can predate async image
+        // preparation, so the first actual upload must request fresh proof.
+        self.tmux_image_upload_preflight =
+            self.tmux_image_support.is_some() && self.tmux_image_retry_upload;
+        let retry_upload = self.tmux_image_retry_upload;
+        let rebuild = tmux_inspection_needs_picker_rebuild(
+            changed, retry_upload,
+            self.tmux_image_support.as_ref().map(|support| support.protocol),
+        );
+        self.tmux_image_retry_upload = false;
+        if rebuild { self.rebuild_terminal_image_picker(); }
+        // A Sixel retry only needs another draw. Rebuilding it here would
+        // withdraw the viewer's prepared protocol and can starve a second
+        // image while the Info preview repeatedly wins the next frame.
+        rebuild || retry_upload
+    }
+
+    /// A native payload is checked only once for its current content. Kitty
+    /// has a one-shot transfer; independently verified Sixel commands may
+    /// redraw while a newly introduced image awaits its own proof.
+    pub(super) fn defer_unverified_tmux_image_upload(
+        &mut self,
+        protocol: super::tmux_images::NativeProtocol,
+        sixel_uploads: &[u64],
+    ) -> bool {
+        if !tmux_native_upload_needs_preflight(
+            protocol,
+            self.tmux_image_upload_preflight,
+            &self.tmux_verified_sixel_uploads,
+            sixel_uploads,
+        ) {
+            return false;
+        }
+        if !self.tmux_image_retry_upload {
+            self.tmux_image_retry_upload = true;
+            if self.tmux_image_check_rx.is_some() {
+                // A pre-existing inquiry may precede this image preparation.
+                // Ask for exactly one fresh observation, not one per redraw.
+                self.tmux_image_recheck_after_pending = true;
+            } else {
+                self.request_tmux_image_refresh(true);
+            }
+        }
+        if self.tmux_image_check_rx.is_none() {
+            // Worker creation failed. Never let unchecked graphics escape.
+            self.disable_failed_tmux_image_transport();
+        }
+        true
+    }
+
+    fn rebuild_terminal_image_picker(&mut self) {
+        use ratatui_image::picker::ProtocolType;
+        let previous = self.image_picker.protocol_type;
+        self.image_picker = new_terminal_image_picker(
+            self.queried_image_cell_size,
+            self.tmux_image_support.as_ref(),
+            self.config.images.configured_cell_size(),
+        );
+        self.image_picker_generation = self.image_picker_generation.saturating_add(1);
         self.invalidate_terminal_image_preview_caches();
         self.request_image_preview_repaint();
-        self.force_redraw = true;
+        // Only a true native-protocol removal/switch needs a terminal clear.
+        // A retry of the same native image must use Ratatui's non-clearing diff.
+        if previous != self.image_picker.protocol_type && previous != ProtocolType::Halfblocks {
+            self.force_redraw = true;
+        }
+    }
+
+    pub(super) fn tmux_native_image_upload_committed(
+        &mut self,
+        protocol: super::tmux_images::NativeProtocol,
+        sixel_uploads: &[u64],
+    ) {
+        if protocol == super::tmux_images::NativeProtocol::Sixel {
+            self.tmux_verified_sixel_uploads.clear();
+            self.tmux_verified_sixel_uploads.extend_from_slice(sixel_uploads);
+        }
+        self.tmux_image_upload_preflight = false;
+    }
+
+    pub(super) fn tmux_verified_sixel_uploads(&self) -> &[u64] {
+        &self.tmux_verified_sixel_uploads
+    }
+
+    pub(super) fn tmux_image_font_size(&self) -> (u16, u16) {
+        self.image_picker.font_size
+    }
+
+    pub(super) fn native_tmux_image_protocol(&self) -> Option<super::tmux_images::NativeProtocol> {
+        let protocol = self.tmux_image_support.as_ref()?.protocol;
+        let picker = self.image_picker.protocol_type;
+        match (protocol, picker) {
+            (super::tmux_images::NativeProtocol::Kitty, ratatui_image::picker::ProtocolType::Kitty)
+            | (super::tmux_images::NativeProtocol::Sixel, ratatui_image::picker::ProtocolType::Sixel) =>
+                Some(protocol),
+            _ => None,
+        }
+    }
+
+    /// A malformed or undeliverable native graphics command has disabled
+    /// passthrough for this run. Show a definite error instead of leaving
+    /// the full-file viewer on its indefinite "Loading image" placeholder.
+    pub(super) fn tmux_image_transport_failed(&self) -> bool {
+        self.tmux_image_transport_fault
+    }
+
+    pub(super) fn disable_failed_tmux_image_transport(&mut self) {
+        self.tmux_image_transport_fault = true;
+        self.set_status("Native image transport through tmux failed; graphics passthrough disabled for this run");
+        self.tmux_image_support = None;
+        self.tmux_image_check_rx = None;
+        self.tmux_image_retry_upload = false;
+        self.tmux_image_recheck_after_pending = false;
+        self.tmux_image_upload_preflight = false;
+        self.tmux_verified_sixel_uploads.clear();
+        self.rebuild_terminal_image_picker();
     }
 
     /// A cheap, non-reencoding nudge for editor/file-picker image widgets.
@@ -17816,9 +18103,10 @@ impl AppState {
 
 
     fn force_halfblocks_for_unsafe_terminal_image_protocol(&mut self) {
-        if !enforce_safe_terminal_image_picker_protocol_for_current_environment(
-            &mut self.image_picker,
-        ) {
+        let decision = terminal_image_protocol_probe_decision_for_current_environment_with_support(
+            self.tmux_image_support.as_ref().map(|support| support.protocol),
+        );
+        if !enforce_safe_terminal_image_picker_protocol(&mut self.image_picker, decision) {
             return;
         }
 
@@ -24753,6 +25041,14 @@ mod terminal_image_protocol_environment_tests {
             self.protocol_type = ratatui_image::picker::ProtocolType::Halfblocks;
         }
 
+        fn force_kitty_protocol(&mut self) {
+            self.protocol_type = ratatui_image::picker::ProtocolType::Kitty;
+        }
+
+        fn force_sixel_protocol(&mut self) {
+            self.protocol_type = ratatui_image::picker::ProtocolType::Sixel;
+        }
+
         fn guess_terminal_protocol(&mut self) {
             self.guess_protocol_calls += 1;
             self.protocol_type = ratatui_image::picker::ProtocolType::Kitty;
@@ -24852,6 +25148,121 @@ mod terminal_image_protocol_environment_tests {
             picker.protocol_type,
             ratatui_image::picker::ProtocolType::Halfblocks
         );
+    }
+
+    #[test]
+    fn verified_tmux_kitty_does_not_guess_or_probe_the_terminal() {
+        let mut picker = RecordingPicker::new(ratatui_image::picker::ProtocolType::Halfblocks);
+        configure_terminal_image_picker_protocol(&mut picker, TerminalImageProtocolProbeDecision::ForceKitty);
+        assert_eq!(picker.protocol_type, ratatui_image::picker::ProtocolType::Kitty);
+        assert_eq!(picker.guess_protocol_calls, 0);
+        assert_eq!(picker.force_halfblocks_calls, 0);
+    }
+
+    #[test]
+    fn tmux_window_estimate_never_authorizes_native_raster_geometry() {
+        use super::super::tmux_images::{CellGeometry, ImageSupport, NativeProtocol};
+
+        let unknown = ImageSupport::test_support(NativeProtocol::Sixel,
+            CellGeometry::WindowEstimate((16, 32)));
+        assert_eq!(super::trusted_tmux_picker_cell_size(None, Some(&unknown)), None);
+        let custom = ImageSupport::test_support(NativeProtocol::Sixel,
+            CellGeometry::WindowEstimate((11, 23)));
+        assert_eq!(super::trusted_tmux_picker_cell_size(None, Some(&custom)), None);
+        let missing = ImageSupport::test_support(NativeProtocol::Sixel, CellGeometry::Unknown);
+        assert_eq!(super::trusted_tmux_picker_cell_size(None, Some(&missing)), None);
+        assert_eq!(super::trusted_tmux_picker_cell_size(None, None), None);
+
+        // A measured client and an explicit user setting do supply actual
+        // raster dimensions. This does not change the protocol selection.
+        let observed = ImageSupport::test_support(NativeProtocol::Sixel,
+            CellGeometry::ClientReported((9, 18)));
+        assert_eq!(super::trusted_tmux_picker_cell_size(None, Some(&observed)), Some((9, 18)));
+        assert_eq!(super::trusted_tmux_picker_cell_size(Some((13, 27)), Some(&unknown)), Some((13, 27)));
+    }
+
+    #[test]
+    fn explicit_image_cell_size_priority_is_environment_then_config_then_client() {
+        use super::super::tmux_images::{CellGeometry, ImageSupport, NativeProtocol};
+        let observed = ImageSupport::test_support(NativeProtocol::Sixel,
+            CellGeometry::ClientReported((12, 25)));
+        let estimated = ImageSupport::test_support(NativeProtocol::Sixel,
+            CellGeometry::WindowEstimate((16, 32)));
+
+        let config = Some((9, 18));
+        let environment = Some((11, 22));
+        assert_eq!(super::trusted_tmux_picker_cell_size(
+            super::preferred_image_cell_size_override(environment, config), Some(&observed),
+        ), environment);
+        assert_eq!(super::trusted_tmux_picker_cell_size(
+            super::preferred_image_cell_size_override(None, config), Some(&observed),
+        ), config);
+        assert_eq!(super::trusted_tmux_picker_cell_size(
+            super::preferred_image_cell_size_override(None, config), Some(&estimated),
+        ), config);
+        assert_eq!(super::trusted_tmux_picker_cell_size(
+            super::preferred_image_cell_size_override(None, None), Some(&observed),
+        ), Some((12, 25)));
+        assert_eq!(super::trusted_tmux_picker_cell_size(
+            super::preferred_image_cell_size_override(None, None), Some(&estimated),
+        ), None);
+    }
+
+    #[test]
+    fn native_upload_gate_is_stable_after_a_validated_sixel_upload() {
+        use super::super::tmux_images::NativeProtocol::{Kitty, Sixel};
+        use super::tmux_native_upload_needs_preflight as check;
+
+        // An unverified new image is held until the async worker proves that
+        // tmux can forward its upload. The result authorizes one transfer.
+        assert!(check(Sixel, false, &[], &[10]));
+        assert!(!check(Sixel, true, &[], &[10]));
+        // After that upload, ordinary redraws with the identical payload
+        // never start another inspection, regardless of their number.
+        for _ in 0..100 {
+            assert!(!check(Sixel, false, &[10], &[10]));
+        }
+        assert!(check(Sixel, false, &[10], &[11]),
+            "new image bytes require a fresh tmux observation");
+        assert!(check(Sixel, false, &[10], &[]),
+            "unknown upload identity may not bypass the gate");
+        // The frame can contain a previously verified Info image AND a new
+        // full-file viewer. Only the new command needs verification. The
+        // worker reply must not rebuild the existing Sixel image protocol.
+        assert!(check(Sixel, false, &[10], &[10, 20]));
+        assert!(!check(Sixel, true, &[10], &[10, 20]));
+        assert!(!check(Sixel, false, &[10, 20], &[20, 10]));
+        assert!(!check(Sixel, false, &[10, 20], &[20]));
+        assert!(check(Sixel, false, &[10, 20], &[10, 30]));
+        // Kitty has a one-shot upload; placeholders on later frames are
+        // handled by the draw path and never call this gate.
+        assert!(check(Kitty, false, &[], &[]));
+        assert!(!check(Kitty, true, &[], &[]));
+    }
+
+    #[test]
+    fn sixel_retry_redraws_without_invalidating_other_image_protocols() {
+        use super::super::tmux_images::NativeProtocol::{Kitty, Sixel};
+        use super::tmux_inspection_needs_picker_rebuild as rebuild;
+
+        assert!(!rebuild(false, true, Some(Sixel)),
+            "a deferred Sixel command remains retryable without re-encoding");
+        assert!(rebuild(false, true, Some(Kitty)),
+            "Kitty must regenerate a consumed one-shot upload");
+        assert!(rebuild(true, false, Some(Sixel)),
+            "an attachment or capability change invalidates every image");
+        assert!(rebuild(true, true, Some(Kitty)));
+        assert!(!rebuild(false, false, Some(Sixel)),
+            "ordinary idle observations must never rebuild native images");
+    }
+
+    #[test]
+    fn verified_tmux_sixel_does_not_guess_or_probe_the_terminal() {
+        let mut picker = RecordingPicker::new(ratatui_image::picker::ProtocolType::Halfblocks);
+        configure_terminal_image_picker_protocol(&mut picker, TerminalImageProtocolProbeDecision::ForceSixel);
+        assert_eq!(picker.protocol_type, ratatui_image::picker::ProtocolType::Sixel);
+        assert_eq!(picker.guess_protocol_calls, 0);
+        assert_eq!(picker.force_halfblocks_calls, 0);
     }
 
     #[test]
