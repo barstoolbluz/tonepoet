@@ -6019,3 +6019,49 @@ keep working with whatever framing tmux requires.
 
 *(The text as filed ends mid-sentence here; the rest of this section is still to be
 supplied.)*
+
+---
+
+## 95. A finished extraction can leave its output files reserved, so they cannot be deleted
+
+Filed 2026-11-18. Found in the field, in #88's extract window.
+
+**Symptom.** Extract CUE tracks on `1957. Billie Holiday - Body And Soul {MFSL UDCD
+658}` finished and published eight FLAC tracks into `Extracted`. Deleting that folder
+from Browse was then refused, repeatedly, for minutes: "deleted 0 item(s), busy; no
+deletion admitted". Nothing was running.
+
+**Evidence (`~/.cache/tonepoet/tonepoet.log`, 2026-11-19 UTC).**
+- 00:14:33: the extraction registers a `JournalOperation` lease with nine claims: Read
+  on the CUE sheet, Write on each of the eight output tracks.
+- 00:14:48: "Native extraction completed but reservation retirement is pending:
+  persistent lease is live-owned".
+- 00:15:16, 00:15:34, 00:16:01: each delete attempt is refused with
+  `availability=RecoveryReserved`: the requested `Extracted` subtree overlaps the
+  reserved `Extracted/01 - Body and Soul.flac`. The message tells the user to "retry
+  after TonePoet finishes interrupted-operation recovery". Nothing was interrupted.
+- The lease file was still present in
+  `~/.config/tonepoet/concurrency-v1/journal-operation/` afterwards.
+
+**Cause, as far as it is established.** On `NativeComplete`, `run_supervisor`
+(`src/tui/native_extract_task.rs`) drops its journal holder and calls
+`retire_completed_native_reservation` (`src/tui/file_task_runtime.rs`) once. That call
+was refused because the lease was still live-owned at that instant. The failure is
+logged as a warning and nothing tries again, so the reservation outlives the job.
+
+Not established: what still held the lease at that instant, and how often this
+happens. It is the only occurrence in the current log. Whether a relaunch clears it
+was not tested.
+
+The code is #88's (commit `f00ee75b`). The #90–#93 phases did not change it, and it is
+shared by every source the extract window accepts.
+
+**Wanted outcome.** Once an extraction has completed, its output files can be deleted,
+moved or renamed straight away, every time. A completed extraction holds no
+reservation on anything.
+
+**Guardrails.**
+- A reservation is still held for as long as the extraction is actually running, and
+  for an extraction that was interrupted and needs Recovery.
+- A refusal message says what is true. A completed job is not described as interrupted
+  recovery.
