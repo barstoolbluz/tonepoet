@@ -2627,17 +2627,27 @@ pub fn draw_popup(f: &mut ratatui::Frame, app: &mut super::app::AppState,
         popup_rect(terminal, app.browse.artwork_config.popup_height_percent)
     };
     let allow_upscale = !fullscreen && app.browse.artwork_config.allow_upscale;
-    let failure = app.browse_artwork.sources.get(app.browse_artwork.cursor)
+    let source_failed = app.browse_artwork.sources.get(app.browse_artwork.cursor)
         .is_some_and(|source| app.browse_artwork.failed.contains_key(source));
-    let message = app.browse_artwork.message();
-    let message = if message.is_empty() { "Loading image…" } else { message };
+    let transport_failed = app.tmux_image_transport_failed();
+    let failure = source_failed || transport_failed;
+    let message = if source_failed {
+        app.browse_artwork.message()
+    } else if transport_failed {
+        "Cannot display native image: tmux graphics transport failed"
+    } else {
+        let message = app.browse_artwork.message();
+        if message.is_empty() { "Loading image…" } else { message }
+    };
     // A line break makes the reason easy to find when the selected filename
     // spans multiple columns, and keeps the existing message() API unchanged.
     let status = if failure { message.replacen(": ", ":\n", 1) } else { message.to_owned() };
-    let rect = app.browse_artwork.popup_image_area(viewport,
-        allow_upscale).unwrap_or_else(|| {
-            popup_status_area(viewport, &status, failure)
-        });
+    let rect = if transport_failed {
+        popup_status_area(viewport, &status, true)
+    } else {
+        app.browse_artwork.popup_image_area(viewport,
+            allow_upscale).unwrap_or_else(|| popup_status_area(viewport, &status, failure))
+    };
     // In full-screen mode, the entire terminal owns pointer input, including
     // letterboxing around an image smaller than the display.
     app.browse_artwork.popup_rect = if fullscreen { terminal } else { rect };
@@ -2646,7 +2656,7 @@ pub fn draw_popup(f: &mut ratatui::Frame, app: &mut super::app::AppState,
     // color matches the application rather than the old oversized panel.
     f.render_widget(Block::default()
         .style(Style::default().bg(theme.bg)), rect);
-    let displayed = app.browse_artwork.render_image(f, viewport,
+    let displayed = !transport_failed && app.browse_artwork.render_image(f, viewport,
         allow_upscale, ImageVerticalPlacement::Center, theme.bg);
     if !displayed {
         f.render_widget(Paragraph::new(status).style(theme.muted())

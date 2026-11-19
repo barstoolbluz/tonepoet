@@ -18069,8 +18069,16 @@ impl AppState {
         }
     }
 
+    /// A malformed or undeliverable native graphics command has disabled
+    /// passthrough for this run. Show a definite error instead of leaving
+    /// the full-file viewer on its indefinite "Loading image" placeholder.
+    pub(super) fn tmux_image_transport_failed(&self) -> bool {
+        self.tmux_image_transport_fault
+    }
+
     pub(super) fn disable_failed_tmux_image_transport(&mut self) {
         self.tmux_image_transport_fault = true;
+        self.set_status("Native image transport through tmux failed; graphics passthrough disabled for this run");
         self.tmux_image_support = None;
         self.tmux_image_check_rx = None;
         self.tmux_image_retry_upload = false;
