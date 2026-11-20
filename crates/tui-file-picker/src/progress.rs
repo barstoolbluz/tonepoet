@@ -712,13 +712,13 @@ impl FileTaskProgressState {
         self.minimize_available = available;
     }
 
-    /// When watching a worker started by another TUI, Esc returns to Recovery
-    /// and never aborts that worker. Stop-and-undo belongs to the Recovery
+    /// Watching another worker must not confer ownership of its lifetime.
+    /// Esc returns to the interrupted-jobs window without aborting it.
     /// confirmation, not the progress overlay's ordinary Abort control.
     pub fn set_recovery_monitor(&mut self) {
         self.recovery_monitor = true;
         self.auto_close_available = false;
-        self.minimize_available = false;
+        self.minimize_available = true;
         self.task_controls_available = false;
         self.recovery_without_feed = Some((
             "Journal checkpoint unavailable".into(),
@@ -1021,9 +1021,11 @@ impl FileTaskProgressState {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> FileTaskUserAction {
-        // A reconnected monitor never owns the worker's lifetime. Even at a
-        // conflict prompt Esc means Back, not the conflict's Abort decision.
+        // Esc returns to the job window without stopping the remote worker.
         if self.recovery_monitor && matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+            return FileTaskUserAction::Acknowledge;
+        }
+        if self.recovery_monitor && key.code == KeyCode::Char('m') {
             return FileTaskUserAction::Minimize;
         }
         if self.recovery_monitor && key.code == KeyCode::Char('u')
@@ -1100,7 +1102,7 @@ impl FileTaskProgressState {
 
         if matches!(key.code, KeyCode::Char('m'))
             && self.minimize_available
-            && matches!(&self.kind, FileTaskKind::Copy | FileTaskKind::Move)
+            && matches!(&self.kind, FileTaskKind::Copy | FileTaskKind::Move | FileTaskKind::Extract)
         {
             return FileTaskUserAction::Minimize;
         }
@@ -1811,22 +1813,23 @@ impl FileTaskProgressState {
 
         let wide = area_width >= 78;
         if self.recovery_monitor {
-            if !self.task_controls_available {
-                return vec![(
-                    if wide { " Esc Back ".into() } else { "Esc Back".into() },
-                    ProgressHitAction::Minimize, self.theme.progress_button,
-                )];
-            }
-            let paused = matches!(self.phase, FileTaskPhase::Paused);
-            return vec![
+            let mut buttons = vec![
                 (if wide { " Esc Back ".into() } else { "Esc Back".into() },
+                    ProgressHitAction::Acknowledge, self.theme.progress_button),
+                (if wide { " m Minimize ".into() } else { "m Min".into() },
                     ProgressHitAction::Minimize, self.theme.progress_button),
-                (if paused { " p Resume ".into() } else { " p Pause ".into() },
-                    ProgressHitAction::PauseResume, self.theme.progress_button),
-                (" s Skip ".into(), ProgressHitAction::SkipCurrent, self.theme.progress_button),
-                (if wide { " u Stop and undo ".into() } else { "u Stop / undo".into() },
-                    ProgressHitAction::Abort, self.theme.progress_destructive),
             ];
+            if self.task_controls_available {
+                let paused = matches!(self.phase, FileTaskPhase::Paused);
+                buttons.extend([
+                    (if paused { " p Resume ".into() } else { " p Pause ".into() },
+                        ProgressHitAction::PauseResume, self.theme.progress_button),
+                    (" s Skip ".into(), ProgressHitAction::SkipCurrent, self.theme.progress_button),
+                    (if wide { " u Stop and undo ".into() } else { "u Stop".into() },
+                        ProgressHitAction::Abort, self.theme.progress_destructive),
+                ]);
+            }
+            return buttons;
         }
         let pause_label = match (wide, matches!(self.phase, FileTaskPhase::Paused)) {
             (true, true) => " p Resume ",
@@ -1850,7 +1853,7 @@ impl FileTaskProgressState {
             ));
         }
         if self.minimize_available
-            && matches!(&self.kind, FileTaskKind::Copy | FileTaskKind::Move)
+            && matches!(&self.kind, FileTaskKind::Copy | FileTaskKind::Move | FileTaskKind::Extract)
         {
             buttons.push((
                 if wide { " m Minimize ".to_string() } else { "m Min".to_string() },
@@ -1941,7 +1944,11 @@ impl FileTaskProgressState {
         if self.recovery_monitor {
             buttons.push((if compact { "u Undo" } else { " u Stop and undo " }.into(),
                 ProgressHitAction::Abort, self.theme.progress_destructive));
-            buttons.push((if compact { "Esc Back" } else { " Esc Back " }.into(),
+            buttons.push((if compact { "Back" } else { " Esc Back " }.into(),
+                ProgressHitAction::Acknowledge, self.theme.progress_button));
+            // Minimize remains clickable even in a minimum-width conflict
+            // dialog. Compact the labels instead of hiding the control.
+            buttons.push((if compact { "m Min" } else { " m Minimize " }.into(),
                 ProgressHitAction::Minimize, self.theme.progress_button));
         }
         buttons
@@ -2298,7 +2305,10 @@ mod tests {
             crossterm::event::KeyCode::Esc,
             crossterm::event::KeyModifiers::NONE,
         ));
-        assert_eq!(action, super::FileTaskUserAction::Minimize);
+        assert_eq!(action, super::FileTaskUserAction::Acknowledge);
+        assert_eq!(progress.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('m'), crossterm::event::KeyModifiers::NONE)),
+            super::FileTaskUserAction::Minimize);
     }
 
     #[test]
@@ -2312,7 +2322,7 @@ mod tests {
         progress.apply_update(super::FileTaskProgressUpdate::ShowConflict { conflict: prompt });
         assert_eq!(progress.handle_key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Esc, crossterm::event::KeyModifiers::NONE)),
-            super::FileTaskUserAction::Minimize);
+            super::FileTaskUserAction::Acknowledge);
         assert_eq!(progress.conflict.as_ref().map(|p| p.request_id), Some(11));
         assert_eq!(progress.handle_key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char('u'), crossterm::event::KeyModifiers::NONE)),
@@ -2321,14 +2331,15 @@ mod tests {
         assert!(labels.iter().any(|(label, action, _)| label.contains("Stop and undo")
             && *action == super::ProgressHitAction::Abort));
         assert!(labels.iter().any(|(label, action, _)| label.contains("Back")
-            && *action == super::ProgressHitAction::Minimize));
+            && *action == super::ProgressHitAction::Acknowledge));
         assert!(!labels.iter().any(|(label, _, _)| label.contains("Esc Abort")));
         let compact = progress.conflict_buttons(super::MIN_PROGRESS_DIALOG_WIDTH);
         let occupied = compact.iter().map(|(label, _, _)| crate::display_width::width(label)).sum::<usize>()
             + 3 * compact.len().saturating_sub(1);
         assert!(occupied <= usize::from(super::MIN_PROGRESS_DIALOG_WIDTH - 2),
-            "all six actions must fit the minimum recovery conflict dialog");
+            "all recovery conflict actions must fit the minimum dialog");
         assert!(compact.iter().any(|(_, action, _)| *action == super::ProgressHitAction::Abort));
+        assert!(compact.iter().any(|(_, action, _)| *action == super::ProgressHitAction::Acknowledge));
         assert!(compact.iter().any(|(_, action, _)| *action == super::ProgressHitAction::Minimize));
         progress.apply_update(super::FileTaskProgressUpdate::ClearConflict);
         assert!(progress.conflict.is_none());
@@ -2358,7 +2369,7 @@ mod tests {
             assert_eq!(progress.handle_key(key), abort);
         }
         assert_eq!(progress.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            super::FileTaskUserAction::Minimize);
+            super::FileTaskUserAction::Acknowledge);
         assert_eq!(progress.conflict.as_ref().map(|c| c.request_id), Some(41));
 
         for width in [super::MIN_PROGRESS_DIALOG_WIDTH, 80] {
@@ -3410,12 +3421,14 @@ mod tests {
         assert!(!state.task_controls_available());
         let buttons = state.progress_buttons(100);
         assert!(buttons.iter().any(|(label, action, _)|
-            label.contains("Back") && *action == ProgressHitAction::Minimize));
+            label.contains("Back") && *action == ProgressHitAction::Acknowledge));
         assert!(!buttons.iter().any(|(label, _, _)|
             label.contains("Pause") || label.contains("Skip") || label.contains("Stop")));
         assert_eq!(state.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)),
             FileTaskUserAction::None);
         assert_eq!(state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            FileTaskUserAction::Acknowledge);
+        assert_eq!(state.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)),
             FileTaskUserAction::Minimize);
         let area = ratatui::layout::Rect::new(0, 0, 100, 30);
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();

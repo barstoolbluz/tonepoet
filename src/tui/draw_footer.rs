@@ -115,17 +115,19 @@ fn draw_context_bar(
     file_task: Option<FileTaskFooterState>,
     theme: super::theme::Theme,
 ) {
-    let details_label = file_task_details_label(area.width, file_task);
+    let interrupted = interrupted_label(area.width, file_task);
+    let interrupted_width = interrupted.chars().count() as u16;
+    let details_label = file_task_details_label(area.width.saturating_sub(interrupted_width), file_task);
     let details_width = details_label.chars().count() as u16;
     let content_area = Rect::new(
-        area.x,
-        area.y,
-        area.width.saturating_sub(details_width),
+        area.x, area.y,
+        area.width.saturating_sub(details_width.saturating_add(interrupted_width)),
         area.height,
     );
-
     // When a transient status message is set, it replaces the hints on this row.
-    if let Some(msg) = status_message {
+    if file_task.is_some_and(|state| state.startup_notice) {
+        draw_startup_notice(f, content_area, buttons, file_task.unwrap().recovery_unresolved, theme);
+    } else if let Some(msg) = status_message {
         let max_chars = (content_area.width as usize).saturating_sub(2);
         let display: String = if msg.chars().count() > max_chars && max_chars >= 2 {
             let t: String = msg.chars().take(max_chars - 1).collect();
@@ -163,36 +165,72 @@ fn draw_context_bar(
         f.render_widget(Paragraph::new(Line::from(spans)), content_area);
     }
 
-    if let Some(details_area) = file_task_details_rect(area, file_task) {
+    let details_area = Rect::new(
+        area.right().saturating_sub(interrupted_width.saturating_add(details_width)),
+        area.y, details_width, 1,
+    );
+    if details_width > 0 {
         buttons.record_button(TuiButton::FileTaskMessages, details_area);
         let attention = file_task.is_some_and(|state| state.attention);
-        let recovery = file_task.is_some_and(|state| state.recovery_unresolved > 0);
-        let style = Style::default()
-            .fg(if attention {
-                theme.destructive
-            } else if recovery {
-                theme.warning
-            } else {
-                theme.cyan
-            })
-            .add_modifier(Modifier::BOLD);
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(details_label, style))),
-            details_area,
-        );
+        f.render_widget(Paragraph::new(Span::styled(details_label,
+            Style::default().fg(if attention { theme.destructive } else { theme.cyan })
+                .add_modifier(Modifier::BOLD))), details_area);
+    }
+    if interrupted_width > 0 {
+        let indicator = Rect::new(area.right().saturating_sub(interrupted_width),
+            area.y, interrupted_width, 1);
+        buttons.record_button(TuiButton::InterruptedJobsStatus, indicator);
+        f.render_widget(Paragraph::new(Span::styled(interrupted,
+            Style::default().fg(theme.warning).add_modifier(Modifier::BOLD))), indicator);
+    }
+
+}
+
+/// Dedicated status-bar slot, never covered by a hint, status message or
+/// minimized transfer meter. At tiny widths the actionable marker remains.
+fn interrupted_label(width: u16, file_task: Option<FileTaskFooterState>) -> String {
+    let Some(count) = file_task.map(|state| state.recovery_unresolved).filter(|count| *count > 0) else {
+        return String::new();
+    };
+    let labels = [format!(" ▲ {count} interrupted "), format!(" ▲ {count} "),
+        format!("▲{count}"), "▲".to_string()];
+    labels.into_iter().find(|label| label.chars().count() <= width as usize)
+        .unwrap_or_default()
+}
+
+fn draw_startup_notice(f: &mut Frame, area: Rect, buttons: &mut ButtonRenderMap,
+    count: usize, theme: super::theme::Theme) {
+    if area.width == 0 { return; }
+    let review = " Review… ";
+    let hide = " Hide ";
+    let controls = (review.chars().count() + hide.chars().count()) as u16;
+    let caption_width = area.width.saturating_sub(controls);
+    if caption_width > 0 {
+        let notice = format!("▲ tonepoet closed before {count} jobs finished. Their files stay locked.");
+        let shown = clip_footer_label(&notice, caption_width as usize);
+        f.render_widget(Paragraph::new(Span::styled(shown,
+            Style::default().fg(theme.warning).add_modifier(Modifier::BOLD))),
+            Rect::new(area.x, area.y, caption_width, 1));
+    }
+    if area.width >= controls {
+        let x = area.right() - controls;
+        let review_rect = Rect::new(x, area.y, review.chars().count() as u16, 1);
+        let hide_rect = Rect::new(review_rect.right(), area.y, hide.chars().count() as u16, 1);
+        f.render_widget(Paragraph::new(Span::styled(review, Style::default().fg(theme.blue))), review_rect);
+        f.render_widget(Paragraph::new(Span::styled(hide, Style::default().fg(theme.dismiss))), hide_rect);
+        buttons.record_button(TuiButton::InterruptedJobsReview, review_rect);
+        buttons.record_button(TuiButton::InterruptedJobsHide, hide_rect);
+    } else {
+        buttons.record_button(TuiButton::InterruptedJobsReview, area);
+        f.render_widget(Paragraph::new(Span::styled(clip_footer_label("Review…", area.width as usize),
+            Style::default().fg(theme.blue))), area);
     }
 }
 
-fn file_task_details_rect(area: Rect, file_task: Option<FileTaskFooterState>) -> Option<Rect> {
-    let width = file_task_details_label(area.width, file_task).chars().count() as u16;
-    (width > 0).then(|| {
-        Rect::new(
-            area.x.saturating_add(area.width.saturating_sub(width)),
-            area.y,
-            width,
-            1,
-        )
-    })
+fn clip_footer_label(s: &str, width: usize) -> String {
+    if s.chars().count() <= width { s.to_owned() }
+    else if width > 1 { format!("{}…", s.chars().take(width - 1).collect::<String>()) }
+    else { s.chars().take(width).collect() }
 }
 
 fn compact_progress_bar(ratio: Option<f64>) -> String {
@@ -218,30 +256,9 @@ fn file_task_details_label(width: u16, file_task: Option<FileTaskFooterState>) -
         return String::new();
     }
     if !state.live {
-        if state.recovery_unresolved > 0 {
-            let count = if state.recovery_unresolved > 999 {
-                "999+".to_string()
-            } else {
-                state.recovery_unresolved.to_string()
-            };
-            let candidates = [
-                format!(" ▲ {count} unresolved "),
-                format!(" {count} unresolved "),
-                format!("{count}!"),
-                "!".to_string(),
-            ];
-            return candidates
-                .into_iter()
-                .find(|label| label.chars().count() <= width as usize)
-                .unwrap_or_default();
-        }
-        return if width >= 18 {
-            " details ".to_string()
-        } else if width >= 7 {
-            " msgs ".to_string()
-        } else {
-            "d".to_string()
-        };
+        if state.ratio.is_none() && !state.attention { return String::new(); }
+        return if width >= 18 { " details ".to_string() }
+        else if width >= 7 { " msgs ".to_string() } else { "d".to_string() };
     }
 
     let percent = progress_percent(state.ratio);
@@ -401,14 +418,14 @@ fn truncate_groups_to_width(groups: &[Vec<Hint>], available: usize) -> Vec<Vec<H
 
 #[cfg(test)]
 mod tests {
-    use super::{file_task_details_label, file_task_details_rect, hint_groups_for};
+    use super::{file_task_details_label, interrupted_label, hint_groups_for};
     use crate::tui::app::{AppScreen, FileTaskFooterState};
-    use ratatui::layout::Rect;
 
     fn retained() -> Option<FileTaskFooterState> {
         Some(FileTaskFooterState {
             live: false,
             recovery_unresolved: 0,
+            startup_notice: false,
             ratio: Some(1.0),
             queued: 0,
             attention: false,
@@ -419,6 +436,7 @@ mod tests {
         Some(FileTaskFooterState {
             live: true,
             recovery_unresolved: 0,
+            startup_notice: false,
             ratio: Some(0.61),
             queued,
             attention,
@@ -429,6 +447,7 @@ mod tests {
         Some(FileTaskFooterState {
             live: false,
             recovery_unresolved: count,
+            startup_notice: false,
             ratio: None,
             queued: 0,
             attention: false,
@@ -460,24 +479,19 @@ mod tests {
         assert_eq!(file_task_details_label(17, retained()), " msgs ");
         assert_eq!(file_task_details_label(18, retained()), " details ");
         assert_eq!(file_task_details_label(80, None), "");
-
-        assert_eq!(
-            file_task_details_rect(Rect::new(9, 4, 1, 1), retained()),
-            Some(Rect::new(9, 4, 1, 1)),
-        );
-        assert_eq!(file_task_details_rect(Rect::new(9, 4, 0, 1), retained()), None);
     }
 
     #[test]
-    fn unresolved_recovery_label_shares_the_restore_slot_at_every_width() {
-        assert_eq!(file_task_details_label(30, unresolved(2)), " ▲ 2 unresolved ");
-        assert_eq!(file_task_details_label(14, unresolved(2)), " 2 unresolved ");
-        assert_eq!(file_task_details_label(2, unresolved(2)), "2!");
-        assert_eq!(file_task_details_label(1, unresolved(2)), "!");
-        assert_eq!(
-            file_task_details_rect(Rect::new(9, 4, 1, 1), unresolved(2)),
-            Some(Rect::new(9, 4, 1, 1)),
-        );
+    fn interrupted_decision_has_its_own_visible_status_slot() {
+        assert_eq!(interrupted_label(40, unresolved(2)), " ▲ 2 interrupted ");
+        assert_eq!(interrupted_label(6, unresolved(2)), " ▲ 2 ");
+        assert_eq!(interrupted_label(2, unresolved(2)), "▲");
+        assert_eq!(interrupted_label(1, unresolved(2)), "▲");
+        assert_eq!(file_task_details_label(80, unresolved(2)), "");
+        let mut state = live(2, false).unwrap();
+        state.recovery_unresolved = 2;
+        assert_eq!(interrupted_label(80, Some(state)), " ▲ 2 interrupted ");
+        assert_eq!(file_task_details_label(80, Some(state)), " [██░] 61% +2 ");
     }
 
     #[test]

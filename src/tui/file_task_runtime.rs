@@ -1942,6 +1942,80 @@ pub(crate) fn retire_completed_native_reservation(
     Ok(())
 }
 
+/// Retire a clean, completed native extraction that was left in the journal
+/// inventory. Unlike Undo, this operation never opens a source or output
+/// path, and it never deletes an extraction artifact.
+///
+/// Recheck the exact journal revision after verifying that no worker holds the
+/// durable lease. A later generation or an unfinished output must be reviewed
+/// again rather than silently dismissed. Repeated dismissal is harmless.
+pub fn dismiss_completed_native_recovery(
+    path: &Path,
+    expected: RecoveryRecordVersion,
+) -> Result<(), String> {
+    // Dismiss is a journal retirement, not a user-file operation. Validate
+    // the private namespace before any read or removal, and make a repeated
+    // dismissal a no-op after the record was retired.
+    let root = file_task_journal_dir();
+    if path.parent() != Some(root.as_path())
+        || path.extension().and_then(|ext| ext.to_str()) != Some("jsonl")
+    {
+        return Err("Completed job record lies outside the private journal directory".into());
+    }
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {},
+        Ok(_) => return Err("Completed job record is not a regular journal file".into()),
+        Err(error) => return Err(format!("inspect completed extraction record: {error}")),
+    }
+    let (record, version) = load_record_with_version(path)?;
+    if version != expected {
+        return Err("The job changed after it was reviewed. Open Interrupted jobs again.".into());
+    }
+    if !record.is_native_extraction()
+        || record.lifecycle != DurableFileTaskLifecycle::Completed
+        || !record.temp_artifacts.is_empty()
+        || !record.quarantine_artifacts.is_empty()
+        || !record.native_rename_intents.is_empty()
+    {
+        return Err("Only a finished extraction with no unfinished paths can be dismissed.".into());
+    }
+    if classify_recovery_surface(path, &record)? != RecoverySurfaceAvailability::Recoverable {
+        return Err("The extraction worker is still running. Dismiss is unavailable.".into());
+    }
+    // Classification retires only a stale reservation; it cannot retire a
+    // live descriptor. Re-read after the check so even a concurrent journal
+    // checkpoint cannot be dismissed by a stale view.
+    let (fresh, fresh_version) = load_record_with_version(path)?;
+    if fresh_version != expected || fresh.job_id != record.job_id {
+        return Err("The job changed while its locks were being released. Review it again.".into());
+    }
+    if fresh.lifecycle != DurableFileTaskLifecycle::Completed
+        || !fresh.temp_artifacts.is_empty()
+        || !fresh.quarantine_artifacts.is_empty()
+        || !fresh.native_rename_intents.is_empty()
+    {
+        return Err("The extraction still has unfinished work. Use Tidy up instead.".into());
+    }
+    // This retired job has no active owner or pending filesystem mutations.
+    // Only its private journal is removed; user files remain untouched.
+    match fs::remove_file(path) {
+        Ok(()) => {},
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        Err(error) => return Err(format!(
+            "remove finished extraction record {}: {error}", path.display()
+        )),
+    }
+    if let Some(parent) = path.parent() {
+        // Windows cannot reliably open directories as ordinary File handles.
+        // Use the same platform-aware best-effort directory sync as journal
+        // retirement elsewhere; the per-file remove has already committed.
+        sync_directory_best_effort(parent);
+    }
+    super::file_task_live::retire_job_live_directories(path, &record.job_id);
+    Ok(())
+}
+
 fn classify_recovery_surface(
     path: &Path,
     record: &DurableFileTaskRecord,

@@ -28,15 +28,21 @@ pub enum TuiButton {
     Tab(u8), // 1-5
     /// Restore live minimized transfer progress or reopen retained task details.
     FileTaskMessages,
+    InterruptedJobsStatus,
+    InterruptedJobsReview,
+    InterruptedJobsHide,
     RecoveryTitle,
-    RecoveryPromptAction(u8),
     RecoveryListRow(usize),
     RecoveryAction(u8),
     RecoveryBulkResume,
     RecoveryBulkDiscard,
-    RecoveryDetailsTab(u8),
     RecoveryDetailsClose,
     RecoveryConfirm(u8),
+    InterruptedTab(u8),
+    InterruptedShowFiles,
+    InterruptedHelp,
+    InterruptedClose,
+    InterruptedRefusalAction(u8),
 
     // Convert screen panes (click to focus)
     Pane(ConvertFocus),
@@ -512,13 +518,19 @@ impl TuiButton {
         match self {
             Self::Tab(_)
             | Self::FileTaskMessages
+            | Self::InterruptedJobsStatus
+            | Self::InterruptedJobsReview
+            | Self::InterruptedJobsHide
+            | Self::InterruptedTab(_)
+            | Self::InterruptedShowFiles
+            | Self::InterruptedHelp
+            | Self::InterruptedClose
+            | Self::InterruptedRefusalAction(_)
             | Self::RecoveryTitle
-            | Self::RecoveryPromptAction(_)
             | Self::RecoveryListRow(_)
             | Self::RecoveryAction(_)
             | Self::RecoveryBulkResume
             | Self::RecoveryBulkDiscard
-            | Self::RecoveryDetailsTab(_)
             | Self::RecoveryDetailsClose
             | Self::RecoveryConfirm(_)
             | Self::OverlayConfirm

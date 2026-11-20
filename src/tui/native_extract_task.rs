@@ -125,7 +125,10 @@ pub(super) fn resume_from_journal(
 ) -> Result<(), String> {
     if app.file_transfers.active_session_id.is_some()
         || !app.file_transfers.queued.is_empty()
-        || !app.file_transfers.recovery_queued.is_empty()
+        // A review-only queued copy/move is not running. The serial slot,
+        // runnable queue and other live progress guards above remain the
+        // ownership checks; waiting recoveries must not block an older native
+        // extraction that a user explicitly chose to finish.
         || app.minimized_file_task_progress.is_some()
         || app.file_task_preempted_overlay.is_some()
     {
@@ -616,6 +619,21 @@ fn native_recovery_baseline(
         }
     }
     base
+}
+
+/// Count the original selected tracks from durable publication and skip
+/// receipts. Sidecars and log files do not count as selected tracks. This is
+/// presentation accounting only; it never reads an output or resumes a job.
+pub(super) fn recorded_selection_counts(
+    record: &DurableFileTaskRecord,
+) -> Option<(usize, usize, usize)> {
+    let job = serde_json::from_value::<NativeExtractionJob>(
+        record.job.get("native_extraction")?.clone(),
+    ).ok()?;
+    let baseline = native_recovery_baseline(
+        &job, &record.native_published_paths, &record.native_skipped_selections,
+    );
+    Some((baseline.done.saturating_sub(baseline.skipped), baseline.skipped, baseline.total))
 }
 
 fn add_native_recovery_baseline(

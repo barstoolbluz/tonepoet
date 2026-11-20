@@ -268,6 +268,10 @@ pub enum AppMessage {
     FilesScanned { paths: Vec<std::path::PathBuf> },
     /// Status message to show in the status bar
     StatusMessage(String),
+    RecoveryDismissComplete {
+        journal_path: std::path::PathBuf,
+        result: Result<(), String>,
+    },
     RecoveryDiscardComplete {
         journal_path: std::path::PathBuf,
         result: Result<crate::tui::file_task_runtime::RecoveryDiscardSummary, String>,

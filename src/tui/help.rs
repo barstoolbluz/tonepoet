@@ -207,6 +207,7 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
         title: "Global",
         entries: vec![
             ("1-5", "Switch screen (Browse/Library/Convert/Queue/Config)"),
+            ("Alt+J", "Open Interrupted jobs"),
             (":", "Enter command mode"),
             (":q", "Quit tonepoet"),
             (":go / :start", "Start processing queued items"),
@@ -345,6 +346,22 @@ mod tests {
                 entries.iter().any(|(key, desc)| *key == command && desc.contains("CUE")),
                 "Browse help must render {command} with a CUE description"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod interrupted_jobs_help_tests {
+    use super::*;
+
+    #[test]
+    fn interrupted_jobs_chord_is_in_global_help_on_every_regular_screen() {
+        for screen in [AppScreen::Browse, AppScreen::Library, AppScreen::Convert,
+            AppScreen::Queue, AppScreen::Config] {
+            let sections = help_content_for(screen);
+            let global = sections.iter().find(|section| section.title == "Global")
+                .expect("global help must be available on every screen");
+            assert!(global.entries.contains(&("Alt+J", "Open Interrupted jobs")));
         }
     }
 }
