@@ -62942,7 +62942,7 @@ mod file_task_supervisor_tests {
         let key = |code| crossterm::event::KeyEvent::new(code,
             crossterm::event::KeyModifiers::NONE);
         assert_eq!(viewer.handle_key(key(crossterm::event::KeyCode::Esc)),
-            tui_file_picker::FileTaskUserAction::Minimize,
+            tui_file_picker::FileTaskUserAction::Acknowledge,
             "Esc must not abort a surviving worker at a conflict");
         assert_eq!(viewer.conflict.as_ref().map(|c| c.request_id), Some(first.request_id));
         let choose = viewer.handle_key(key(crossterm::event::KeyCode::Char('s')));

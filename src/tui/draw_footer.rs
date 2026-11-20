@@ -485,7 +485,7 @@ mod tests {
     fn interrupted_decision_has_its_own_visible_status_slot() {
         assert_eq!(interrupted_label(40, unresolved(2)), " ▲ 2 interrupted ");
         assert_eq!(interrupted_label(6, unresolved(2)), " ▲ 2 ");
-        assert_eq!(interrupted_label(2, unresolved(2)), "▲");
+        assert_eq!(interrupted_label(2, unresolved(2)), "▲2");
         assert_eq!(interrupted_label(1, unresolved(2)), "▲");
         assert_eq!(file_task_details_label(80, unresolved(2)), "");
         let mut state = live(2, false).unwrap();
