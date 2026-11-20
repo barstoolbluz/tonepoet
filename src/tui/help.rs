@@ -208,6 +208,7 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
         entries: vec![
             ("1-5", "Switch screen (Browse/Library/Convert/Queue/Config)"),
             ("Alt+J", "Open Interrupted jobs"),
+            ("Alt+H", "Hide interrupted-jobs startup notice (when visible)"),
             (":", "Enter command mode"),
             (":q", "Quit tonepoet"),
             (":go / :start", "Start processing queued items"),
@@ -362,6 +363,7 @@ mod interrupted_jobs_help_tests {
             let global = sections.iter().find(|section| section.title == "Global")
                 .expect("global help must be available on every screen");
             assert!(global.entries.contains(&("Alt+J", "Open Interrupted jobs")));
+            assert!(global.entries.contains(&("Alt+H", "Hide interrupted-jobs startup notice (when visible)")));
         }
     }
 }

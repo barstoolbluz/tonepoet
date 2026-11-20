@@ -368,8 +368,6 @@ pub(super) fn wrap_buffer(buffer: &mut Buffer, font: (u16, u16)) -> Result<(), (
 mod tests {
     use super::*;
     use ratatui::layout::Rect;
-    use std::fmt::Write as _;
-
     // Model the observable tmux boundary: each passthrough is forwarded as
     // one complete raw string; tmux may write arbitrary terminal state next.
     fn packets(symbol: &str) -> Vec<(usize, usize, String)> {

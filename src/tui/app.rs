@@ -9690,7 +9690,8 @@ pub struct FileTaskFooterState {
     pub live: bool,
     /// Jobs currently needing a user decision, independent of any live meter.
     pub recovery_unresolved: usize,
-    /// Startup notice stays in the hint row until Review or Hide is chosen.
+    /// Startup notice replaces the indicator in its reserved footer slot
+    /// until Review or Hide is chosen.
     pub startup_notice: bool,
     pub ratio: Option<f64>,
     pub queued: usize,

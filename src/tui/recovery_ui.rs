@@ -185,18 +185,6 @@ impl RecoveryEntry {
             && self.version.is_some()
     }
 
-    fn can_bulk_discard_restore(&self) -> bool {
-        self.can_discard() && !self.irreversible() && !self.is_discard_cleanup()
-    }
-
-    fn show_in_bulk_discard_confirm(&self) -> bool {
-        self.can_bulk_discard_restore()
-            || (self.discard_committed
-                && self.is_recoverable()
-                && !self.irreversible()
-                && !self.is_discard_cleanup())
-    }
-
     fn completed_count(&self) -> usize {
         self.record.as_ref().map_or(0, |record| {
             if record.is_native_extraction() {
@@ -238,54 +226,6 @@ impl RecoveryEntry {
                 .saturating_add(self.skipped_count())
                 .saturating_add(self.failed_count()),
         )
-    }
-
-    fn state_label(&self) -> &'static str {
-        if self.is_unreadable() {
-            return "record unreadable";
-        }
-        if self.is_live() {
-            if self.has_observed_control() && self.live_snapshot.as_ref()
-                .is_some_and(|s| matches!(s.phase, tui_file_picker::FileTaskPhase::Paused)) {
-                return "paused";
-            }
-            return if !self.has_observed_control() { "running · no feed" }
-                else if self.is_stalled() { "running · stalled" } else { "running" };
-        }
-        if self.resume_committed {
-            return if self.approved_resume_queue_id.is_some() { "resume queued" }
-                else { "resume starting" };
-        }
-        if self.is_discard_cleanup() {
-            return "cleanup pending";
-        }
-        let Some(record) = self.record.as_ref() else {
-            return "record unreadable";
-        };
-        if record.is_native_extraction() {
-            if record.lifecycle == DurableFileTaskLifecycle::Completed { return "completed"; }
-            return if record.native_published_paths.is_empty() { "not started" }
-                else { "partly completed" };
-        }
-        let completed = self.completed_count();
-        let total = self.item_count();
-        let attempted = completed
-            .saturating_add(self.skipped_count())
-            .saturating_add(self.failed_count());
-        let has_leftovers = !record.temp_artifacts.is_empty()
-            || !record.quarantine_artifacts.is_empty()
-            || !record.native_rename_intents.is_empty();
-        if total > 0 && completed == total {
-            if has_leftovers {
-                "cleanup pending"
-            } else {
-                "completed"
-            }
-        } else if attempted == 0 {
-            "not started"
-        } else {
-            "partly completed"
-        }
     }
 
     fn blocked_paths(&self) -> Vec<PathBuf> {
@@ -551,6 +491,7 @@ impl RecoveryUiState {
         } else { 0 }
     }
 
+    #[cfg(test)]
     fn resume_count(&self) -> usize {
         self.entries.iter().filter(|entry| self.can_resume_unattended(entry)).count()
     }
@@ -1417,7 +1358,7 @@ fn resume_selected(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
             Err(error) => {
                 app.recovery_ui.open_window();
                 app.active_overlay = ActiveOverlay::FileRecovery;
-                app.set_status(format!("Cannot resume extraction: {error}"));
+                app.set_status(format!("Cannot finish extraction: {error}"));
             }
         }
         return;
@@ -1564,6 +1505,7 @@ fn entry_has_destination_overlap(entries: &[RecoveryEntry], selected: &RecoveryE
         .any(|other| unresolved_overlap_predecessor(other) && entries_share_folder(selected, other))
 }
 
+#[cfg(test)]
 fn overlapping_entry_count(entries: &[RecoveryEntry], selected: &RecoveryEntry) -> usize {
     entries.iter().filter(|other| other.journal_path != selected.journal_path)
         .filter(|other| unresolved_overlap_predecessor(other) && entries_share_folder(selected, other)).count()
@@ -1586,15 +1528,6 @@ fn age_label(updated_unix_ms: u64) -> String {
         3600..=86_399 => format!("{}h ago", seconds / 3600),
         _ => format!("{}d ago", seconds / 86_400),
     }
-}
-
-fn timestamp_clock(unix_ms: u64) -> String {
-    let Ok(unix_ms) = i64::try_from(unix_ms) else {
-        return "--:--".to_string();
-    };
-    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(unix_ms)
-        .map(|time| time.with_timezone(&chrono::Local).format("%H:%M").to_string())
-        .unwrap_or_else(|| "--:--".to_string())
 }
 
 fn human_bytes(bytes: u64) -> String {

@@ -116,7 +116,7 @@ pub(super) fn dispatch_queued(
 }
 
 /// Called only after a reviewed, ownerless native journal is selected in the
-/// existing Recovery window. Other outstanding file tasks still own their
+/// Interrupted jobs window. Other outstanding file tasks still own their
 /// serial slot; an interrupted extraction does not reserve its own UI forever.
 pub(super) fn resume_from_journal(
     app: &mut AppState,
@@ -132,13 +132,13 @@ pub(super) fn resume_from_journal(
         || app.minimized_file_task_progress.is_some()
         || app.file_task_preempted_overlay.is_some()
     {
-        return Err("Finish the other file tasks and unresolved recoveries before resuming this extraction".into());
+        return Err("Finish the active or queued file task before this extraction".into());
     }
     let record = file_task_runtime::load_record(journal_path)?;
     if !record.is_native_extraction() || record.lifecycle == DurableFileTaskLifecycle::Completed
         || file_task_runtime::recovery_record_is_discard_cleanup(&record)
     {
-        return Err("Selected recovery is not an unfinished native extraction".into());
+        return Err("The selected job is not an unfinished extraction".into());
     }
     let saved: DurableNativeExtractionTask = serde_json::from_value(record.job)
         .map_err(|error| format!("Decode saved extraction selection: {error}"))?;

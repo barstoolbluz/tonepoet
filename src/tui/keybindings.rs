@@ -328,6 +328,19 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
         return;
     }
 
+    // Hide the startup notice only when it is actually on screen and the
+    // underlying screen owns keyboard input. Overlay, dropdown and inline
+    // editor dispatch above must retain priority over this temporary chord.
+    if matches!((key.code, key.modifiers), (KeyCode::Char('h'), KeyModifiers::ALT))
+        && app.current_screen != AppScreen::Wizard
+        && (app.current_screen != AppScreen::Browse || !app.browse.options_menu.is_open())
+        && !current_focus_needs_generic_host_clipboard(app)
+        && app.file_task_footer_state().is_some_and(|state| state.startup_notice)
+    {
+        super::recovery_ui::hide_startup_notice(app);
+        return;
+    }
+
     // Global keys (except in Wizard mode)
     if app.current_screen != AppScreen::Wizard {
         match (key.code, key.modifiers) {
@@ -117208,5 +117221,104 @@ mod r30c_extract_disc_save_notification_tests {
         record_extract_sidecar_save(&mut editor);
         assert!(editor.extract_tags_saved);
         assert!(editor.extract_mb_saved);
+    }
+}
+
+
+#[cfg(test)]
+mod interrupted_jobs_startup_hide_shortcut_tests {
+    use super::*;
+
+    fn pending_notice(jobs: usize) -> AppState {
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.recovery_ui.entries = (0..jobs).map(|i| super::super::recovery_ui::RecoveryEntry {
+            journal_path: std::path::PathBuf::from(format!("interrupted-{i}.jsonl")),
+            record: None,
+            version: None,
+            availability: super::super::file_task_runtime::RecoverySurfaceAvailability::Unreadable,
+            diagnostic: None,
+            queue_id: None,
+            resume_committed: false,
+            approved_resume_queue_id: None,
+            discard_committed: false,
+            live_snapshot: None,
+            stop_requested_unix_ms: None,
+        }).collect();
+        app.recovery_ui.prompt_pending = true;
+        app.recovery_ui.prompt_shown = false;
+        assert!(app.file_task_footer_state().is_some_and(|state| state.startup_notice));
+        app
+    }
+
+    fn alt_h() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT)
+    }
+
+    #[test]
+    fn alt_h_hides_only_the_startup_notice_and_preserves_the_indicator() {
+        let (tx, _rx) = mpsc::channel(4);
+        for count in [1, 3] {
+            let mut app = pending_notice(count);
+            handle_key(&mut app, alt_h(), &tx);
+            assert!(!app.recovery_ui.prompt_pending);
+            assert!(app.recovery_ui.prompt_shown);
+            assert!(matches!(app.active_overlay, ActiveOverlay::None));
+            let footer = app.file_task_footer_state().expect("persistent indicator");
+            assert_eq!(footer.recovery_unresolved, count);
+            assert!(!footer.startup_notice);
+        }
+    }
+
+    #[test]
+    fn alt_h_respects_modal_menu_search_editor_and_wizard_input_ownership() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut app = pending_notice(1);
+        app.active_overlay = ActiveOverlay::Help { screen: AppScreen::Browse, scroll: 0 };
+        handle_key(&mut app, alt_h(), &tx);
+        assert!(app.recovery_ui.prompt_pending);
+        app.active_overlay = ActiveOverlay::None;
+
+        app.browse.options_menu = BrowseOptionsMenu::Root;
+        handle_key(&mut app, alt_h(), &tx);
+        assert!(app.recovery_ui.prompt_pending);
+        app.browse.options_menu = BrowseOptionsMenu::Closed;
+
+        app.browse.search.active = true;
+        handle_key(&mut app, alt_h(), &tx);
+        assert!(app.recovery_ui.prompt_pending);
+        app.browse.search.active = false;
+
+        app.browse.path_input = Some(super::super::text_input::TextInputState::empty());
+        handle_key(&mut app, alt_h(), &tx);
+        assert!(app.recovery_ui.prompt_pending);
+        app.browse.path_input = None;
+
+        app.current_screen = AppScreen::Convert;
+        app.convert.focus = ConvertFocus::Metadata;
+        app.convert.metadata.editing = Some(ConvertMetadataField::Title);
+        handle_key(&mut app, alt_h(), &tx);
+        assert!(app.recovery_ui.prompt_pending);
+        app.convert.metadata.editing = None;
+
+        app.current_screen = AppScreen::Wizard;
+        handle_key(&mut app, alt_h(), &tx);
+        assert!(app.recovery_ui.prompt_pending);
+        app.current_screen = AppScreen::Browse;
+
+        handle_key(&mut app, alt_h(), &tx);
+        assert!(!app.recovery_ui.prompt_pending);
+        assert!(app.recovery_ui.prompt_shown);
+    }
+
+    #[test]
+    fn alt_j_still_opens_interrupted_jobs_without_using_hide() {
+        let _root = crate::concurrency::scoped_test_coordination_root();
+        let (tx, _rx) = mpsc::channel(4);
+        let mut app = pending_notice(2);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT), &tx);
+        assert!(matches!(app.active_overlay, ActiveOverlay::FileRecovery));
+        assert!(!app.recovery_ui.prompt_pending);
+        assert!(app.recovery_ui.prompt_shown);
     }
 }
