@@ -9688,7 +9688,11 @@ impl FileTransferQueueState {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FileTaskFooterState {
     pub live: bool,
+    /// Jobs currently needing a user decision, independent of any live meter.
     pub recovery_unresolved: usize,
+    /// Startup notice replaces the indicator in its reserved footer slot
+    /// until Review or Hide is chosen.
+    pub startup_notice: bool,
     pub ratio: Option<f64>,
     pub queued: usize,
     pub attention: bool,
@@ -17081,10 +17085,9 @@ impl AppState {
         let mut recovery_surface_records = Vec::new();
         if startup_options.recover_pending_file_operations {
             let crate::tui::file_task_runtime::StartupFileTaskRecoveryInventory {
-                total_pending_jobs,
                 recoveries,
                 recovery_surface_records: startup_recovery_surface_records,
-                unreconstructable_journals,
+                ..
             } = crate::tui::file_task_runtime::startup_file_task_recovery_inventory();
             recovery_surface_records = startup_recovery_surface_records;
             file_transfers.unresolved_recovery_count =
@@ -17096,20 +17099,8 @@ impl AppState {
                 browse.filesystem_clipboard = Some(newest.clipboard.clone());
                 browse.filesystem_clipboard_retry_plan = Some(newest.retry_plan.clone());
                 browse.filesystem_clipboard_generation = 1;
-                let total_temp = recoveries
-                    .iter()
-                    .map(|recovery| recovery.temp_artifact_count)
-                    .sum::<usize>();
-                let total_quarantine = recoveries
-                    .iter()
-                    .map(|recovery| recovery.quarantine_artifact_count)
-                    .sum::<usize>();
-                let queued_recoveries = recoveries.len();
                 for (index, recovery) in recoveries.into_iter().rev().enumerate() {
                     let Some(destination_dir) = recovery.destination_dir else {
-                        // The inventory already classifies this case as
-                        // unreconstructable. Keep startup panic-free if a future
-                        // producer violates that contract.
                         continue;
                     };
                     file_transfers.recovery_queued.push_back(QueuedFileTransfer {
@@ -17123,40 +17114,10 @@ impl AppState {
                         recovered: true,
                     });
                 }
-                let unreconstructable = unreconstructable_journals.len();
-                let inspection_suffix = if unreconstructable == 0 {
-                    String::new()
-                } else {
-                    format!(
-                        "; {unreconstructable} operation{} need record inspection",
-                        if unreconstructable == 1 { "" } else { "s" },
-                    )
-                };
-                let recovery_status = format!(
-                    "Found {} interrupted copy/move operation{}; {} can be resumed after review, with {} incomplete output{} and {} renamed source{}{}",
-                    total_pending_jobs,
-                    if total_pending_jobs == 1 { "" } else { "s" },
-                    queued_recoveries,
-                    total_temp,
-                    if total_temp == 1 { "" } else { "s" },
-                    total_quarantine,
-                    if total_quarantine == 1 { "" } else { "s" },
-                    inspection_suffix,
-                );
-                theme_startup_status = Some(match theme_startup_status.take() {
-                    Some(existing) => format!("{existing}; {recovery_status}"),
-                    None => recovery_status,
-                });
-            } else if total_pending_jobs > 0 {
-                let recovery_status = format!(
-                    "Found {} unresolved copy/move operation{}; open Recovery to review the current state",
-                    total_pending_jobs,
-                    if total_pending_jobs == 1 { "" } else { "s" },
-                );
-                theme_startup_status = Some(match theme_startup_status.take() {
-                    Some(existing) => format!("{existing}; {recovery_status}"),
-                    None => recovery_status,
-                });
+                // Decision-required journals are presented solely through
+                // the one-line startup notice and the persistent status-bar
+                // indicator. Do not overwrite an unrelated startup status
+                // with the pre-redesign Recovery prompt.
             }
         }
         let recovery_ui = crate::tui::recovery_ui::RecoveryUiState::from_records(
@@ -17823,6 +17784,8 @@ impl AppState {
 
     #[must_use]
     pub fn file_task_footer_state(&self) -> Option<FileTaskFooterState> {
+        let decisions = self.recovery_ui.needs_attention_count();
+        let startup_notice = self.recovery_ui.prompt_pending && !self.recovery_ui.prompt_shown && decisions > 0;
         let live_progress = self
             .minimized_file_task_progress
             .as_ref()
@@ -17842,7 +17805,8 @@ impl AppState {
         if let Some(progress) = live_progress {
             return Some(FileTaskFooterState {
                 live: true,
-                recovery_unresolved: 0,
+                recovery_unresolved: decisions,
+                startup_notice,
                 ratio: progress.totals.ratio(),
                 queued: self.file_transfers.queued.len(),
                 attention: progress.conflict.is_some()
@@ -17853,10 +17817,11 @@ impl AppState {
                     ),
             });
         }
-        if self.file_transfers.unresolved_recovery_count > 0 {
+        if decisions > 0 {
             return Some(FileTaskFooterState {
                 live: false,
-                recovery_unresolved: self.file_transfers.unresolved_recovery_count,
+                recovery_unresolved: decisions,
+                startup_notice,
                 ratio: None,
                 queued: self.file_transfers.queued.len(),
                 attention: false,
@@ -17865,6 +17830,7 @@ impl AppState {
         self.last_file_task_progress.as_ref().map(|(_, progress)| FileTaskFooterState {
             live: false,
             recovery_unresolved: 0,
+            startup_notice: false,
             ratio: progress.totals.ratio(),
             queued: self.file_transfers.queued.len(),
             attention: matches!(progress.phase, tui_file_picker::FileTaskPhase::Failed),
@@ -18384,7 +18350,7 @@ impl AppState {
             }
             let _ = crate::tui::recovery_ui::intercept_recovery_conflict_status(self, &msg);
             self.status_message = Some((
-                "That file change is blocked by an unresolved copy or move; review recovery details before changing the overlapping path".to_string(),
+                "That path is locked by an interrupted job. Open Interrupted jobs to finish or undo it.".to_string(),
                 std::time::Instant::now(),
             ));
             return;

@@ -1,4 +1,4 @@
-//! Interrupted copy/move recovery surfaces.
+//! Interrupted jobs presentation and recovery coordination.
 //!
 //! The durable file-task record remains authoritative. This module derives
 //! presentation state from immutable snapshots and sends explicit resume or
@@ -12,10 +12,9 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::{
-    layout::{Alignment, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Clear, Paragraph, Wrap},
+    layout::Rect,
+    style::{Color, Style},
+    widgets::{Block, Clear, Paragraph},
     Frame,
 };
 use tokio::sync::mpsc;
@@ -29,69 +28,24 @@ use super::file_task_runtime::{
 use super::message::AppMessage;
 use super::file_task_live::{LiveWorkerRef, LiveWorkerSnapshot};
 
-const PROMPT_MIN_WIDTH: u16 = 84;
-const PROMPT_MIN_HEIGHT: u16 = 14;
-const WINDOW_MIN_WIDTH: u16 = 116;
-const WINDOW_MIN_HEIGHT: u16 = 23;
-const DETAILS_MIN_WIDTH: u16 = 78;
-const DETAILS_MAX_HEIGHT: u16 = 21;
-const CONFIRM_MIN_WIDTH: u16 = 78;
-const CONFIRM_MAX_HEIGHT: u16 = 21;
-
-// The HTML mockups establish readability floors, not restored-window targets.
-// Let the primary recovery surfaces use the terminal when it has room, while
-// keeping the narrower epi-popups from becoming needlessly full-width.
-const PROMPT_WIDTH_PERCENT: u16 = 60;
-const PROMPT_HEIGHT_PERCENT: u16 = 40;
-const WINDOW_WIDTH_PERCENT: u16 = 75;
-const WINDOW_HEIGHT_PERCENT: u16 = 55;
-// Layer-3 surfaces open over the recovery window, so they are sized against
-// that window rather than the terminal. Sizing them against the terminal would
-// make an epi-popup nearly as wide as the surface it sits on.
-const EPI_POPUP_WIDTH_PERCENT: u16 = 78;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoverySurface {
-    Prompt,
     Window,
-    Details,
+    Files,
+    Refusal,
     DiscardConfirm,
     BulkDiscardConfirm,
     StopConfirm,
     ForceStopConfirm,
     SetAsideConfirm,
-    Inspector,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecoveryDetailsTab {
-    BlockedPaths,
-    IncompleteFiles,
-    RenamedSources,
-}
-
-impl RecoveryDetailsTab {
-    const ALL: [Self; 3] = [
-        Self::BlockedPaths,
-        Self::IncompleteFiles,
-        Self::RenamedSources,
-    ];
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::BlockedPaths => "Blocked paths",
-            Self::IncompleteFiles => "Staging paths",
-            Self::RenamedSources => "Renamed sources",
-        }
-    }
+    Error,
+    Help,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecoveryDetailsReason {
     Ordinary,
     Refusal(PathBuf),
-    BeforeDecision,
-    CleanupPending,
 }
 
 #[derive(Debug, Clone)]
@@ -113,9 +67,19 @@ pub struct RecoveryEntry {
     /// record. Keep all competing decisions unavailable until that attempt
     /// reports success or failure.
     pub discard_committed: bool,
-    pub session_deferred: bool,
     pub live_snapshot: Option<LiveWorkerSnapshot>,
     pub stop_requested_unix_ms: Option<u64>,
+}
+
+/// Only the last checkpoint for a selected root represents its outcome.
+/// Count facts and the Files popup must use the same recorded disposition.
+fn last_recorded_root_disposition(
+    record: &DurableFileTaskRecord,
+    mapping: &tui_file_picker::PasteMapping,
+) -> Option<tui_file_picker::FileTaskRootDisposition> {
+    record.roots.iter().rev().find(|root|
+        root.source == mapping.source && root.destination == mapping.destination)
+        .map(|root| root.disposition)
 }
 
 impl RecoveryEntry {
@@ -149,17 +113,8 @@ impl RecoveryEntry {
     fn item_count(&self) -> usize {
         self.record.as_ref().map_or(0, |record| {
             if record.is_native_extraction() {
-                let programs = record.job.get("native_extraction")
-                    .and_then(|job| job.get("programs"))
-                    .and_then(serde_json::Value::as_array);
-                let file_per_program = record.job.get("native_extraction")
-                    .and_then(|job| job.get("file_per_program"))
-                    .and_then(serde_json::Value::as_bool).unwrap_or(false);
-                return programs.map_or(0, |programs| {
-                    if file_per_program { programs.len() }
-                    else { programs.iter().map(|program| program.get("tracks")
-                        .and_then(serde_json::Value::as_array).map_or(0, Vec::len)).sum() }
-                });
+                return super::native_extract_task::recorded_selection_counts(record)
+                    .map_or(0, |(_, _, total)| total);
             }
             record.mappings.len()
         })
@@ -214,77 +169,54 @@ impl RecoveryEntry {
             && match self.record.as_ref() {
                 Some(record) if record.is_native_extraction() =>
                     record.lifecycle != DurableFileTaskLifecycle::Completed,
-                _ => self.queue_id.is_some(),
+                Some(record) => self.queue_id.is_some()
+                    && (record.lifecycle != DurableFileTaskLifecycle::Completed
+                        || !record.temp_artifacts.is_empty()),
+                None => false,
             }
-    }
-
-    fn can_defer(&self) -> bool {
-        self.is_recoverable()
-            && !self.record.as_ref().is_some_and(DurableFileTaskRecord::is_native_extraction)
-            && self.queue_id.is_some()
-            && !self.resume_committed
-            && !self.discard_committed
     }
 
     fn can_discard(&self) -> bool {
         self.is_recoverable()
-            && !self.record.as_ref().is_some_and(|record|
-                record.is_native_extraction()
-                    && record.lifecycle == DurableFileTaskLifecycle::Completed)
+            && !self.is_completed_clean()
             && !self.resume_committed
             && !self.discard_committed
             && self.record.is_some()
             && self.version.is_some()
     }
 
-    fn can_bulk_discard_restore(&self) -> bool {
-        self.can_discard() && !self.irreversible() && !self.is_discard_cleanup()
-    }
-
-    fn show_in_bulk_discard_confirm(&self) -> bool {
-        self.can_bulk_discard_restore()
-            || (self.discard_committed
-                && self.is_recoverable()
-                && !self.irreversible()
-                && !self.is_discard_cleanup())
-    }
-
     fn completed_count(&self) -> usize {
         self.record.as_ref().map_or(0, |record| {
             if record.is_native_extraction() {
-                return if record.lifecycle == DurableFileTaskLifecycle::Completed {
-                    self.item_count()
-                } else { record.native_published_paths.len().min(self.item_count()) };
+                return super::native_extract_task::recorded_selection_counts(record)
+                    .map_or(0, |(done, _, _)| done);
             }
-            record
-                .roots
-                .iter()
-                .filter(|root| root.disposition.is_completed())
-                .count()
+            // A durable root can have multiple checkpoints: only its final
+            // disposition is the outcome of the user's selected item.
+            record.mappings.iter().filter(|mapping|
+                last_recorded_root_disposition(record, mapping)
+                    .is_some_and(tui_file_picker::FileTaskRootDisposition::is_completed)).count()
         })
     }
 
     fn skipped_count(&self) -> usize {
         self.record.as_ref().map_or(0, |record| {
-            record
-                .roots
-                .iter()
-                .filter(|root| {
-                    root.disposition == tui_file_picker::FileTaskRootDisposition::Skipped
-                })
-                .count()
+            if record.is_native_extraction() {
+                return super::native_extract_task::recorded_selection_counts(record)
+                    .map_or(0, |(_, skipped, _)| skipped);
+            }
+            record.mappings.iter().filter(|mapping|
+                last_recorded_root_disposition(record, mapping)
+                    == Some(tui_file_picker::FileTaskRootDisposition::Skipped)).count()
         })
     }
 
     fn failed_count(&self) -> usize {
         self.record.as_ref().map_or(0, |record| {
-            record
-                .roots
-                .iter()
-                .filter(|root| {
-                    root.disposition == tui_file_picker::FileTaskRootDisposition::Failed
-                })
-                .count()
+            if record.is_native_extraction() { return 0; }
+            record.mappings.iter().filter(|mapping|
+                last_recorded_root_disposition(record, mapping)
+                    == Some(tui_file_picker::FileTaskRootDisposition::Failed)).count()
         })
     }
 
@@ -294,54 +226,6 @@ impl RecoveryEntry {
                 .saturating_add(self.skipped_count())
                 .saturating_add(self.failed_count()),
         )
-    }
-
-    fn state_label(&self) -> &'static str {
-        if self.is_unreadable() {
-            return "record unreadable";
-        }
-        if self.is_live() {
-            if self.has_observed_control() && self.live_snapshot.as_ref()
-                .is_some_and(|s| matches!(s.phase, tui_file_picker::FileTaskPhase::Paused)) {
-                return "paused";
-            }
-            return if !self.has_observed_control() { "running · no feed" }
-                else if self.is_stalled() { "running · stalled" } else { "running" };
-        }
-        if self.resume_committed {
-            return if self.approved_resume_queue_id.is_some() { "resume queued" }
-                else { "resume starting" };
-        }
-        if self.is_discard_cleanup() {
-            return "cleanup pending";
-        }
-        let Some(record) = self.record.as_ref() else {
-            return "record unreadable";
-        };
-        if record.is_native_extraction() {
-            if record.lifecycle == DurableFileTaskLifecycle::Completed { return "completed"; }
-            return if record.native_published_paths.is_empty() { "not started" }
-                else { "partly completed" };
-        }
-        let completed = self.completed_count();
-        let total = self.item_count();
-        let attempted = completed
-            .saturating_add(self.skipped_count())
-            .saturating_add(self.failed_count());
-        let has_leftovers = !record.temp_artifacts.is_empty()
-            || !record.quarantine_artifacts.is_empty()
-            || !record.native_rename_intents.is_empty();
-        if total > 0 && completed == total {
-            if has_leftovers {
-                "cleanup pending"
-            } else {
-                "completed"
-            }
-        } else if attempted == 0 {
-            "not started"
-        } else {
-            "partly completed"
-        }
     }
 
     fn blocked_paths(&self) -> Vec<PathBuf> {
@@ -391,16 +275,38 @@ impl RecoveryEntry {
             .unwrap_or_default()
     }
 
-    fn needs_attention(&self) -> bool {
-        // A live copy is not an interrupted operation. Only jobs that have
-        // lost their worker or wait for a recovery decision count here.
-        (!self.is_live() && !self.resume_committed && !self.discard_committed
-            && !self.record.as_ref().is_some_and(|record| record.is_native_extraction()
-                && record.lifecycle == DurableFileTaskLifecycle::Completed))
-            || self.live_snapshot.as_ref().is_some_and(|s| {
-            matches!(s.phase, tui_file_picker::FileTaskPhase::Paused)
+    fn is_completed_clean(&self) -> bool {
+        self.record.as_ref().is_some_and(|record| {
+            record.lifecycle == DurableFileTaskLifecycle::Completed
+                && record.temp_artifacts.is_empty()
+                && record.quarantine_artifacts.is_empty()
+                && record.native_rename_intents.is_empty()
         })
     }
+
+    fn can_dismiss(&self) -> bool {
+        self.is_recoverable() && self.is_completed_clean()
+            && self.record.as_ref().is_some_and(DurableFileTaskRecord::is_native_extraction)
+            && self.version.is_some() && !self.resume_committed && !self.discard_committed
+    }
+
+    fn can_tidy(&self) -> bool {
+        (self.can_discard() || self.can_resume())
+            && (self.is_discard_cleanup() || self.record.as_ref().is_some_and(|record|
+                record.lifecycle == DurableFileTaskLifecycle::Completed
+                    && !record.temp_artifacts.is_empty()
+                    && (record.is_native_extraction() || self.queue_id.is_some())))
+    }
+
+    fn needs_attention(&self) -> bool {
+        if self.is_unreadable() { return true; }
+        if self.is_live() {
+            return self.is_stalled() || self.live_snapshot.as_ref().is_some_and(|s|
+                matches!(s.phase, tui_file_picker::FileTaskPhase::Stalled));
+        }
+        !self.resume_committed && !self.discard_committed
+    }
+
 }
 
 #[derive(Debug, Clone)]
@@ -409,11 +315,16 @@ pub struct RecoveryUiState {
     pub selected: usize,
     pub list_scroll: usize,
     pub surface: RecoverySurface,
-    pub details_tab: RecoveryDetailsTab,
     pub details_scroll: usize,
     pub details_reason: RecoveryDetailsReason,
     pub focus: usize,
     pub maximized: bool,
+    /// At narrow widths show the selected job in its own tab.
+    pub small_job_tab: bool,
+    /// Actual screen rectangle from the last draw, used for mouse hit testing.
+    pub last_screen: Rect,
+    /// Derived from the last window draw; no terminal-size guesses in input handling.
+    pub compact: bool,
     pub prompt_pending: bool,
     pub prompt_shown: bool,
     pub incomplete_sizes: BTreeMap<PathBuf, Option<u64>>,
@@ -424,10 +335,6 @@ pub struct RecoveryUiState {
     pub stop_and_undo_pending: BTreeSet<PathBuf>,
     pub stop_requested_at: BTreeMap<PathBuf, u64>,
     pub aside_in_flight: BTreeSet<PathBuf>,
-    /// Recovery records explicitly deferred with `:recovery-defer` during
-    /// this process. The durable record stays unresolved, but its executable
-    /// retry is not recreated until the next session.
-    pub session_deferred: BTreeSet<PathBuf>,
 }
 
 impl Default for RecoveryUiState {
@@ -437,11 +344,13 @@ impl Default for RecoveryUiState {
             selected: 0,
             list_scroll: 0,
             surface: RecoverySurface::Window,
-            details_tab: RecoveryDetailsTab::BlockedPaths,
             details_scroll: 0,
             details_reason: RecoveryDetailsReason::Ordinary,
             focus: 0,
             maximized: false,
+            small_job_tab: false,
+            last_screen: Rect::default(),
+            compact: false,
             prompt_pending: false,
             prompt_shown: false,
             incomplete_sizes: BTreeMap::new(),
@@ -450,7 +359,6 @@ impl Default for RecoveryUiState {
             stop_and_undo_pending: BTreeSet::new(),
             stop_requested_at: BTreeMap::new(),
             aside_in_flight: BTreeSet::new(),
-            session_deferred: BTreeSet::new(),
         }
     }
 }
@@ -472,7 +380,6 @@ impl RecoveryUiState {
             .entries
             .get(self.selected)
             .map(|entry| entry.journal_path.clone());
-        let session_deferred = self.session_deferred.clone();
         let discard_in_flight = self.discard_in_flight.clone();
         let stop_requested_at = self.stop_requested_at.clone();
         self.entries = records
@@ -489,7 +396,6 @@ impl RecoveryUiState {
                 approved_resume_queue_id: None,
                 stop_requested_unix_ms: stop_requested_at.get(&surface.journal_path).copied(),
                 discard_committed: discard_in_flight.contains(&surface.journal_path),
-                session_deferred: session_deferred.contains(&surface.journal_path),
                 journal_path: surface.journal_path,
                 record: surface.record,
                 version: surface.version,
@@ -497,6 +403,12 @@ impl RecoveryUiState {
                 diagnostic: surface.diagnostic,
             })
             .collect();
+        self.entries.sort_by(|a, b| {
+            b.needs_attention().cmp(&a.needs_attention())
+                .then_with(|| b.record.as_ref().map_or(0, |r| r.created_unix_ms)
+                    .cmp(&a.record.as_ref().map_or(0, |r| r.created_unix_ms)))
+                .then_with(|| a.journal_path.cmp(&b.journal_path))
+        });
         self.selected = selected_path
             .as_ref()
             .and_then(|path| {
@@ -507,8 +419,6 @@ impl RecoveryUiState {
             .unwrap_or_else(|| self.selected.min(self.entries.len().saturating_sub(1)));
         self.list_scroll = self.list_scroll.min(self.selected);
         self.discard_in_flight
-            .retain(|path| self.entries.iter().any(|entry| &entry.journal_path == path));
-        self.session_deferred
             .retain(|path| self.entries.iter().any(|entry| &entry.journal_path == path));
         self.stop_requested_at
             .retain(|path, _| self.entries.iter().any(|entry| &entry.journal_path == path));
@@ -545,68 +455,48 @@ impl RecoveryUiState {
         self.details_reason = RecoveryDetailsReason::Ordinary;
     }
 
-    fn open_prompt(&mut self) {
-        self.surface = RecoverySurface::Prompt;
-        self.focus = 0;
-        self.prompt_pending = false;
-        self.prompt_shown = true;
-    }
-
     pub(super) fn minimize(&mut self) {
         self.surface = RecoverySurface::Window;
         self.focus = 0;
     }
 
-    fn open_details(&mut self, tab: RecoveryDetailsTab, reason: RecoveryDetailsReason) {
+    fn open_details(&mut self, reason: RecoveryDetailsReason) {
         self.consume_startup_prompt();
-        self.surface = RecoverySurface::Details;
-        self.details_tab = tab;
+        self.surface = RecoverySurface::Files;
         self.details_reason = reason;
         self.details_scroll = 0;
         self.focus = 0;
     }
 
-    fn details_count(&self, tab: RecoveryDetailsTab) -> usize {
-        self.selected_entry().map_or(0, |entry| match tab {
-            RecoveryDetailsTab::BlockedPaths => entry.blocked_paths().len(),
-            RecoveryDetailsTab::IncompleteFiles => entry.incomplete_paths().len(),
-            RecoveryDetailsTab::RenamedSources => entry.renamed_sources().len(),
+    fn resume_all_available(&self) -> bool {
+        let decisions = self.entries.iter().filter(|entry| entry.needs_attention()).collect::<Vec<_>>();
+        decisions.len() >= 2 && decisions.iter().all(|entry| {
+            self.can_resume_unattended(entry)
+                && entry.record.as_ref().is_some_and(|record| {
+                    record.quarantine_artifacts.is_empty()
+                        && record.native_rename_intents.is_empty()
+                })
         })
     }
 
-    fn resume_all_available(&self) -> bool {
-        !self.entries.is_empty()
-            && self.entries.iter().all(|entry| {
-                self.can_resume_unattended(entry)
-                    && entry.record.as_ref().is_some_and(|record| {
-                        record.quarantine_artifacts.is_empty()
-                            && record.native_rename_intents.is_empty()
-                    })
-            })
-    }
-
     fn can_resume_unattended(&self, entry: &RecoveryEntry) -> bool {
-        if entry.record.as_ref().is_some_and(DurableFileTaskRecord::is_native_extraction) {
-            return false;
-        }
-        entry.can_resume() && !entry_has_destination_overlap(&self.entries, entry)
+        !entry.record.as_ref().is_some_and(DurableFileTaskRecord::is_native_extraction)
+            && entry.can_resume() && !entry_has_destination_overlap(&self.entries, entry)
     }
 
     fn bulk_discard_count(&self) -> usize {
-        self.entries
-            .iter()
-            .filter(|entry| entry.can_bulk_discard_restore())
-            .count()
+        let decisions = self.entries.iter().filter(|entry| entry.needs_attention()).collect::<Vec<_>>();
+        if decisions.len() >= 2 && decisions.iter().all(|entry| entry.can_discard()) {
+            decisions.len()
+        } else { 0 }
     }
 
+    #[cfg(test)]
     fn resume_count(&self) -> usize {
-        self.entries
-            .iter()
-            .filter(|entry| self.can_resume_unattended(entry))
-            .count()
+        self.entries.iter().filter(|entry| self.can_resume_unattended(entry)).count()
     }
 
-    fn needs_attention_count(&self) -> usize {
+    pub(super) fn needs_attention_count(&self) -> usize {
         self.entries.iter().filter(|entry| entry.needs_attention()).count()
     }
 
@@ -623,10 +513,8 @@ impl RecoveryUiState {
             return false;
         };
         self.selected = entry_index;
-        self.open_details(
-            RecoveryDetailsTab::BlockedPaths,
-            RecoveryDetailsReason::Refusal(blocked),
-        );
+        self.open_details(RecoveryDetailsReason::Refusal(blocked));
+        self.surface = RecoverySurface::Refusal;
         self.details_scroll = row;
         true
     }
@@ -648,10 +536,8 @@ impl RecoveryUiState {
             return false;
         };
         self.selected = entry_index;
-        self.open_details(
-            RecoveryDetailsTab::BlockedPaths,
-            RecoveryDetailsReason::Refusal(blocked),
-        );
+        self.open_details(RecoveryDetailsReason::Refusal(blocked));
+        self.surface = RecoverySurface::Refusal;
         self.details_scroll = row;
         true
     }
@@ -713,15 +599,7 @@ fn sync_recovery_review_queue(
     let mut rebuilt = VecDeque::new();
 
     for recovery in recoveries {
-        if app
-            .recovery_ui
-            .session_deferred
-            .contains(&recovery.journal_path)
-            || app
-                .recovery_ui
-                .discard_in_flight
-                .contains(&recovery.journal_path)
-        {
+        if app.recovery_ui.discard_in_flight.contains(&recovery.journal_path) {
             continue;
         }
         if recovery_is_already_runnable_or_active(app, &recovery.journal_path) {
@@ -834,6 +712,38 @@ pub fn refresh_live_observation(app: &mut AppState) -> bool {
             }
         }
     }
+    // A minimized remote monitor is still a live progress observer. Keep its
+    // footer snapshot current, even though no progress overlay is visible.
+    if let Some(session) = app.minimized_file_task_progress.as_mut().filter(|s| s.is_recovery_monitor()) {
+        if let Some(entry) = app.recovery_ui.entries.iter().find(|entry| {
+            entry.is_live() && entry.worker_ref() == session.remote_worker
+        }) {
+            let checkpoint = (!entry.has_observed_control()).then(|| journal_checkpoint(entry));
+            changed |= session.progress.set_recovery_feed_state(checkpoint, entry.has_observed_control());
+            if let Some(snapshot) = entry.live_snapshot.as_ref() {
+                if session.progress.phase != snapshot.phase || session.progress.status != snapshot.status
+                    || session.progress.current_item != snapshot.current_item
+                    || session.progress.totals != snapshot.totals
+                    || session.progress.rate_bytes_per_sec != snapshot.rate_bytes_per_sec
+                {
+                    session.progress.apply_update(tui_file_picker::FileTaskProgressUpdate::Snapshot {
+                        phase: snapshot.phase.clone(), status: snapshot.status.clone(),
+                        current_item: snapshot.current_item.clone(), totals: snapshot.totals.clone(),
+                        rate_bytes_per_sec: snapshot.rate_bytes_per_sec,
+                    });
+                    changed = true;
+                }
+                let current = session.progress.conflict.as_ref().map(|c| c.request_id);
+                let next = snapshot.conflict.as_ref().map(|c| c.request_id);
+                if current != next {
+                    if let Some(conflict) = snapshot.conflict.clone() {
+                        session.progress.apply_update(tui_file_picker::FileTaskProgressUpdate::ShowConflict { conflict });
+                    } else { session.progress.apply_update(tui_file_picker::FileTaskProgressUpdate::ClearConflict); }
+                    changed = true;
+                }
+            }
+        }
+    }
     changed
 }
 
@@ -855,7 +765,7 @@ pub fn advance_stop_and_undo(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) 
             // complete, but its recovery decision still requires review.
             app.recovery_ui.stop_and_undo_pending.remove(&path);
             app.recovery_ui.stop_requested_at.remove(&path);
-            app.set_status("Worker stopped, but automatic cleanup is not safe; review Recovery before changing files");
+            app.set_status("Worker stopped, but automatic cleanup is not safe; review Interrupted jobs before changing files");
             continue;
         }
         let Some(version) = entry.version else { continue; };
@@ -872,6 +782,16 @@ pub fn advance_stop_and_undo(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) 
 }
 
 pub fn reconcile_progress_watch(app: &mut AppState) {
+    // A minimized watcher does not own a worker and is not a durable record.
+    // Retire its meter when the remote job stops; the journal inventory then
+    // determines whether a decision indicator must replace it.
+    if app.minimized_file_task_progress.as_ref().is_some_and(|session| {
+        session.is_recovery_monitor()
+            && !app.recovery_ui.entries.iter().any(|entry| entry.is_live()
+                && entry.worker_ref() == session.remote_worker)
+    }) {
+        app.minimized_file_task_progress = None;
+    }
     let remote = match &app.active_overlay {
         ActiveOverlay::FileTaskProgress(session) if session.is_recovery_monitor() => session.remote_worker.clone(),
         _ => None,
@@ -897,7 +817,7 @@ pub fn open_stop_confirm_from_progress_watch(app: &mut AppState, remote: &LiveWo
         app.recovery_ui.focus = 1;
     } else {
         app.recovery_ui.open_window();
-        app.set_status("This transfer changed since it was opened; review its current Recovery state");
+        app.set_status("This transfer changed since it was opened; review its current state in Interrupted jobs");
     }
     app.active_overlay = ActiveOverlay::FileRecovery;
 }
@@ -995,7 +915,7 @@ fn activate_safety_confirmation(app: &mut AppState, tx: &mpsc::Sender<AppMessage
             let Some((path, remote)) = entry.filter(|e| e.has_observed_control())
                 .and_then(|e| Some((e.journal_path.clone(), e.worker_ref()?))) else {
                 app.recovery_ui.open_window();
-                app.set_status("Worker no longer live; recheck Recovery before stopping");
+                app.set_status("Worker no longer live; reopen Interrupted jobs before stopping");
                 return;
             };
             if !super::file_task_live::read_snapshot(&remote)
@@ -1009,7 +929,7 @@ fn activate_safety_confirmation(app: &mut AppState, tx: &mpsc::Sender<AppMessage
                     app.recovery_ui.stop_and_undo_pending.insert(path.clone());
                     app.recovery_ui.stop_requested_at.insert(path, unix_ms_now());
                     app.recovery_ui.open_window();
-                    app.set_status("Stop requested; after the worker releases its lease, tracked staging will be cleaned and restorable names restored. Already published output may remain");
+                    app.set_status("Stop requested; once the worker exits, its unfinished paths will be cleaned. Finished output stays in place.");
                 }
                 Err(error) => { app.recovery_ui.open_window(); app.set_status(format!("Stop request failed; worker still running: {error}")); }
             }
@@ -1032,7 +952,7 @@ fn activate_safety_confirmation(app: &mut AppState, tx: &mpsc::Sender<AppMessage
                 Ok(()) => {
                     app.recovery_ui.stop_and_undo_pending.insert(path.clone());
                     app.recovery_ui.stop_requested_at.insert(path, unix_ms_now());
-                    app.set_status("Identity-checked force stop sent; recoverable staging will be reviewed for cleanup after the lease releases");
+                    app.set_status("Identity-checked force stop sent; cleanup starts only after the worker releases its lease");
                 }
                 Err(error) => app.set_status(format!("Could not force stop worker: {error}")),
             }
@@ -1115,24 +1035,17 @@ pub fn refresh_from_runtime(app: &mut AppState) {
     }
 }
 
-pub fn maybe_open_startup_prompt(app: &mut AppState) {
-    if app.recovery_ui.prompt_pending
-        && !app.recovery_ui.prompt_shown
-        && !app.recovery_ui.entries.is_empty()
-        && matches!(app.active_overlay, ActiveOverlay::None)
-    {
-        app.recovery_ui.open_prompt();
-        app.active_overlay = ActiveOverlay::FileRecovery;
-    }
+/// Startup only presents the status-bar notice. The first screen is never a modal.
+pub fn maybe_open_startup_prompt(_app: &mut AppState) {}
+
+pub fn hide_startup_notice(app: &mut AppState) {
+    app.recovery_ui.consume_startup_prompt();
 }
 
 pub fn open_recovery_window(app: &mut AppState) {
     refresh_from_runtime(app);
-    if app.recovery_ui.entries.is_empty() {
-        app.set_status("No interrupted copy or move operations need attention");
-        return;
-    }
     app.recovery_ui.open_window();
+    app.recovery_ui.small_job_tab = false;
     app.active_overlay = ActiveOverlay::FileRecovery;
 }
 
@@ -1178,7 +1091,7 @@ pub fn open_details_for_queue_id(
         return;
     }
     app.active_overlay = ActiveOverlay::FileRecovery;
-    open_selected_details(app, tx, RecoveryDetailsReason::BeforeDecision);
+    open_selected_details(app, tx, RecoveryDetailsReason::Ordinary);
 }
 
 pub fn open_blocked_refusal(app: &mut AppState, attempted: &Path) -> bool {
@@ -1209,10 +1122,44 @@ pub fn intercept_recovery_conflict_status(app: &mut AppState, message: &str) -> 
     }
 }
 
-fn request_incomplete_sizes_if_needed(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
-    if app.recovery_ui.details_tab != RecoveryDetailsTab::IncompleteFiles {
-        return;
+/// Request source-derived unfinished-path sizes while the job is visible;
+/// never block the event loop or assume that a folder is an empty file.
+pub(super) fn refresh_visible_sizes(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
+    if matches!(app.active_overlay, ActiveOverlay::FileRecovery) {
+        request_incomplete_sizes_if_needed(app, tx);
     }
+}
+
+fn measured_incomplete_path_size(path: &Path) -> Option<u64> {
+    use std::time::{Duration, Instant};
+    let began = Instant::now();
+    let mut remaining = vec![path.to_path_buf()];
+    let mut total = 0u64;
+    let mut visited = 0usize;
+    while let Some(path) = remaining.pop() {
+        visited = visited.checked_add(1)?;
+        // A directory with a pathological number of descendants must not
+        // occupy a background worker indefinitely. Unknown is honest.
+        if visited > 50_000 || began.elapsed() > Duration::from_millis(350) {
+            return None;
+        }
+        let meta = std::fs::symlink_metadata(&path).ok()?;
+        if meta.is_file() {
+            total = total.checked_add(meta.len())?;
+        } else if meta.is_dir() {
+            for child in std::fs::read_dir(&path).ok()? {
+                remaining.push(child.ok()?.path());
+            }
+        } else {
+            // Never follow a symlink out of the destination's private
+            // unfinished tree or pretend that its target was measured.
+            return None;
+        }
+    }
+    Some(total)
+}
+
+fn request_incomplete_sizes_if_needed(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     let Some(entry) = app.recovery_ui.selected_entry() else {
         return;
     };
@@ -1230,9 +1177,7 @@ fn request_incomplete_sizes_if_needed(app: &mut AppState, tx: &mpsc::Sender<AppM
         let sizes = paths
             .into_iter()
             .map(|path| {
-                let size = std::fs::symlink_metadata(&path)
-                    .ok()
-                    .and_then(|metadata| metadata.is_file().then_some(metadata.len()));
+                let size = measured_incomplete_path_size(&path);
                 (path, size)
             })
             .collect();
@@ -1295,7 +1240,7 @@ fn commit_discard_choices_in_session(app: &mut AppState, paths: &BTreeSet<PathBu
 
 fn begin_single_discard(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     let Some((journal_path, version)) = selected_discard_snapshot(app) else {
-        app.set_status("This interrupted operation cannot be discarded from its current state");
+        app.set_status("Undo is unavailable for the current job state");
         return;
     };
     app.recovery_ui
@@ -1317,12 +1262,12 @@ fn begin_bulk_discard(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
         .recovery_ui
         .entries
         .iter()
-        .filter(|entry| entry.can_bulk_discard_restore())
+        .filter(|entry| entry.needs_attention() && entry.can_discard())
         .filter_map(|entry| Some((entry.journal_path.clone(), entry.version?)))
         .filter(|(path, _)| !app.recovery_ui.discard_in_flight.contains(path))
         .collect::<Vec<_>>();
-    if work.is_empty() {
-        app.set_status("No reversible interrupted operations are available to discard");
+    if work.len() < 2 || app.recovery_ui.bulk_discard_count() == 0 {
+        app.set_status("Undo all is available only when every waiting job supports Undo");
         return;
     }
     let paths = work
@@ -1364,7 +1309,7 @@ pub fn complete_discard(
                     app.active_overlay = ActiveOverlay::None;
                 }
                 app.set_status(format!(
-                    "Interrupted operation discarded: {} incomplete output{} deleted, {} source name{} restored",
+                    "Undo complete: {} unfinished path{} deleted, {} original name{} restored",
                     summary.deleted_incomplete,
                     plural(summary.deleted_incomplete),
                     summary.restored_sources,
@@ -1373,7 +1318,7 @@ pub fn complete_discard(
             } else {
                 app.recovery_ui.open_window();
                 app.set_status(format!(
-                    "Interrupted operation discarded; {} blocked path{} released",
+                    "Undo complete; {} locked path{} released",
                     summary.released_paths,
                     plural(summary.released_paths),
                 ));
@@ -1390,7 +1335,7 @@ pub fn complete_discard(
                 app.active_overlay = ActiveOverlay::FileRecovery;
             }
             app.set_status(format!(
-                "Discard did not complete: {}",
+                "Undo did not complete: {}",
                 user_safe_discard_error(&error)
             ));
         }
@@ -1401,56 +1346,6 @@ fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
 }
 
-fn single_discard_header(entry: &RecoveryEntry) -> String {
-    format!("Discard this interrupted {} operation:", entry.kind_label())
-}
-
-fn bulk_discard_header(count: usize) -> String {
-    format!(
-        "Discard {count} reversible interrupted copy/move operation{}:",
-        plural(count)
-    )
-}
-
-const INSPECTOR_SCOPE_LINE: &str =
-    "This interrupted copy/move operation cannot be changed automatically.";
-
-const UNREADABLE_BLOCKING_NOTE: &str =
-    "Saved record cannot be interpreted. Earlier path reservations may remain blocked until Set aside succeeds.";
-const UNREADABLE_PATH_NOTE: &str =
-    "Exact affected path names may not be recoverable from the unreadable record; the blocked-path inventory is unknown, not empty.";
-
-fn decide_later(app: &mut AppState) {
-    let count = app.recovery_ui.entries.len();
-    app.recovery_ui.minimize();
-    app.active_overlay = ActiveOverlay::None;
-    app.set_status(format!(
-        "{count} interrupted operation{} remain unresolved; overlapping file changes and undo/redo remain unavailable until they are resolved",
-        plural(count),
-    ));
-}
-
-fn defer_selected(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
-    let Some(queue_id) = app
-        .recovery_ui
-        .selected_entry()
-        .filter(|entry| entry.can_defer())
-        .and_then(|entry| entry.queue_id)
-    else {
-        app.set_status(
-            "The selected interrupted operation is already saved for later or is not available to defer",
-        );
-        return;
-    };
-    super::keybindings::defer_file_transfer_recovery(app, Some(queue_id), tx);
-    refresh_from_runtime(app);
-    if !app.recovery_ui.entries.is_empty() {
-        app.recovery_ui.surface = RecoverySurface::Window;
-        app.recovery_ui.focus = 0;
-        app.active_overlay = ActiveOverlay::FileRecovery;
-    }
-}
-
 fn resume_selected(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     if let Some(entry) = app.recovery_ui.selected_entry().filter(|entry| {
         entry.can_resume() && entry.record.as_ref().is_some_and(DurableFileTaskRecord::is_native_extraction)
@@ -1459,11 +1354,11 @@ fn resume_selected(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
         app.recovery_ui.minimize();
         app.active_overlay = ActiveOverlay::None;
         match super::native_extract_task::resume_from_journal(app, &path, tx) {
-            Ok(()) => app.set_status("Resuming native extraction in detached file-task worker"),
+            Ok(()) => app.set_status("Finishing extraction in the file-task worker"),
             Err(error) => {
                 app.recovery_ui.open_window();
                 app.active_overlay = ActiveOverlay::FileRecovery;
-                app.set_status(format!("Cannot resume extraction: {error}"));
+                app.set_status(format!("Cannot finish extraction: {error}"));
             }
         }
         return;
@@ -1473,7 +1368,7 @@ fn resume_selected(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
         .selected_entry()
         .and_then(|entry| entry.queue_id)
     else {
-        app.set_status("This interrupted operation cannot be resumed automatically");
+        app.set_status("This interrupted job cannot be finished automatically");
         return;
     };
     // The serial scheduler intentionally will not launch underneath an
@@ -1488,7 +1383,7 @@ fn resume_selected(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
 
 fn resume_queue_ids(app: &mut AppState, ids: Vec<u64>, tx: &mpsc::Sender<AppMessage>) {
     if ids.is_empty() {
-        app.set_status("No interrupted operations are ready to resume");
+        app.set_status("No interrupted jobs are ready to finish");
         return;
     }
     app.recovery_ui.minimize();
@@ -1499,7 +1394,7 @@ fn resume_queue_ids(app: &mut AppState, ids: Vec<u64>, tx: &mpsc::Sender<AppMess
 
 fn resume_all(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     if !app.recovery_ui.resume_all_available() {
-        app.set_status("Resume all is not available while an operation needs review");
+        app.set_status("Finish all is unavailable while a job needs a decision");
         return;
     }
     let ids = app
@@ -1511,2222 +1406,8 @@ fn resume_all(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     resume_queue_ids(app, ids, tx);
 }
 
-fn resume_reviewed_set(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
-    let ids = app
-        .recovery_ui
-        .entries
-        .iter()
-        .filter(|entry| app.recovery_ui.can_resume_unattended(entry))
-        .filter_map(|entry| entry.queue_id)
-        .collect::<Vec<_>>();
-    resume_queue_ids(app, ids, tx);
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WindowAction {
-    Watch,
-    Pause,
-    ResumeRunning,
-    StopAndUndo,
-    ForceStop,
-    LeaveRunning,
-    CancelQueuedResume,
-    KeepWaiting,
-    Resume,
-    Discard,
-    Details,
-    Inspect,
-    SetAside,
-    Later,
-}
-
-fn window_actions(entry: &RecoveryEntry) -> Vec<WindowAction> {
-    if entry.is_unreadable() {
-        return vec![WindowAction::SetAside, WindowAction::Inspect];
-    }
-    if entry.is_live() {
-        let mut actions = vec![WindowAction::Watch];
-        if entry.has_observed_control() {
-            if entry.live_snapshot.as_ref().is_some_and(|s| matches!(s.phase, tui_file_picker::FileTaskPhase::Paused)) {
-                actions.push(WindowAction::ResumeRunning);
-            } else {
-                actions.push(WindowAction::Pause);
-            }
-            actions.push(WindowAction::StopAndUndo);
-        }
-        if entry.worker_pid().is_some() && (entry.is_stalled()
-            || entry.stop_requested_unix_ms.is_some_and(|ms| unix_ms_now().saturating_sub(ms) >= 10_000)) {
-            actions.push(WindowAction::ForceStop);
-        }
-        actions.push(WindowAction::Details);
-        actions.push(WindowAction::LeaveRunning);
-        return actions;
-    }
-    if entry.resume_committed {
-        let mut actions = Vec::new();
-        if entry.approved_resume_queue_id.is_some() {
-            actions.push(WindowAction::CancelQueuedResume);
-        }
-        actions.extend([WindowAction::KeepWaiting, WindowAction::Details]);
-        return actions;
-    }
-    let mut actions = Vec::new();
-    if entry.can_resume() {
-        actions.push(WindowAction::Resume);
-    }
-    if entry.can_discard() {
-        actions.push(WindowAction::Discard);
-    }
-    actions.push(WindowAction::Details);
-    if entry.can_defer() {
-        actions.push(WindowAction::Later);
-    }
-    actions
-}
-
-fn visible_action_count(state: &RecoveryUiState) -> usize {
-    match state.surface {
-        RecoverySurface::Prompt => 2 + usize::from(state.resume_all_available()),
-        RecoverySurface::Window => {
-            let primary = state
-                .selected_entry()
-                .map(window_actions)
-                .map_or(0, |actions| actions.len());
-            primary
-                + usize::from(state.resume_count() > 0)
-                + usize::from(state.bulk_discard_count() > 0)
-        }
-        RecoverySurface::Details => 2,
-        RecoverySurface::DiscardConfirm | RecoverySurface::BulkDiscardConfirm
-        | RecoverySurface::StopConfirm | RecoverySurface::ForceStopConfirm
-        | RecoverySurface::SetAsideConfirm => 2,
-        RecoverySurface::Inspector => 2,
-    }
-}
-
-fn cycle_focus(state: &mut RecoveryUiState, reverse: bool) {
-    let count = visible_action_count(state);
-    if count == 0 {
-        state.focus = 0;
-        return;
-    }
-    state.focus = if reverse {
-        if state.focus == 0 { count - 1 } else { state.focus - 1 }
-    } else {
-        (state.focus + 1) % count
-    };
-}
-
-fn move_selection(state: &mut RecoveryUiState, delta: isize) {
-    if state.entries.is_empty() {
-        return;
-    }
-    let last = state.entries.len() - 1;
-    state.selected = if delta < 0 {
-        state.selected.saturating_sub(delta.unsigned_abs())
-    } else {
-        state.selected.saturating_add(delta as usize).min(last)
-    };
-    state.focus = 0;
-    state.details_scroll = 0;
-}
-
-fn single_discard_effect_count(entry: &RecoveryEntry) -> usize {
-    let direct_rename = entry
-        .record
-        .as_ref()
-        .map_or(0, |record| record.native_rename_intents.len());
-    let base = 4 + usize::from(direct_rename > 0) + if entry.irreversible() { 3 } else { 0 };
-    if entry.is_discard_cleanup() {
-        // Cleanup may have stopped at any durable obligation, so keep enough
-        // scroll range for the same itemized consequences plus the final
-        // record-retirement line. Overestimating by one is harmless;
-        // underestimating could make a pending effect unreachable.
-        base.saturating_add(1)
-    } else {
-        base
-    }
-}
-
-fn auxiliary_scroll_count(state: &RecoveryUiState) -> usize {
-    match state.surface {
-        RecoverySurface::Details => state.details_count(state.details_tab),
-        RecoverySurface::DiscardConfirm => state
-            .selected_entry()
-            .map_or(0, single_discard_effect_count),
-        RecoverySurface::BulkDiscardConfirm => state.bulk_discard_count().saturating_mul(2),
-        RecoverySurface::Inspector | RecoverySurface::Prompt | RecoverySurface::Window
-        | RecoverySurface::StopConfirm | RecoverySurface::ForceStopConfirm
-        | RecoverySurface::SetAsideConfirm => 0,
-    }
-}
-
-fn scroll_auxiliary(state: &mut RecoveryUiState, delta: isize) {
-    let max_scroll = auxiliary_scroll_count(state).saturating_sub(1);
-    if delta < 0 {
-        state.details_scroll = state.details_scroll.saturating_sub(delta.unsigned_abs());
-    } else {
-        state.details_scroll = state
-            .details_scroll
-            .saturating_add(delta as usize)
-            .min(max_scroll);
-    }
-}
-
-pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
-    if key.code == KeyCode::Char('m') && key.modifiers == KeyModifiers::ALT {
-        app.recovery_ui.maximized = !app.recovery_ui.maximized;
-        return;
-    }
-    match app.recovery_ui.surface {
-        RecoverySurface::Prompt => match key.code {
-            KeyCode::Esc => decide_later(app),
-            KeyCode::Tab => cycle_focus(
-                &mut app.recovery_ui,
-                key.modifiers.contains(KeyModifiers::SHIFT),
-            ),
-            KeyCode::BackTab => cycle_focus(&mut app.recovery_ui, true),
-            KeyCode::Enter => activate_prompt_focus(app, tx),
-            _ => {}
-        },
-        RecoverySurface::Window => match key.code {
-            KeyCode::Esc => {
-                app.recovery_ui.minimize();
-                app.active_overlay = ActiveOverlay::None;
-            }
-            KeyCode::Up => move_selection(&mut app.recovery_ui, -1),
-            KeyCode::Down => move_selection(&mut app.recovery_ui, 1),
-            KeyCode::PageUp => move_selection(&mut app.recovery_ui, -8),
-            KeyCode::PageDown => move_selection(&mut app.recovery_ui, 8),
-            KeyCode::Tab => cycle_focus(
-                &mut app.recovery_ui,
-                key.modifiers.contains(KeyModifiers::SHIFT),
-            ),
-            KeyCode::BackTab => cycle_focus(&mut app.recovery_ui, true),
-            KeyCode::Enter => activate_window_focus(app, tx),
-            _ => {}
-        },
-        RecoverySurface::Details => match key.code {
-            KeyCode::Esc => app.recovery_ui.open_window(),
-            KeyCode::Left => select_adjacent_tab(app, -1, tx),
-            KeyCode::Right => select_adjacent_tab(app, 1, tx),
-            KeyCode::Up => scroll_auxiliary(&mut app.recovery_ui, -1),
-            KeyCode::Down => scroll_auxiliary(&mut app.recovery_ui, 1),
-            KeyCode::PageUp => scroll_auxiliary(&mut app.recovery_ui, -8),
-            KeyCode::PageDown => scroll_auxiliary(&mut app.recovery_ui, 8),
-            KeyCode::Tab => cycle_focus(
-                &mut app.recovery_ui,
-                key.modifiers.contains(KeyModifiers::SHIFT),
-            ),
-            KeyCode::BackTab => cycle_focus(&mut app.recovery_ui, true),
-            KeyCode::Enter => activate_details_focus(app, tx),
-            _ => {}
-        },
-        RecoverySurface::DiscardConfirm => match key.code {
-            KeyCode::Esc => app.recovery_ui.open_window(),
-            KeyCode::Up => scroll_auxiliary(&mut app.recovery_ui, -1),
-            KeyCode::Down => scroll_auxiliary(&mut app.recovery_ui, 1),
-            KeyCode::Tab => cycle_focus(
-                &mut app.recovery_ui,
-                key.modifiers.contains(KeyModifiers::SHIFT),
-            ),
-            KeyCode::BackTab => cycle_focus(&mut app.recovery_ui, true),
-            KeyCode::Enter => {
-                if app.recovery_ui.focus == 0 {
-                    begin_single_discard(app, tx);
-                } else {
-                    app.recovery_ui.open_window();
-                }
-            }
-            _ => {}
-        },
-        RecoverySurface::BulkDiscardConfirm => match key.code {
-            KeyCode::Esc => app.recovery_ui.open_window(),
-            KeyCode::Up => scroll_auxiliary(&mut app.recovery_ui, -1),
-            KeyCode::Down => scroll_auxiliary(&mut app.recovery_ui, 1),
-            KeyCode::PageUp => scroll_auxiliary(&mut app.recovery_ui, -6),
-            KeyCode::PageDown => scroll_auxiliary(&mut app.recovery_ui, 6),
-            KeyCode::Tab => cycle_focus(
-                &mut app.recovery_ui,
-                key.modifiers.contains(KeyModifiers::SHIFT),
-            ),
-            KeyCode::BackTab => cycle_focus(&mut app.recovery_ui, true),
-            KeyCode::Enter => {
-                if app.recovery_ui.focus == 0 {
-                    begin_bulk_discard(app, tx);
-                } else {
-                    app.recovery_ui.open_window();
-                }
-            }
-            _ => {}
-        },
-        RecoverySurface::StopConfirm | RecoverySurface::ForceStopConfirm
-        | RecoverySurface::SetAsideConfirm => match key.code {
-            KeyCode::Esc => app.recovery_ui.open_window(),
-            KeyCode::Tab => cycle_focus(&mut app.recovery_ui, key.modifiers.contains(KeyModifiers::SHIFT)),
-            KeyCode::BackTab => cycle_focus(&mut app.recovery_ui, true),
-            KeyCode::Enter => activate_safety_confirmation(app, tx),
-            _ => {}
-        },
-        RecoverySurface::Inspector => match key.code {
-            KeyCode::Esc => app.recovery_ui.open_window(),
-            KeyCode::Tab => cycle_focus(&mut app.recovery_ui, key.modifiers.contains(KeyModifiers::SHIFT)),
-            KeyCode::BackTab => cycle_focus(&mut app.recovery_ui, true),
-            KeyCode::Enter => {
-                if app.recovery_ui.focus == 0 { app.recovery_ui.open_window();
-                    app.recovery_ui.focus = 0;
-                    activate_window_focus(app, tx);
-                } else { app.recovery_ui.open_window(); }
-            }
-            KeyCode::Up => scroll_auxiliary(&mut app.recovery_ui, -1),
-            KeyCode::Down => scroll_auxiliary(&mut app.recovery_ui, 1),
-            _ => {}
-        },
-    }
-}
-
-fn activate_prompt_focus(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
-    let has_resume_all = app.recovery_ui.resume_all_available();
-    match app.recovery_ui.focus {
-        0 => app.recovery_ui.open_window(),
-        1 if has_resume_all => resume_all(app, tx),
-        _ => decide_later(app),
-    }
-}
-
-fn activate_window_focus(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
-    let Some(entry) = app.recovery_ui.selected_entry() else {
-        return;
-    };
-    let actions = window_actions(entry);
-    let focus = app.recovery_ui.focus;
-    if let Some(action) = actions.get(focus).copied() {
-        match action {
-            WindowAction::Watch => watch_selected_progress(app),
-            WindowAction::Pause => request_running_control(app, super::app::FileTaskControl::Pause),
-            WindowAction::ResumeRunning => request_running_control(app, super::app::FileTaskControl::Resume),
-            WindowAction::StopAndUndo => open_safety_confirm(app, RecoverySurface::StopConfirm),
-            WindowAction::ForceStop => open_safety_confirm(app, RecoverySurface::ForceStopConfirm),
-            WindowAction::LeaveRunning => {
-                app.recovery_ui.minimize();
-                app.active_overlay = ActiveOverlay::None;
-                app.set_status("The transfer continues in its worker; Recovery can watch or control it later");
-            }
-            WindowAction::CancelQueuedResume => {
-                let Some(queue_id) = app.recovery_ui.selected_entry()
-                    .and_then(|entry| entry.approved_resume_queue_id) else {
-                    app.set_status("This approved resume has already left the queue; refresh Recovery");
-                    return;
-                };
-                // The scheduler already owns cancellation and queue sync.
-                // Do not offer Undo while the runnable item could still start.
-                super::keybindings::cancel_queued_file_transfer(app, queue_id, tx);
-                refresh_from_runtime(app);
-                app.recovery_ui.open_window();
-            }
-            WindowAction::KeepWaiting => {
-                app.recovery_ui.minimize();
-                app.active_overlay = ActiveOverlay::None;
-                app.set_status("The approved recovery is waiting to start; no user files were changed by leaving Recovery");
-            }
-            WindowAction::SetAside => open_safety_confirm(app, RecoverySurface::SetAsideConfirm),
-            WindowAction::Resume => resume_selected(app, tx),
-            WindowAction::Discard => open_selected_discard_confirm(app),
-            WindowAction::Details => {
-                open_selected_details(app, tx, RecoveryDetailsReason::BeforeDecision)
-            }
-            WindowAction::Inspect => {
-                app.recovery_ui.surface = RecoverySurface::Inspector;
-                app.recovery_ui.focus = 0;
-                app.recovery_ui.details_scroll = 0;
-            }
-            WindowAction::Later => defer_selected(app, tx),
-        }
-        return;
-    }
-
-    let mut index = actions.len();
-    if app.recovery_ui.resume_count() > 0 {
-        if focus == index {
-            resume_reviewed_set(app, tx);
-            return;
-        }
-        index += 1;
-    }
-    if app.recovery_ui.bulk_discard_count() > 0 && focus == index {
-        app.recovery_ui.surface = RecoverySurface::BulkDiscardConfirm;
-        app.recovery_ui.focus = 1;
-        app.recovery_ui.details_scroll = 0;
-    }
-}
-
-fn open_selected_discard_confirm(app: &mut AppState) {
-    let Some(entry) = app.recovery_ui.selected_entry() else {
-        return;
-    };
-    if !entry.can_discard() {
-        if entry.resume_committed {
-            app.set_status("Resume is already approved for this interrupted operation; wait for or cancel the queued transfer before choosing a different outcome");
-        } else {
-            app.set_status("This interrupted operation needs review before it can be discarded");
-        }
-        return;
-    }
-    app.recovery_ui.consume_startup_prompt();
-    app.recovery_ui.surface = RecoverySurface::DiscardConfirm;
-    app.recovery_ui.focus = 1;
-    app.recovery_ui.details_scroll = 0;
-}
-
-fn open_selected_details(
-    app: &mut AppState,
-    tx: &mpsc::Sender<AppMessage>,
-    requested_reason: RecoveryDetailsReason,
-) {
-    let Some(entry) = app.recovery_ui.selected_entry() else {
-        return;
-    };
-    let reason = if entry.state_label() == "cleanup pending" {
-        RecoveryDetailsReason::CleanupPending
-    } else {
-        requested_reason
-    };
-    let tab = match reason {
-        RecoveryDetailsReason::BeforeDecision => RecoveryDetailsTab::IncompleteFiles,
-        RecoveryDetailsReason::Refusal(_) => RecoveryDetailsTab::BlockedPaths,
-        RecoveryDetailsReason::CleanupPending => {
-            if !entry.incomplete_paths().is_empty() {
-                RecoveryDetailsTab::IncompleteFiles
-            } else if !entry.renamed_sources().is_empty() {
-                RecoveryDetailsTab::RenamedSources
-            } else {
-                RecoveryDetailsTab::BlockedPaths
-            }
-        }
-        RecoveryDetailsReason::Ordinary => {
-            if !entry.blocked_paths().is_empty() {
-                RecoveryDetailsTab::BlockedPaths
-            } else if !entry.incomplete_paths().is_empty() {
-                RecoveryDetailsTab::IncompleteFiles
-            } else {
-                RecoveryDetailsTab::RenamedSources
-            }
-        }
-    };
-    app.recovery_ui.open_details(tab, reason);
-    request_incomplete_sizes_if_needed(app, tx);
-}
-
-fn select_adjacent_tab(app: &mut AppState, delta: isize, tx: &mpsc::Sender<AppMessage>) {
-    let current = RecoveryDetailsTab::ALL
-        .iter()
-        .position(|tab| *tab == app.recovery_ui.details_tab)
-        .unwrap_or(0);
-    let next = if delta < 0 {
-        current.saturating_sub(1)
-    } else {
-        (current + 1).min(RecoveryDetailsTab::ALL.len() - 1)
-    };
-    app.recovery_ui.details_tab = RecoveryDetailsTab::ALL[next];
-    app.recovery_ui.details_scroll = 0;
-    request_incomplete_sizes_if_needed(app, tx);
-}
-
-fn activate_details_focus(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
-    let focus = app.recovery_ui.focus;
-    app.recovery_ui.open_window();
-    if focus == 0 {
-        app.recovery_ui.focus = 0;
-        activate_window_focus(app, tx);
-    }
-}
-
-pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<AppMessage>) {
-    match mouse.kind {
-        MouseEventKind::ScrollUp => {
-            match app.recovery_ui.surface {
-                RecoverySurface::Window => move_selection(&mut app.recovery_ui, -3),
-                RecoverySurface::Details
-                | RecoverySurface::DiscardConfirm
-                | RecoverySurface::BulkDiscardConfirm
-                | RecoverySurface::StopConfirm | RecoverySurface::ForceStopConfirm
-                | RecoverySurface::SetAsideConfirm
-                | RecoverySurface::Inspector => scroll_auxiliary(&mut app.recovery_ui, -3),
-                RecoverySurface::Prompt => {}
-            }
-            return;
-        }
-        MouseEventKind::ScrollDown => {
-            match app.recovery_ui.surface {
-                RecoverySurface::Window => move_selection(&mut app.recovery_ui, 3),
-                RecoverySurface::Details
-                | RecoverySurface::DiscardConfirm
-                | RecoverySurface::BulkDiscardConfirm
-                | RecoverySurface::StopConfirm | RecoverySurface::ForceStopConfirm
-                | RecoverySurface::SetAsideConfirm
-                | RecoverySurface::Inspector => scroll_auxiliary(&mut app.recovery_ui, 3),
-                RecoverySurface::Prompt => {}
-            }
-            return;
-        }
-        MouseEventKind::Down(MouseButton::Left) => {}
-        _ => return,
-    }
-
-    let Some(button) = app.button_map.find_button_at(mouse.column, mouse.row) else {
-        return;
-    };
-    match button {
-        TuiButton::RecoveryTitle => {
-            if app.double_click.register_click(
-                TuiButton::RecoveryTitle,
-                mouse.column,
-                mouse.row,
-                tui_file_picker::DOUBLE_CLICK_WINDOW,
-            ) {
-                app.recovery_ui.maximized = !app.recovery_ui.maximized;
-            }
-        }
-        TuiButton::RecoveryPromptAction(index) => {
-            app.recovery_ui.focus = index as usize;
-            activate_prompt_focus(app, tx);
-        }
-        TuiButton::RecoveryListRow(index) if index < app.recovery_ui.entries.len() => {
-            app.recovery_ui.selected = index;
-            app.recovery_ui.focus = 0;
-        }
-        TuiButton::RecoveryAction(index) => {
-            app.recovery_ui.focus = index as usize;
-            activate_window_focus(app, tx);
-        }
-        TuiButton::RecoveryBulkResume => {
-            if app.recovery_ui.resume_count() > 0 {
-                resume_reviewed_set(app, tx);
-            }
-        }
-        TuiButton::RecoveryBulkDiscard => {
-            if app.recovery_ui.bulk_discard_count() > 0 {
-                app.recovery_ui.surface = RecoverySurface::BulkDiscardConfirm;
-                app.recovery_ui.focus = 1;
-                app.recovery_ui.details_scroll = 0;
-            }
-        }
-        TuiButton::RecoveryDetailsTab(index)
-            if (index as usize) < RecoveryDetailsTab::ALL.len() =>
-        {
-            app.recovery_ui.details_tab = RecoveryDetailsTab::ALL[index as usize];
-            app.recovery_ui.details_scroll = 0;
-            request_incomplete_sizes_if_needed(app, tx);
-        }
-        TuiButton::RecoveryDetailsClose => app.recovery_ui.open_window(),
-        TuiButton::RecoveryConfirm(index) => {
-            app.recovery_ui.focus = index as usize;
-            match app.recovery_ui.surface {
-                RecoverySurface::DiscardConfirm => {
-                    if index == 0 {
-                        begin_single_discard(app, tx);
-                    } else {
-                        app.recovery_ui.open_window();
-                    }
-                }
-                RecoverySurface::BulkDiscardConfirm => {
-                    if index == 0 {
-                        begin_bulk_discard(app, tx);
-                    } else {
-                        app.recovery_ui.open_window();
-                    }
-                }
-                RecoverySurface::StopConfirm | RecoverySurface::ForceStopConfirm
-                | RecoverySurface::SetAsideConfirm => activate_safety_confirmation(app, tx),
-                _ => {}
-            }
-        }
-        _ => {}
-    }
-}
-
-pub fn draw(f: &mut Frame, app: &mut AppState, theme: super::theme::Theme) {
-    match app.recovery_ui.surface {
-        RecoverySurface::Prompt => draw_prompt(f, app, theme),
-        RecoverySurface::Window => draw_window(f, app, theme),
-        RecoverySurface::Details => draw_details(f, app, theme),
-        RecoverySurface::DiscardConfirm => draw_discard_confirm(f, app, theme, false),
-        RecoverySurface::BulkDiscardConfirm => draw_discard_confirm(f, app, theme, true),
-        RecoverySurface::StopConfirm | RecoverySurface::ForceStopConfirm
-        | RecoverySurface::SetAsideConfirm => draw_safety_confirmation(f, app, theme),
-        RecoverySurface::Inspector => draw_inspector(f, app, theme),
-    }
-}
-
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
-    let width = width.min(area.width);
-    let height = height.min(area.height);
-    Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    )
-}
-
-fn scaled_extent(total: u16, floor: u16, percent: u16) -> u16 {
-    let scaled = (u32::from(total) * u32::from(percent.min(100)) / 100) as u16;
-    scaled.max(floor.min(total)).min(total)
-}
-
-/// The rect the recovery window occupies. Layer-3 surfaces open over that
-/// window, so they take their proportions from it rather than from the whole
-/// terminal — an epi-popup sized against the terminal ends up nearly as wide as
-/// the surface it sits on.
-fn parent_window_rect(area: Rect, maximized: bool) -> Rect {
-    surface_rect(
-        area,
-        WINDOW_MIN_WIDTH,
-        WINDOW_MIN_HEIGHT,
-        WINDOW_WIDTH_PERCENT,
-        Some(WINDOW_HEIGHT_PERCENT),
-        maximized,
-    )
-}
-
-fn surface_rect(
-    area: Rect,
-    min_width: u16,
-    min_height: u16,
-    width_percent: u16,
-    height_percent: Option<u16>,
-    maximized: bool,
-) -> Rect {
-    if maximized {
-        Rect::new(
-            area.x.saturating_add(1),
-            area.y.saturating_add(1),
-            area.width.saturating_sub(2),
-            area.height.saturating_sub(2),
-        )
-    } else {
-        let width = scaled_extent(area.width, min_width, width_percent);
-        let height = height_percent.map_or(min_height.min(area.height), |percent| {
-            scaled_extent(area.height, min_height, percent)
-        });
-        centered_rect(width, height, area)
-    }
-}
-
-fn recovery_block(
-    f: &mut Frame,
-    popup: Rect,
-    label: &str,
-    accent: Color,
-    buttons: &mut ButtonRenderMap,
-    theme: super::theme::Theme,
-    maximized: bool,
-) -> Rect {
-    f.render_widget(Clear, popup);
-    let indicator = if maximized { '▾' } else { '▸' };
-    let block = super::draw::solid_title_block(
-        popup,
-        format!("{indicator} {label}"),
-        accent,
-        theme,
-    );
-    let inner = block.inner(popup);
-    f.render_widget(block, popup);
-    buttons.record_button(
-        TuiButton::RecoveryTitle,
-        Rect::new(
-            popup.x.saturating_add(1),
-            popup.y,
-            popup.width.saturating_sub(2),
-            1,
-        ),
-    );
-    inner
-}
-
-fn draw_prompt(f: &mut Frame, app: &mut AppState, theme: super::theme::Theme) {
-    let popup = surface_rect(
-        f.size(),
-        PROMPT_MIN_WIDTH,
-        PROMPT_MIN_HEIGHT,
-        PROMPT_WIDTH_PERCENT,
-        Some(PROMPT_HEIGHT_PERCENT),
-        app.recovery_ui.maximized,
-    );
-    let count = app.recovery_ui.entries.len();
-    let inner = recovery_block(
-        f,
-        popup,
-        "copy and move recovery",
-        theme.purple,
-        &mut app.button_map,
-        theme,
-        app.recovery_ui.maximized,
-    );
-    if inner.height == 0 {
-        return;
-    }
-    f.render_widget(
-        Paragraph::new(format!("{count} {}", if count == 1 { "entry" } else { "entries" }))
-            .alignment(Alignment::Right)
-            .style(Style::default().fg(theme.text_muted)),
-        Rect::new(inner.x, inner.y, inner.width, 1),
-    );
-    if inner.height >= 3 {
-        f.render_widget(
-            Paragraph::new(format!(
-                "{count} saved copy/move operation{} remain open. Some workers may still be running.\nReview their status and choose the available controls.",
-                plural(count),
-            ))
-            .style(Style::default().fg(theme.text)),
-            Rect::new(
-                inner.x.saturating_add(1),
-                inner.y.saturating_add(1),
-                inner.width.saturating_sub(2),
-                2,
-            ),
-        );
-    }
-
-    let row_y = inner.y.saturating_add(4);
-    let max_rows = inner.height.saturating_sub(8) as usize;
-    let shown = app.recovery_ui.entries.len().min(max_rows.max(1));
-    for (row, entry) in app.recovery_ui.entries.iter().take(shown).enumerate() {
-        draw_compact_entry_row(
-            f,
-            entry,
-            Rect::new(
-                inner.x.saturating_add(1),
-                row_y.saturating_add(row as u16),
-                inner.width.saturating_sub(2),
-                1,
-            ),
-            theme,
-        );
-    }
-    if app.recovery_ui.entries.len() > shown && row_y + (shown as u16) < inner.y + inner.height {
-        f.render_widget(
-            Paragraph::new(format!(
-                "... and {} more",
-                app.recovery_ui.entries.len() - shown
-            ))
-            .style(Style::default().fg(theme.text_dim)),
-            Rect::new(
-                inner.x.saturating_add(2),
-                row_y.saturating_add(shown as u16),
-                inner.width.saturating_sub(3),
-                1,
-            ),
-        );
-    }
-
-    let action_y = inner.y + inner.height.saturating_sub(3);
-    let mut labels = vec![("Review".to_string(), theme.cyan)];
-    if app.recovery_ui.resume_all_available() {
-        labels.push(("Resume all".to_string(), theme.success));
-    }
-    labels.push(("Later".to_string(), theme.dismiss));
-    draw_button_row_owned(
-        f,
-        Rect::new(
-            inner.x.saturating_add(1),
-            action_y,
-            inner.width.saturating_sub(2),
-            1,
-        ),
-        labels,
-        app.recovery_ui.focus,
-        |index| TuiButton::RecoveryPromptAction(index as u8),
-        &mut app.button_map,
-        theme,
-    );
-    f.render_widget(
-        Paragraph::new(
-            "▲ Later keeps their paths blocked and undo unavailable.",
-        )
-        .style(Style::default().fg(theme.warning)),
-        Rect::new(
-            inner.x.saturating_add(1),
-            inner.y + inner.height.saturating_sub(1),
-            inner.width.saturating_sub(2),
-            1,
-        ),
-    );
-}
-
-/// Both recovery list layouts use worker-reported byte progress when live.
-/// Journal root counts describe recoverable work, not an in-flight large file.
-fn recovery_row_progress(entry: &RecoveryEntry) -> (String, String) {
-    if entry.is_live() {
-        return entry.live_snapshot.as_ref().map_or_else(
-            || ("????????".to_string(), "waiting".to_string()),
-            |snapshot| {
-                let ratio = snapshot.totals.byte_ratio();
-                let filled = ratio.map_or(0, |r| (r.clamp(0.0, 1.0) * 8.0).floor() as usize);
-                let bar = ratio.map_or_else(|| "????????".to_string(), |_| {
-                    format!("{}{}", "█".repeat(filled), "░".repeat(8 - filled))
-                });
-                let count = ratio.map_or_else(|| "bytes ?".to_string(), |r| {
-                    format!("{:>3}%", (r * 100.0).round() as u64)
-                });
-                (bar, count)
-            },
-        );
-    }
-    let total = entry.item_count();
-    let completed = entry.completed_count().min(total);
-    let filled = if total == 0 { 0 } else { completed.saturating_mul(8) / total };
-    (format!("{}{}", "█".repeat(filled), "░".repeat(8 - filled)),
-        format!("{completed:>2}/{total:<2}"))
-}
-
-fn draw_compact_entry_row(
-    f: &mut Frame,
-    entry: &RecoveryEntry,
-    area: Rect,
-    theme: super::theme::Theme,
-) {
-    let total = entry.item_count();
-    let (bar, counter) = recovery_row_progress(entry);
-    let destination = entry
-        .record
-        .as_ref()
-        .map(summarize_destination)
-        .unwrap_or_else(|| "record inspection required".to_string());
-    let line = Line::from(vec![
-        Span::styled(
-            format!("{:<5}", entry.kind_label()),
-            Style::default().fg(theme.text_bright),
-        ),
-        Span::styled(
-            format!(" {:>3} item{} ", total, plural(total)),
-            Style::default().fg(theme.text_muted),
-        ),
-        Span::styled(
-            format!("{:<18}", entry.state_label()),
-            Style::default().fg(state_color(entry, theme)),
-        ),
-        Span::styled(format!(" {bar} "), Style::default().fg(theme.cyan)),
-        Span::styled(
-            format!("{counter}  "),
-            Style::default().fg(theme.text_muted),
-        ),
-        Span::styled(destination, Style::default().fg(theme.text)),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
-}
-
-fn state_color(entry: &RecoveryEntry, theme: super::theme::Theme) -> Color {
-    if entry.is_unreadable() || entry.irreversible() {
-        theme.error
-    } else if entry.is_live() {
-        theme.info
-    } else if entry.state_label() == "cleanup pending" {
-        theme.warning
-    } else if entry.state_label() == "completed" {
-        theme.success
-    } else {
-        theme.info
-    }
-}
-
-fn draw_window(f: &mut Frame, app: &mut AppState, theme: super::theme::Theme) {
-    let popup = surface_rect(
-        f.size(),
-        WINDOW_MIN_WIDTH,
-        WINDOW_MIN_HEIGHT,
-        WINDOW_WIDTH_PERCENT,
-        Some(WINDOW_HEIGHT_PERCENT),
-        app.recovery_ui.maximized,
-    );
-    let count = app.recovery_ui.entries.len();
-    let inner = recovery_block(
-        f,
-        popup,
-        "recovery · copy and move",
-        theme.cyan,
-        &mut app.button_map,
-        theme,
-        app.recovery_ui.maximized,
-    );
-    if inner.width < 20 || inner.height < 5 {
-        return;
-    }
-    f.render_widget(
-        Paragraph::new(format!("{count} unresolved · {} waiting for a decision", app.recovery_ui.needs_attention_count()))
-            .alignment(Alignment::Right)
-            .style(Style::default().fg(theme.text_muted)),
-        Rect::new(inner.x, inner.y, inner.width, 1),
-    );
-
-    let footer_height = 3u16.min(inner.height.saturating_sub(1));
-    let body_y = inner.y.saturating_add(1);
-    let body_height = inner.height.saturating_sub(1 + footer_height);
-    let left_width = if inner.width >= 70 {
-        ((u32::from(inner.width) * 43 / 100) as u16)
-            .max(30)
-            .min(inner.width.saturating_sub(20))
-    } else {
-        inner.width / 2
-    };
-    let divider_x = inner.x.saturating_add(left_width);
-    let left = Rect::new(inner.x, body_y, left_width, body_height);
-    let right = Rect::new(
-        divider_x.saturating_add(1),
-        body_y,
-        inner.width.saturating_sub(left_width + 1),
-        body_height,
-    );
-    if body_height > 0 {
-        f.render_widget(
-            Paragraph::new("│\n".repeat(body_height as usize))
-                .style(Style::default().fg(theme.border_dim)),
-            Rect::new(divider_x, body_y, 1, body_height),
-        );
-    }
-    draw_recovery_list(f, app, left, theme);
-    draw_recovery_detail_pane(f, app, right, theme);
-
-    let footer_y = inner.y + inner.height.saturating_sub(2);
-    let partition_y = footer_y.saturating_sub(1);
-    if popup.width >= 3 && partition_y > popup.y {
-        let divider_offset = divider_x.saturating_sub(popup.x) as usize;
-        let mut partition = vec!['─'; popup.width as usize];
-        partition[0] = '├';
-        if let Some(last) = partition.last_mut() {
-            *last = '┤';
-        }
-        if divider_offset < partition.len().saturating_sub(1) {
-            partition[divider_offset] = '┴';
-        }
-        // The horizontal rule is deliberately dim, but its junctions are
-        // part of the cyan outer frame. Do not repaint those frame cells with
-        // the dim divider style (which makes both side rails look broken).
-        let middle = partition[1..partition.len() - 1].iter().collect::<String>();
-        let partition = Line::from(vec![
-            Span::styled("├", Style::default().fg(theme.cyan)),
-            Span::styled(middle, Style::default().fg(theme.border_dim)),
-            Span::styled("┤", Style::default().fg(theme.cyan)),
-        ]);
-        f.render_widget(Paragraph::new(partition),
-            Rect::new(popup.x, partition_y, popup.width, 1));
-    }
-    let resume = app.recovery_ui.resume_count();
-    let discard = app.recovery_ui.bulk_discard_count();
-    let attention = app.recovery_ui.needs_attention_count();
-    let primary_count = app
-        .recovery_ui
-        .selected_entry()
-        .map(window_actions)
-        .map_or(0, |actions| actions.len());
-    let resume_focus = (resume > 0).then_some(primary_count);
-    let discard_focus = (discard > 0)
-        .then_some(primary_count + usize::from(resume > 0));
-    let resume_label = format!("Resume {resume}");
-    let discard_label = format!("Discard and restore {discard}");
-    let separator = " · ";
-    let resume_style = if resume_focus == Some(app.recovery_ui.focus) {
-        Style::default()
-            .fg(theme.bg)
-            .bg(theme.success)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme.success).add_modifier(Modifier::BOLD)
-    };
-    let discard_style = if discard_focus == Some(app.recovery_ui.focus) {
-        Style::default()
-            .fg(theme.bg)
-            .bg(theme.warning)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme.warning).add_modifier(Modifier::BOLD)
-    };
-
-    let footer_x = inner.x.saturating_add(1);
-    let mut cursor_x = footer_x;
-    let mut footer_spans = Vec::new();
-    if resume > 0 {
-        app.button_map.record_button(
-            TuiButton::RecoveryBulkResume,
-            Rect::new(cursor_x, footer_y, resume_label.chars().count() as u16, 1),
-        );
-        footer_spans.push(Span::styled(resume_label.clone(), resume_style));
-        cursor_x = cursor_x.saturating_add(resume_label.chars().count() as u16);
-    }
-    if discard > 0 {
-        if !footer_spans.is_empty() {
-            footer_spans.push(Span::styled(
-                separator,
-                Style::default().fg(theme.text_muted),
-            ));
-            cursor_x = cursor_x.saturating_add(separator.chars().count() as u16);
-        }
-        app.button_map.record_button(
-            TuiButton::RecoveryBulkDiscard,
-            Rect::new(
-                cursor_x,
-                footer_y,
-                discard_label.chars().count() as u16,
-                1,
-            ),
-        );
-        footer_spans.push(Span::styled(discard_label.clone(), discard_style));
-    }
-    if !footer_spans.is_empty() {
-        footer_spans.push(Span::styled(
-            separator,
-            Style::default().fg(theme.text_muted),
-        ));
-    }
-    footer_spans.push(Span::styled(
-        format!("{attention} needs attention"),
-        Style::default().fg(theme.text_muted),
-    ));
-    f.render_widget(
-        Paragraph::new(Line::from(footer_spans)),
-        Rect::new(
-            footer_x,
-            footer_y,
-            inner.width.saturating_sub(2),
-            1,
-        ),
-    );
-    f.render_widget(
-        Paragraph::new(format!(
-            "▲ {count} saved operations · reserved paths are released when recovery finishes"
-        ))
-        .style(Style::default().fg(theme.warning)),
-        Rect::new(
-            inner.x.saturating_add(1),
-            footer_y.saturating_add(1),
-            inner.width.saturating_sub(2),
-            1,
-        ),
-    );
-}
-
-fn draw_recovery_list(f: &mut Frame, app: &mut AppState, area: Rect, theme: super::theme::Theme) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let visible = area.height as usize;
-    if app.recovery_ui.selected < app.recovery_ui.list_scroll {
-        app.recovery_ui.list_scroll = app.recovery_ui.selected;
-    }
-    if app.recovery_ui.selected >= app.recovery_ui.list_scroll.saturating_add(visible) {
-        app.recovery_ui.list_scroll = app
-            .recovery_ui
-            .selected
-            .saturating_add(1)
-            .saturating_sub(visible);
-    }
-    for row in 0..visible {
-        let index = app.recovery_ui.list_scroll + row;
-        let Some(entry) = app.recovery_ui.entries.get(index) else {
-            break;
-        };
-        let y = area.y.saturating_add(row as u16);
-        let selected = index == app.recovery_ui.selected;
-        let background = if selected {
-            theme.selection_bg
-        } else {
-            theme.panel_bg
-        };
-        let total = entry.item_count();
-        let (bar, counter) = recovery_row_progress(entry);
-        let line = Line::from(vec![
-            Span::styled(
-                format!(" {:<4} {:>2} ", entry.kind_label(), total),
-                Style::default().fg(theme.text_bright).bg(background),
-            ),
-            Span::styled(
-                format!("{:<17}", entry.state_label()),
-                Style::default()
-                    .fg(state_color(entry, theme))
-                    .bg(background),
-            ),
-            Span::styled(
-                format!(" {bar} {counter}"),
-                Style::default().fg(theme.text).bg(background),
-            ),
-        ]);
-        f.render_widget(
-            Paragraph::new(line).style(Style::default().bg(background)),
-            Rect::new(area.x, y, area.width, 1),
-        );
-        app.button_map.record_button(
-            TuiButton::RecoveryListRow(index),
-            Rect::new(area.x, y, area.width, 1),
-        );
-    }
-}
-
-fn draw_recovery_detail_pane(
-    f: &mut Frame,
-    app: &mut AppState,
-    area: Rect,
-    theme: super::theme::Theme,
-) {
-    let Some(entry) = app.recovery_ui.selected_entry() else {
-        f.render_widget(
-            Paragraph::new("No interrupted operations.")
-                .style(Style::default().fg(theme.text_muted)),
-            area,
-        );
-        return;
-    };
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-    if entry.is_unreadable() || entry.record.is_none() {
-        let diagnostic = entry
-            .diagnostic
-            .as_deref()
-            .unwrap_or("The operation record could not be interpreted safely.");
-        let text = format!(
-            "Record unreadable\n\n{UNREADABLE_BLOCKING_NOTE}\n\n{UNREADABLE_PATH_NOTE}\n\nNo automatic resume or undo is offered.\n\nDiagnostic: {}",
-            user_safe_diagnostic(diagnostic)
-        );
-        let text_height = area.height.saturating_sub(3);
-        f.render_widget(
-            Paragraph::new(text)
-                .wrap(Wrap { trim: false })
-                .style(Style::default().fg(theme.error)),
-            Rect::new(
-                area.x.saturating_add(1),
-                area.y,
-                area.width.saturating_sub(2),
-                text_height,
-            ),
-        );
-        draw_window_actions(f, app, area, theme);
-        return;
-    }
-    let Some(record) = entry.record.as_ref() else {
-        return;
-    };
-    let source = summarize_sources(record);
-    let destination = summarize_destination(record);
-    let overlap = overlapping_entry_count(&app.recovery_ui.entries, entry);
-    let action_height = if window_actions(entry)
-        .iter()
-        .any(|action| *action != WindowAction::Details)
-    {
-        3
-    } else {
-        1
-    };
-    let text_area = Rect::new(
-        area.x.saturating_add(1),
-        area.y,
-        area.width.saturating_sub(2),
-        area.height.saturating_sub(action_height),
-    );
-    let header_left = format!(
-        "{} · {} item{}",
-        entry.kind_label(),
-        entry.item_count(),
-        plural(entry.item_count())
-    );
-    let header_right = format!(
-        "{} · {}",
-        if entry.is_live() { entry.state_label() } else { "no longer running" },
-        age_label(record.created_unix_ms)
-    );
-    let header_width = text_area.width as usize;
-    let header_gap = header_width.saturating_sub(
-        header_left
-            .chars()
-            .count()
-            .saturating_add(header_right.chars().count()),
-    );
-    let header = if header_gap > 0 {
-        format!("{header_left}{}{header_right}", " ".repeat(header_gap))
-    } else {
-        format!("{header_left} · {}", age_label(record.created_unix_ms))
-    };
-    let mut lines = vec![
-        Line::from(Span::styled(
-            header,
-            Style::default()
-                .fg(theme.text_bright)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(vec![
-            Span::styled("From: ", Style::default().fg(theme.text_muted)),
-            Span::styled(source, Style::default().fg(theme.text)),
-        ]),
-        Line::from(vec![
-            Span::styled("To:   ", Style::default().fg(theme.text_muted)),
-            Span::styled(destination, Style::default().fg(theme.text)),
-        ]),
-        Line::raw(""),
-    ];
-    if entry.is_live() {
-        let process = entry.worker_pid()
-            .map(|pid| format!("worker process {pid}"))
-            .unwrap_or_else(|| "worker process active (identity pending)".to_string());
-        lines.push(Line::from(Span::styled(
-            format!("{}: {process}", entry.state_label()),
-            Style::default().fg(if entry.is_stalled() { theme.warning } else { theme.success }),
-        )));
-        if let Some(snapshot) = entry.live_snapshot.as_ref() {
-            lines.push(Line::from(Span::styled(
-                format!("Files: {}/{}  Bytes: {} / {}  Rate: {}",
-                    snapshot.totals.items_done,
-                    snapshot.totals.items_total.map_or_else(|| "unknown".into(), |n| n.to_string()),
-                    human_bytes(snapshot.totals.bytes_done),
-                    snapshot.totals.bytes_total.map_or_else(|| "unknown".into(), human_bytes),
-                    snapshot.rate_bytes_per_sec.map_or_else(|| "unknown".into(), |n| format!("{}/s", human_bytes(n))),
-                ), Style::default().fg(theme.text_bright),
-            )));
-            if let Some(item) = snapshot.current_item.as_ref() {
-                lines.push(Line::from(Span::styled(
-                    format!("Current: {} · {} / {}", item.label,
-                        human_bytes(item.bytes_done),
-                        item.bytes_total.map_or_else(|| "unknown".into(), human_bytes)),
-                    Style::default().fg(theme.text),
-                )));
-            }
-            lines.push(Line::from(Span::styled(
-                format!("Last advancing progress {} · {}", age_label(snapshot.forward_unix_ms), snapshot.status),
-                Style::default().fg(if entry.is_stalled() { theme.warning } else { theme.text_muted }),
-            )));
-        } else {
-            lines.push(Line::from(Span::styled(
-                "Waiting for a current worker progress snapshot; journal updates are not per-byte.",
-                Style::default().fg(theme.warning),
-            )));
-        }
-    } else {
-        lines.push(Line::from(Span::styled(
-            format!("Last progress {}", age_label(record.updated_unix_ms)),
-            Style::default().fg(theme.text_muted),
-        )));
-    }
-    lines.extend([
-        Line::from(Span::styled(
-            outcome_summary(entry),
-            Style::default().fg(theme.info),
-        )),
-        Line::from(Span::styled(
-            reversibility_statement(entry),
-            Style::default().fg(if entry.irreversible() {
-                theme.error
-            } else {
-                theme.warning
-            }),
-        )),
-        Line::from(Span::styled(
-            if record.native_rename_intents.is_empty() {
-                format!(
-                    "Tracked staging path{}: {} · source rename record{}: {} (trees may contain partial files)",
-                    plural(record.temp_artifacts.len()),
-                    record.temp_artifacts.len(),
-                    plural(record.quarantine_artifacts.len()),
-                    record.quarantine_artifacts.len()
-                )
-            } else {
-                format!(
-                    "Tracked staging path{}: {} · renamed source{}: {} · {} direct move{} to recheck",
-                    plural(record.temp_artifacts.len()),
-                    record.temp_artifacts.len(),
-                    plural(record.quarantine_artifacts.len()),
-                    record.quarantine_artifacts.len(),
-                    record.native_rename_intents.len(),
-                    plural(record.native_rename_intents.len())
-                )
-            },
-            Style::default().fg(theme.text_muted),
-        )),
-        Line::from(Span::styled(
-            format!(
-                "Blocking: {} path{} unavailable to other operations until resolved",
-                entry.blocked_paths().len(),
-                plural(entry.blocked_paths().len())
-            ),
-            Style::default().fg(theme.text_muted),
-        )),
-        Line::raw(""),
-    ]);
-    if entry.resume_committed {
-        lines.push(Line::from(Span::styled(
-            if entry.approved_resume_queue_id.is_some() {
-                "Resume approved and queued behind other transfers; Cancel queued resume returns it to review."
-            } else {
-                "Resume approved and starting; it cannot be cancelled from the waiting queue."
-            },
-            Style::default().fg(theme.info),
-        )));
-    }
-    if entry.discard_committed {
-        lines.push(Line::from(Span::styled(
-            "Discard approved; reviewed cleanup is in progress.",
-            Style::default().fg(theme.warning),
-        )));
-    }
-    if entry.session_deferred {
-        lines.push(Line::from(Span::styled(
-            "Saved for later in this session; restart Tonepoet to make Resume available again",
-            Style::default().fg(theme.warning),
-        )));
-    }
-    if !record.native_rename_intents.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "This move stopped around a direct rename. Discard rechecks both paths and restores the original source only when the saved file identity makes that safe.",
-            Style::default().fg(theme.warning),
-        )));
-    }
-    if overlap > 0 {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "Review order: this destination overlaps {overlap} other unresolved operation{}.",
-                plural(overlap)
-            ),
-            Style::default().fg(theme.warning),
-        )));
-    }
-    lines.push(Line::from(Span::styled(
-        format!(
-            "Started {} · {} {}",
-            timestamp_clock(record.created_unix_ms),
-            if entry.is_live() { "last journal checkpoint" } else { "last progress" },
-            timestamp_clock(record.updated_unix_ms)
-        ),
-        Style::default().fg(theme.text_dim),
-    )));
-    f.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }),
-        text_area,
-    );
-    draw_window_actions(f, app, area, theme);
-}
-
-fn action_description(action: WindowAction, entry: &RecoveryEntry) -> &'static str {
-    match action {
-        WindowAction::Watch => "Open live file/byte progress; Esc returns without stopping the worker",
-        WindowAction::Pause => "Ask the worker to pause at a safe checkpoint; staged data stays",
-        WindowAction::ResumeRunning => "Ask the paused worker to resume copying or moving",
-        WindowAction::StopAndUndo => "Confirm stop, then remove tracked staging and restore eligible names; published output may remain",
-        WindowAction::ForceStop => "Confirm an identity-checked force stop; partial work will need recovery",
-        WindowAction::LeaveRunning => "Close Recovery; the independent worker keeps running",
-        WindowAction::CancelQueuedResume => "Remove the approved retry from the serial transfer queue; return its saved record to recovery review",
-        WindowAction::KeepWaiting => "Close Recovery and let the already-approved retry continue waiting or starting",
-        WindowAction::SetAside => "Confirm release of reserved paths; file content is left untouched",
-        WindowAction::Resume => "Continue the recorded transfer from its recoverable state",
-        WindowAction::Discard if entry.is_discard_cleanup() => "Finish cleaning private staging and release the saved path reservations",
-        WindowAction::Discard => "Confirm removal of private staging and safe restoration of renamed sources",
-        WindowAction::Details => "Inspect saved paths and staging; details also offer a direct action",
-        WindowAction::Inspect => "Inspect why the record could not be read safely",
-        WindowAction::Later => "Leave the decision for later; reserved paths remain blocked",
-    }
-}
-
-fn action_label(action: WindowAction, entry: &RecoveryEntry) -> (&'static str, bool) {
-    match action {
-        WindowAction::Watch => ("Watch progress", false),
-        WindowAction::Pause => ("Pause", false),
-        WindowAction::ResumeRunning => ("Resume worker", false),
-        WindowAction::StopAndUndo => ("Stop and undo", true),
-        WindowAction::ForceStop => ("Force stop", true),
-        WindowAction::LeaveRunning if entry.is_stalled() => ("Keep waiting", false),
-        WindowAction::LeaveRunning => ("Leave running", false),
-        WindowAction::CancelQueuedResume => ("Cancel queued resume", false),
-        WindowAction::KeepWaiting => ("Keep waiting", false),
-        WindowAction::SetAside => ("Set aside", true),
-        WindowAction::Resume => ("Resume", false),
-        WindowAction::Discard if entry.is_discard_cleanup() => ("Finish cleanup", true),
-        WindowAction::Discard => ("Undo (review)", true),
-        WindowAction::Details => ("Details", false),
-        WindowAction::Inspect => ("Inspect", false),
-        WindowAction::Later => ("Later", false),
-    }
-}
-
-fn draw_window_actions(f: &mut Frame, app: &mut AppState, area: Rect, theme: super::theme::Theme) {
-    let Some(entry) = app.recovery_ui.selected_entry() else { return; };
-    let actions = window_actions(entry);
-    if actions.is_empty() || area.height < 3 || area.width == 0 { return; }
-    let hint = actions.get(app.recovery_ui.focus)
-        .map(|action| action_description(*action, entry))
-        .unwrap_or("Select an action to review its result");
-    let hint_y = area.y.saturating_add(area.height.saturating_sub(1));
-    f.render_widget(Paragraph::new(hint).style(Style::default().fg(theme.text_dim)),
-        Rect::new(area.x.saturating_add(1), hint_y, area.width.saturating_sub(2), 1));
-    // Two rows, at most three decisions each. A single-row layout would hide
-    // Stop/Leave on the right at ordinary 116-column terminal widths.
-    for (index, action) in actions.iter().copied().enumerate() {
-        let row = index / 3;
-        let col = index % 3;
-        if row >= 2 { break; }
-        let cell_width = area.width.saturating_sub(2) / 3;
-        let x = area.x.saturating_add(1 + (col as u16) * cell_width);
-        let y = area.y.saturating_add(area.height.saturating_sub(3 - row as u16));
-        let (label, dangerous) = action_label(action, entry);
-        let text = format!(" {label} ");
-        let width = (text.chars().count() as u16).min(cell_width);
-        let color = if dangerous { theme.warning } else { theme.cyan };
-        let style = if app.recovery_ui.focus == index {
-            Style::default().fg(theme.bg).bg(color).add_modifier(Modifier::BOLD)
-        } else { Style::default().fg(color).add_modifier(Modifier::BOLD) };
-        f.render_widget(Paragraph::new(text).style(style), Rect::new(x, y, width, 1));
-        app.button_map.record_button(TuiButton::RecoveryAction(index as u8), Rect::new(x, y, width, 1));
-    }
-}
-
-fn details_restored_height(state: &RecoveryUiState) -> u16 {
-    let mut rows = state.details_count(state.details_tab);
-    if state.details_tab == RecoveryDetailsTab::BlockedPaths
-        && matches!(state.details_reason, RecoveryDetailsReason::Refusal(_))
-        && rows > 0
-    {
-        rows = rows.saturating_add(1);
-    }
-    (15u16)
-        .saturating_add(rows.min(6) as u16)
-        .clamp(15, DETAILS_MAX_HEIGHT)
-}
-
-fn draw_details(f: &mut Frame, app: &mut AppState, theme: super::theme::Theme) {
-    let popup = surface_rect(
-        parent_window_rect(f.size(), app.recovery_ui.maximized),
-        DETAILS_MIN_WIDTH,
-        details_restored_height(&app.recovery_ui),
-        EPI_POPUP_WIDTH_PERCENT,
-        None,
-        app.recovery_ui.maximized,
-    );
-    let inner = recovery_block(
-        f,
-        popup,
-        "recovery details",
-        theme.cyan,
-        &mut app.button_map,
-        theme,
-        app.recovery_ui.maximized,
-    );
-    let Some(entry) = app.recovery_ui.selected_entry() else {
-        return;
-    };
-    if inner.height < 8 {
-        return;
-    }
-
-    let context_height = 3u16.min(inner.height);
-    let context_area = Rect::new(inner.x, inner.y, inner.width, context_height);
-    f.render_widget(
-        Block::default().style(Style::default().bg(theme.surface)),
-        context_area,
-    );
-    let context = format!(
-        " {} · {} item{}\n {} → {}",
-        entry.kind_label(),
-        entry.item_count(),
-        plural(entry.item_count()),
-        entry
-            .record
-            .as_ref()
-            .map(summarize_sources)
-            .unwrap_or_else(|| "unavailable".to_string()),
-        entry
-            .record
-            .as_ref()
-            .map(summarize_destination)
-            .unwrap_or_else(|| "unavailable".to_string()),
-    );
-    f.render_widget(
-        Paragraph::new(context).style(Style::default().fg(theme.text)),
-        context_area,
-    );
-
-    let tabs_area = Rect::new(
-        inner.x,
-        inner.y.saturating_add(context_height + 1),
-        inner.width,
-        2,
-    );
-    draw_details_tabs(f, app, tabs_area, theme);
-    let footer_height = 5;
-    let inventory_y = tabs_area.y.saturating_add(2);
-    let inventory_height = inner
-        .y
-        .saturating_add(inner.height)
-        .saturating_sub(inventory_y)
-        .saturating_sub(footer_height);
-    draw_details_inventory(
-        f,
-        app,
-        Rect::new(
-            inner.x.saturating_add(1),
-            inventory_y,
-            inner.width.saturating_sub(2),
-            inventory_height,
-        ),
-        theme,
-    );
-    draw_details_footer(
-        f,
-        app,
-        Rect::new(
-            inner.x.saturating_add(1),
-            inner.y + inner.height.saturating_sub(footer_height),
-            inner.width.saturating_sub(2),
-            footer_height,
-        ),
-        theme,
-    );
-}
-
-fn draw_details_tabs(f: &mut Frame, app: &mut AppState, area: Rect, theme: super::theme::Theme) {
-    let border_style = Style::default().fg(theme.cyan);
-    let active_style = Style::default()
-        .fg(theme.cyan)
-        .add_modifier(Modifier::BOLD);
-    let inactive_style = Style::default().fg(theme.text_dim);
-    let mut top = vec![Span::raw(" ")];
-    let mut x = area.x.saturating_add(1);
-    let mut slots = Vec::new();
-    for (index, tab) in RecoveryDetailsTab::ALL.iter().copied().enumerate() {
-        let label = tab.label();
-        let count = format!(" · {}", app.recovery_ui.details_count(tab));
-        let active = tab == app.recovery_ui.details_tab;
-        let natural_width = (label.chars().count()
-            + count.chars().count()
-            + if active { 6 } else { 2 }) as u16;
-        let remaining = area.x.saturating_add(area.width).saturating_sub(x);
-        if remaining == 0 {
-            break;
-        }
-        let width = natural_width.min(remaining);
-        slots.push((active, width));
-        if active {
-            top.push(Span::styled("┌─ ", border_style));
-            top.push(Span::styled(label, active_style));
-            top.push(Span::styled(count, Style::default().fg(theme.text_muted)));
-            top.push(Span::styled(" ─┐", border_style));
-        } else {
-            top.push(Span::styled(format!(" {label}"), inactive_style));
-            top.push(Span::styled(count, Style::default().fg(theme.text_dim)));
-            top.push(Span::raw(" "));
-        }
-        app.button_map.record_button(
-            TuiButton::RecoveryDetailsTab(index as u8),
-            Rect::new(x, area.y, width, 1),
-        );
-        top.push(Span::raw(" "));
-        x = x.saturating_add(width.saturating_add(1));
-    }
-    f.render_widget(
-        Paragraph::new(Line::from(top)),
-        Rect::new(area.x, area.y, area.width, 1),
-    );
-    if area.height >= 2 {
-        let mut bottom = String::from(" ");
-        for (active, width) in slots {
-            if active {
-                bottom.push('┘');
-                bottom.push_str(&" ".repeat(width.saturating_sub(2) as usize));
-                bottom.push('└');
-            } else {
-                bottom.push_str(&"─".repeat(width as usize));
-            }
-            bottom.push('─');
-        }
-        bottom.push_str(&"─".repeat(
-            (area.width as usize).saturating_sub(super::display_width::width(&bottom)),
-        ));
-        f.render_widget(
-            Paragraph::new(Span::styled(bottom, border_style)),
-            Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
-        );
-    }
-}
-
-fn draw_details_inventory(f: &mut Frame, app: &AppState, area: Rect, theme: super::theme::Theme) {
-    let Some(entry) = app.recovery_ui.selected_entry() else {
-        return;
-    };
-    if area.height == 0 {
-        return;
-    }
-    match app.recovery_ui.details_tab {
-        RecoveryDetailsTab::BlockedPaths => {
-            let rows = entry.blocked_paths();
-            let start = app.recovery_ui.details_scroll.min(rows.len());
-            let mut y = area.y;
-            for path in rows.into_iter().skip(start) {
-                if y >= area.y.saturating_add(area.height) {
-                    break;
-                }
-                let highlighted = matches!(
-                    &app.recovery_ui.details_reason,
-                    RecoveryDetailsReason::Refusal(blocked) if blocked == &path
-                );
-                let style = if highlighted {
-                    Style::default()
-                        .fg(theme.text_bright)
-                        .bg(theme.selection_bg)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(theme.text)
-                };
-                f.render_widget(
-                    Paragraph::new(path.display().to_string()).style(style),
-                    Rect::new(area.x, y, area.width, 1),
-                );
-                y = y.saturating_add(1);
-                if highlighted && y < area.y.saturating_add(area.height) {
-                    f.render_widget(
-                        Paragraph::new("Blocked your attempted move")
-                            .style(Style::default().fg(theme.warning).bg(theme.selection_bg)),
-                        Rect::new(area.x, y, area.width, 1),
-                    );
-                    y = y.saturating_add(1);
-                }
-            }
-        }
-        RecoveryDetailsTab::IncompleteFiles => {
-            let rows = entry.incomplete_paths();
-            let start = app.recovery_ui.details_scroll.min(rows.len());
-            for (offset, path) in rows
-                .into_iter()
-                .skip(start)
-                .take(area.height as usize)
-                .enumerate()
-            {
-                let y = area.y.saturating_add(offset as u16);
-                let right = match app.recovery_ui.incomplete_sizes.get(&path) {
-                    Some(Some(size)) => human_bytes(*size),
-                    Some(None) => "tree or size unavailable".to_string(),
-                    None if app
-                        .recovery_ui
-                        .size_requests
-                        .contains(&entry.journal_path) =>
-                    {
-                        "checking...".to_string()
-                    }
-                    None => "size unavailable".to_string(),
-                };
-                let name = path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string());
-                draw_left_right_row(f, area, y, &name, &right, theme);
-            }
-        }
-        RecoveryDetailsTab::RenamedSources => {
-            let rows = entry.renamed_sources();
-            let start = app.recovery_ui.details_scroll.min(rows.len());
-            for (offset, path) in rows
-                .into_iter()
-                .skip(start)
-                .take(area.height as usize)
-                .enumerate()
-            {
-                let y = area.y.saturating_add(offset as u16);
-                let name = path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string());
-                f.render_widget(
-                    Paragraph::new(name).style(Style::default().fg(theme.text)),
-                    Rect::new(area.x, y, area.width, 1),
-                );
-            }
-        }
-    }
-}
-
-fn draw_left_right_row(
-    f: &mut Frame,
-    area: Rect,
-    y: u16,
-    left: &str,
-    right: &str,
-    theme: super::theme::Theme,
-) {
-    let right_width = right.chars().count() as u16;
-    let left_width = area.width.saturating_sub(right_width.saturating_add(1));
-    f.render_widget(
-        Paragraph::new(left).style(Style::default().fg(theme.text)),
-        Rect::new(area.x, y, left_width, 1),
-    );
-    f.render_widget(
-        Paragraph::new(right)
-            .alignment(Alignment::Right)
-            .style(Style::default().fg(theme.text_muted)),
-        Rect::new(
-            area.x.saturating_add(left_width),
-            y,
-            area.width.saturating_sub(left_width),
-            1,
-        ),
-    );
-}
-
-fn draw_details_footer(f: &mut Frame, app: &mut AppState, area: Rect, theme: super::theme::Theme) {
-    let Some(entry) = app.recovery_ui.selected_entry() else {
-        return;
-    };
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-    let record = entry.record.as_ref();
-    let incomplete = record.map_or(0, |record| record.temp_artifacts.len());
-    let renamed = record.map_or(0, |record| record.quarantine_artifacts.len());
-    let released = entry.blocked_paths().len();
-
-    f.render_widget(
-        Paragraph::new("─".repeat(area.width as usize))
-            .style(Style::default().fg(theme.border_dim)),
-        Rect::new(area.x, area.y, area.width, 1),
-    );
-    if area.height >= 2 {
-        f.render_widget(
-            Paragraph::new(if entry.is_live() {
-                "Watch progress  observe current worker bytes/files; Esc returns, job continues"
-            } else {
-                "If resumed     continue from partial files · paths remain blocked"
-            })
-                .style(Style::default().fg(theme.text_muted)),
-            Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
-        );
-    }
-    if area.height >= 4 {
-        let discarded = if entry.is_live() {
-            "Stop and undo   stop worker, then clean eligible staging; published output may remain".to_string()
-        } else if entry.is_discard_cleanup() {
-            format!(
-                "If discarded   finish cleanup · release {released} blocked path{}",
-                plural(released)
-            )
-        } else if entry.irreversible() {
-            format!(
-                "If discarded   delete {incomplete} incomplete · restore surviving renamed sources · keep current output · release {released} blocked path{}",
-                plural(released)
-            )
-        } else if record.is_some_and(|record| !record.native_rename_intents.is_empty()) {
-            format!(
-                "If discarded   delete {incomplete} incomplete · restore source names where the saved file identity still matches · release {released} blocked path{}",
-                plural(released)
-            )
-        } else {
-            format!(
-                "If discarded   delete {incomplete} incomplete · restore {renamed} source name{} · release {released} blocked path{}",
-                plural(renamed),
-                plural(released)
-            )
-        };
-        f.render_widget(
-            Paragraph::new(discarded)
-                .wrap(Wrap { trim: false })
-                .style(Style::default().fg(if entry.irreversible() {
-                    theme.error
-                } else {
-                    theme.warning
-                })),
-            Rect::new(area.x, area.y.saturating_add(2), area.width, 2),
-        );
-    }
-
-    let y = area.y + area.height.saturating_sub(1);
-    let close = " Close ";
-    let close_width = (close.chars().count() as u16).min(area.width);
-    let close_x = area
-        .x
-        .saturating_add(area.width.saturating_sub(close_width));
-    let close_style = if app.recovery_ui.focus == 1 {
-        Style::default()
-            .fg(theme.bg)
-            .bg(theme.dismiss)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(theme.dismiss)
-            .add_modifier(Modifier::BOLD)
-    };
-    f.render_widget(
-        Paragraph::new(close).style(close_style),
-        Rect::new(close_x, y, close_width, 1),
-    );
-    app.button_map.record_button(
-        TuiButton::RecoveryDetailsClose,
-        Rect::new(close_x, y, close_width, 1),
-    );
-    let action = window_actions(entry).into_iter().next();
-    if let Some(action) = action {
-        let label = match action {
-            WindowAction::Watch => " Watch progress ",
-            WindowAction::Resume | WindowAction::ResumeRunning => " Resume ",
-            WindowAction::Pause => " Pause ",
-            WindowAction::StopAndUndo => " Stop and undo ",
-            WindowAction::SetAside => " Set aside ",
-            WindowAction::Discard => " Undo / finish cleanup ",
-            WindowAction::Details | WindowAction::Inspect => " Open actions ",
-            WindowAction::ForceStop => " Force stop ",
-            WindowAction::CancelQueuedResume => " Cancel queued resume ",
-            WindowAction::KeepWaiting => " Keep waiting ",
-            WindowAction::LeaveRunning | WindowAction::Later => " Decide later ",
-        };
-        let width = (label.chars().count() as u16).min(area.width.saturating_sub(close_width));
-        let style = if app.recovery_ui.focus == 0 {
-            Style::default().fg(theme.bg).bg(theme.cyan).add_modifier(Modifier::BOLD)
-        } else { Style::default().fg(theme.cyan).add_modifier(Modifier::BOLD) };
-        f.render_widget(Paragraph::new(label).style(style), Rect::new(area.x, y, width, 1));
-        app.button_map.record_button(TuiButton::RecoveryAction(0), Rect::new(area.x, y, width, 1));
-    }
-
-    let esc = "Esc";
-    let esc_width = esc.chars().count() as u16;
-    if close_x >= area.x.saturating_add(esc_width.saturating_add(2)) {
-        f.render_widget(
-            Paragraph::new(esc)
-                .style(Style::default().fg(theme.text_dim)),
-            Rect::new(close_x.saturating_sub(esc_width + 2), y, esc_width, 1),
-        );
-    }
-}
-
-fn draw_safety_confirmation(f: &mut Frame, app: &mut AppState, theme: super::theme::Theme) {
-    let popup = surface_rect(
-        parent_window_rect(f.size(), app.recovery_ui.maximized),
-        CONFIRM_MIN_WIDTH, 14, EPI_POPUP_WIDTH_PERCENT, None, app.recovery_ui.maximized,
-    );
-    let (title, intro, consequence, affirmative) = match app.recovery_ui.surface {
-        RecoverySurface::StopConfirm => (
-            "stop the running transfer and undo recoverable work",
-            "Ask the worker to stop at its next safe checkpoint. The existing recovery engine then removes tracked staging and restores eligible renamed sources.",
-            "Already published files or folders may remain. A move whose source cleanup began may have deleted files that cannot be restored. Do not interpret this as a complete rollback.",
-            "Stop; then recover",
-        ),
-        RecoverySurface::ForceStopConfirm => (
-            "force stop a stalled or unresponsive worker",
-            "Terminate the identity-verified worker using the operating system's process API. Partial files and durable reservations remain for reconciliation.",
-            "This interrupts a write without a graceful checkpoint. It may leave more partial files than a normal Stop. Cleanup starts only after the worker lease is released; completed output may remain.",
-            "Force stop",
-        ),
-        RecoverySurface::SetAsideConfirm => (
-            "preserve an unreadable record and release paths",
-            "Verify there is no live worker and that its old path reservations can be taken over safely. Preserve the unreadable record under TonePoet's private storage.",
-            "Source and destination files are not removed. Those files may still contain partial work. Once paths are released, future operations can overlap them; inspect the disk before proceeding.",
-            "Set aside record",
-        ),
-        _ => return,
-    };
-    let inner = recovery_block(f,popup,title,theme.warning,
-        &mut app.button_map, theme, app.recovery_ui.maximized);
-    if inner.width == 0 || inner.height < 6 { return; }
-    let selected_name = app.recovery_ui.selected_entry()
-        .and_then(|entry| entry.record.as_ref())
-        .map(summarize_destination)
-        .unwrap_or_else(|| "saved unreadable record".into());
-    let body = format!("Operation: {selected_name}\n\n{intro}\n\nWarning: {consequence}");
-    f.render_widget(Paragraph::new(body).wrap(Wrap{trim:false})
-        .style(Style::default().fg(theme.text)), Rect::new(inner.x+1,inner.y+1,
-        inner.width.saturating_sub(2), inner.height.saturating_sub(4)));
-    draw_button_row_owned(f,
-        Rect::new(inner.x+1,inner.y+inner.height.saturating_sub(2),inner.width.saturating_sub(2),1),
-        vec![(affirmative.into(),theme.error),("Cancel".into(),theme.dismiss)],
-        app.recovery_ui.focus,|i| TuiButton::RecoveryConfirm(i as u8),&mut app.button_map,theme);
-}
-
-fn draw_discard_confirm(
-    f: &mut Frame,
-    app: &mut AppState,
-    theme: super::theme::Theme,
-    bulk: bool,
-) {
-    let itemized_rows = if bulk {
-        app.recovery_ui
-            .entries
-            .iter()
-            .filter(|entry| entry.show_in_bulk_discard_confirm())
-            .count()
-            .saturating_mul(2)
-    } else {
-        6
-    };
-    let restored_height = (9u16)
-        .saturating_add(itemized_rows.min(12) as u16)
-        .clamp(13, CONFIRM_MAX_HEIGHT);
-    let popup = surface_rect(
-        parent_window_rect(f.size(), app.recovery_ui.maximized),
-        CONFIRM_MIN_WIDTH,
-        restored_height,
-        EPI_POPUP_WIDTH_PERCENT,
-        None,
-        app.recovery_ui.maximized,
-    );
-    let irreversible = !bulk
-        && app
-            .recovery_ui
-            .selected_entry()
-            .is_some_and(RecoveryEntry::irreversible);
-    let label = if bulk {
-        "discard and restore interrupted operations"
-    } else {
-        "discard interrupted operation"
-    };
-    let inner = recovery_block(
-        f,
-        popup,
-        label,
-        if irreversible { theme.error } else { theme.warning },
-        &mut app.button_map,
-        theme,
-        app.recovery_ui.maximized,
-    );
-    if inner.height < 5 {
-        return;
-    }
-
-    let header = if bulk {
-        let count = app
-            .recovery_ui
-            .entries
-            .iter()
-            .filter(|entry| entry.show_in_bulk_discard_confirm())
-            .count();
-        bulk_discard_header(count)
-    } else {
-        app.recovery_ui
-            .selected_entry()
-            .map(single_discard_header)
-            .unwrap_or_else(|| "Discard this interrupted copy/move operation:".to_string())
-    };
-    f.render_widget(
-        Paragraph::new(header)
-            .style(Style::default().fg(theme.text_bright).add_modifier(Modifier::BOLD)),
-        Rect::new(
-            inner.x.saturating_add(1),
-            inner.y.saturating_add(1),
-            inner.width.saturating_sub(2),
-            1,
-        ),
-    );
-
-    let body_y = inner.y.saturating_add(3);
-    let body_height = inner.height.saturating_sub(6);
-    if bulk {
-        draw_bulk_discard_items(
-            f,
-            app,
-            Rect::new(
-                inner.x.saturating_add(1),
-                body_y,
-                inner.width.saturating_sub(2),
-                body_height,
-            ),
-            theme,
-        );
-    } else {
-        draw_single_discard_effects(
-            f,
-            app,
-            Rect::new(
-                inner.x.saturating_add(1),
-                body_y,
-                inner.width.saturating_sub(2),
-                body_height,
-            ),
-            theme,
-        );
-    }
-
-    let working = if bulk {
-        app.recovery_ui.entries.iter().any(|entry| {
-            app.recovery_ui
-                .discard_in_flight
-                .contains(&entry.journal_path)
-        })
-    } else {
-        app.recovery_ui.selected_entry().is_some_and(|entry| {
-            app.recovery_ui
-                .discard_in_flight
-                .contains(&entry.journal_path)
-        })
-    };
-    let y = inner.y + inner.height.saturating_sub(2);
-    if working {
-        f.render_widget(
-            Paragraph::new("Applying reviewed discard...")
-                .style(Style::default().fg(theme.warning)),
-            Rect::new(
-                inner.x.saturating_add(1),
-                y,
-                inner.width.saturating_sub(2),
-                1,
-            ),
-        );
-    } else {
-        let confirm = if bulk {
-            "Discard and restore"
-        } else if app
-            .recovery_ui
-            .selected_entry()
-            .is_some_and(RecoveryEntry::is_discard_cleanup)
-        {
-            "Finish cleanup"
-        } else if irreversible {
-            "Discard, keep what is on disk"
-        } else {
-            "Discard and restore"
-        };
-        draw_button_row_owned(
-            f,
-            Rect::new(
-                inner.x.saturating_add(1),
-                y,
-                inner.width.saturating_sub(2),
-                1,
-            ),
-            vec![
-                (
-                    confirm.to_string(),
-                    if irreversible { theme.error } else { theme.warning },
-                ),
-                ("Cancel".to_string(), theme.dismiss),
-            ],
-            app.recovery_ui.focus,
-            |index| TuiButton::RecoveryConfirm(index as u8),
-            &mut app.button_map,
-            theme,
-        );
-    }
-}
-
-fn draw_single_discard_effects(
-    f: &mut Frame,
-    app: &AppState,
-    area: Rect,
-    theme: super::theme::Theme,
-) {
-    let Some(entry) = app.recovery_ui.selected_entry() else {
-        return;
-    };
-    let record = entry.record.as_ref();
-    let incomplete = record.map_or(0, |record| record.temp_artifacts.len());
-    let renamed = record.map_or(0, |record| record.quarantine_artifacts.len());
-    let direct_rename = record.map_or(0, |record| record.native_rename_intents.len());
-    let released = entry.blocked_paths().len();
-    let mut lines = Vec::new();
-    if incomplete > 0 || !entry.is_discard_cleanup() {
-        lines.push(Line::from(format!(
-            "[x] delete {incomplete} incomplete destination file{}",
-            plural(incomplete)
-        )));
-    }
-    if entry.irreversible() {
-        let deletion_started = record.map_or(0, |record| {
-            record
-                .quarantine_artifacts
-                .iter()
-                .filter(|artifact| artifact.state == DurableQuarantineState::DeletionStarted)
-                .count()
-        });
-        lines.push(Line::from(format!(
-            "[x] source deletion had begun for {deletion_started} source root{}; deleted entries cannot be restored",
-            plural(deletion_started)
-        )));
-        if renamed > 0 {
-            lines.push(Line::from("[x] restore any surviving source names that were renamed"));
-        }
-        lines.push(Line::from("[x] keep completed output on disk"));
-    } else if renamed > 0 || !entry.is_discard_cleanup() {
-        lines.push(Line::from(format!(
-            "[x] restore source names where needed for {renamed} affected source root{}",
-            plural(renamed)
-        )));
-    }
-    if direct_rename > 0 {
-        lines.push(Line::from(format!(
-            "[x] recheck {direct_rename} direct move{}; restore the original source only when its saved identity matches",
-            plural(direct_rename)
-        )));
-    }
-    lines.push(Line::from(format!(
-        "[x] release {released} blocked path{}",
-        plural(released)
-    )));
-    lines.push(Line::from(if entry.is_discard_cleanup() {
-        "[x] finish removing this operation from recovery"
-    } else {
-        "[x] remove this operation from recovery"
-    }));
-    if entry.irreversible() {
-        lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled(
-            "Some source files were already deleted and cannot be restored.",
-            Style::default().fg(theme.error).add_modifier(Modifier::BOLD),
-        )));
-    }
-    let start = app.recovery_ui.details_scroll.min(lines.len());
-    f.render_widget(
-        Paragraph::new(lines.into_iter().skip(start).collect::<Vec<_>>())
-            .wrap(Wrap { trim: false })
-            .style(Style::default().fg(theme.text)),
-        area,
-    );
-}
-
-fn draw_bulk_discard_items(
-    f: &mut Frame,
-    app: &AppState,
-    area: Rect,
-    theme: super::theme::Theme,
-) {
-    let mut rows = Vec::new();
-    for entry in app
-        .recovery_ui
-        .entries
-        .iter()
-        .filter(|entry| entry.show_in_bulk_discard_confirm())
-    {
-        let Some(record) = entry.record.as_ref() else {
-            continue;
-        };
-        let incomplete = record.temp_artifacts.len();
-        let renamed = record.quarantine_artifacts.len();
-        let direct_rename = record.native_rename_intents.len();
-        let released = entry.blocked_paths().len();
-        rows.push(Line::from(Span::styled(
-            format!(
-                "{} · {} item{} · {}",
-                entry.kind_label(),
-                entry.item_count(),
-                plural(entry.item_count()),
-                summarize_destination(record)
-            ),
-            Style::default().fg(theme.text_bright).add_modifier(Modifier::BOLD),
-        )));
-        let effects = if direct_rename > 0 {
-            format!(
-                "  delete {incomplete} incomplete · restore {renamed} source name{} · recheck {direct_rename} direct move{} · release {released} path{}",
-                plural(renamed),
-                plural(direct_rename),
-                plural(released)
-            )
-        } else {
-            format!(
-                "  delete {incomplete} incomplete · restore {renamed} source name{} · release {released} path{}",
-                plural(renamed),
-                plural(released)
-            )
-        };
-        rows.push(Line::from(Span::styled(
-            effects,
-            Style::default().fg(theme.text_muted),
-        )));
-    }
-    let start = app.recovery_ui.details_scroll.min(rows.len());
-    f.render_widget(
-        Paragraph::new(rows.into_iter().skip(start).collect::<Vec<_>>())
-            .wrap(Wrap { trim: false }),
-        area,
-    );
-}
-
-fn draw_inspector(f: &mut Frame, app: &mut AppState, theme: super::theme::Theme) {
-    let popup = surface_rect(
-        parent_window_rect(f.size(), app.recovery_ui.maximized),
-        DETAILS_MIN_WIDTH,
-        17,
-        EPI_POPUP_WIDTH_PERCENT,
-        None,
-        app.recovery_ui.maximized,
-    );
-    let inner = recovery_block(
-        f,
-        popup,
-        "record inspector",
-        theme.cyan,
-        &mut app.button_map,
-        theme,
-        app.recovery_ui.maximized,
-    );
-    let Some(entry) = app.recovery_ui.selected_entry() else {
-        return;
-    };
-    let diagnostic = entry
-        .diagnostic
-        .as_deref()
-        .map(user_safe_diagnostic)
-        .unwrap_or_else(|| "The saved recovery record could not be interpreted safely.".to_string());
-    let lines = vec![
-        Line::from(INSPECTOR_SCOPE_LINE),
-        Line::from(UNREADABLE_BLOCKING_NOTE),
-        Line::from(UNREADABLE_PATH_NOTE),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "Record location:",
-            Style::default().fg(theme.text_muted),
-        )),
-        Line::from(entry.journal_path.display().to_string()),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "Diagnostic:",
-            Style::default().fg(theme.text_muted),
-        )),
-        Line::from(diagnostic),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "Esc returns to recovery.",
-            Style::default().fg(theme.text_dim),
-        )),
-    ];
-    let start = app.recovery_ui.details_scroll.min(lines.len());
-    f.render_widget(
-        Paragraph::new(lines.into_iter().skip(start).collect::<Vec<_>>())
-            .wrap(Wrap { trim: false })
-            .style(Style::default().fg(theme.text)),
-        Rect::new(
-            inner.x.saturating_add(1),
-            inner.y.saturating_add(1),
-            inner.width.saturating_sub(2),
-            inner.height.saturating_sub(3),
-        ),
-    );
-    draw_button_row_owned(f,
-        Rect::new(inner.x.saturating_add(1), inner.y + inner.height.saturating_sub(1),
-            inner.width.saturating_sub(2),1),
-        vec![("Set aside after ownership check".into(),theme.warning), ("Close".into(),theme.dismiss)],
-        app.recovery_ui.focus,
-        |i| if i==0 { TuiButton::RecoveryAction(0) } else { TuiButton::RecoveryDetailsClose },
-        &mut app.button_map,theme);
-}
-
-fn draw_button_row_owned<F>(
-    f: &mut Frame,
-    area: Rect,
-    labels: Vec<(String, Color)>,
-    focus: usize,
-    button: F,
-    buttons: &mut ButtonRenderMap,
-    theme: super::theme::Theme,
-) where
-    F: Fn(usize) -> TuiButton,
-{
-    let mut x = area.x;
-    for (index, (label, color)) in labels.into_iter().enumerate() {
-        if x >= area.x.saturating_add(area.width) {
-            break;
-        }
-        let text = format!(" {label} ");
-        let width = (text.chars().count() as u16)
-            .min(area.x.saturating_add(area.width).saturating_sub(x));
-        let style = if index == focus {
-            Style::default()
-                .fg(theme.bg)
-                .bg(color)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(color).add_modifier(Modifier::BOLD)
-        };
-        f.render_widget(Paragraph::new(text).style(style), Rect::new(x, area.y, width, 1));
-        buttons.record_button(button(index), Rect::new(x, area.y, width, 1));
-        x = x.saturating_add(width.saturating_add(1));
-    }
-}
+// Single implementation of the interrupted-jobs UI.
+include!("interrupted_jobs_view.rs");
 
 fn summarize_sources(record: &DurableFileTaskRecord) -> String {
     match record.mappings.as_slice() {
@@ -3763,91 +1444,71 @@ fn summarize_destination(record: &DurableFileTaskRecord) -> String {
         .unwrap_or_else(|| "unavailable".to_string())
 }
 
-fn outcome_summary(entry: &RecoveryEntry) -> String {
-    let completed = entry.completed_count();
-    let skipped = entry.skipped_count();
-    let failed = entry.failed_count();
-    let remaining = entry.remaining_count();
-    let done_label = if entry.kind_label() == "move" {
-        "moved"
-    } else {
-        "copied"
-    };
-    format!(
-        "Outcome: {done_label} {completed} · remaining {remaining} · skipped {skipped} · failed {failed}"
-    )
+fn entries_share_folder(left: &RecoveryEntry, right: &RecoveryEntry) -> bool {
+    let (Some(a), Some(b)) = (left.record.as_ref(), right.record.as_ref()) else { return false; };
+    let mut a_paths = a.mappings.iter().flat_map(|m| [&m.source, &m.destination]).collect::<Vec<_>>();
+    let mut b_paths = b.mappings.iter().flat_map(|m| [&m.source, &m.destination]).collect::<Vec<_>>();
+    if let Some(root) = a.admitted_destination_root.as_ref() { a_paths.push(root); }
+    if let Some(root) = b.admitted_destination_root.as_ref() { b_paths.push(root); }
+    a_paths.iter().any(|a_path| b_paths.iter().any(|b_path| paths_overlap(a_path, b_path)))
 }
 
-fn reversibility_statement(entry: &RecoveryEntry) -> String {
-    let Some(record) = entry.record.as_ref() else {
-        return "Automatic changes are unavailable.".to_string();
-    };
-    if entry.is_discard_cleanup() {
-        return "Discard was confirmed; cleanup and release of the remaining blocked paths are not finished."
-            .to_string();
-    }
-    if entry.max_quarantine_state() == Some(DurableQuarantineState::DeletionStarted) {
-        let affected = record
-            .quarantine_artifacts
-            .iter()
-            .filter(|artifact| artifact.state == DurableQuarantineState::DeletionStarted)
-            .count();
-        return format!(
-            "Source deletion had begun for {affected} source root{}; some source files may already be gone and cannot be restored.",
-            plural(affected)
-        );
-    }
-    if !record.native_rename_intents.is_empty() {
-        return format!(
-            "{} source root{} stopped during a direct rename; discard will recheck both paths and will not overwrite either one.",
-            record.native_rename_intents.len(),
-            plural(record.native_rename_intents.len())
-        );
-    }
-    match entry.max_quarantine_state() {
-        Some(DurableQuarantineState::DeletionStarted) =>
-            "Source deletion had begun; some source files may already be gone and cannot be restored.".to_string(),
-        Some(DurableQuarantineState::RenameConfirmed) => format!(
-            "{} source root{} temporarily renamed. No source deletion had been recorded yet.",
-            record.quarantine_artifacts.len(),
-            plural(record.quarantine_artifacts.len())
-        ),
-        Some(DurableQuarantineState::IntentRecorded) => {
-            "A source rename may have started; discard will restore the original name if needed."
-                .to_string()
-        }
-        None => "No source names are waiting to be restored.".to_string(),
-    }
+/// An overlapping record remains an ordering predecessor until its work and
+/// cleanup are finished, even after Finish was approved or the worker started.
+/// A clean completed record left on screen for Dismiss is no longer a blocker.
+fn unresolved_overlap_predecessor(entry: &RecoveryEntry) -> bool {
+    entry.record.is_some()
+        && (entry.is_live() || entry.resume_committed || entry.discard_committed
+            || !entry.is_completed_clean())
 }
 
-fn entries_have_destination_overlap(left: &RecoveryEntry, right: &RecoveryEntry) -> bool {
-    let (Some(left_record), Some(right_record)) = (left.record.as_ref(), right.record.as_ref())
-    else {
-        return false;
-    };
-    left_record.mappings.iter().any(|left_mapping| {
-        right_record.mappings.iter().any(|right_mapping| {
-            paths_overlap(
-                left_mapping.destination.as_path(),
-                right_mapping.destination.as_path(),
-            )
-        })
-    })
+/// The queue command and window share this eligibility check. In particular,
+/// an approved but not yet dispatched older retry still blocks the newer one.
+pub(super) fn resume_has_older_overlap(app: &AppState, journal_path: &Path) -> bool {
+    app.recovery_ui.entries.iter()
+        .find(|entry| entry.journal_path == journal_path)
+        .is_some_and(|entry| older_interrupted_job(&app.recovery_ui.entries, entry).is_some())
+}
+
+fn older_interrupted_job(entries: &[RecoveryEntry], selected: &RecoveryEntry) -> Option<usize> {
+    let current = selected.record.as_ref()?;
+    entries.iter().enumerate().filter(|(_, entry)| {
+        entry.journal_path != selected.journal_path && unresolved_overlap_predecessor(entry)
+            && entries_share_folder(selected, entry)
+    }).filter(|(_, entry)| {
+        let other = entry.record.as_ref().unwrap();
+        (other.created_unix_ms, entry.journal_path.as_path())
+            < (current.created_unix_ms, selected.journal_path.as_path())
+    }).min_by_key(|(_, entry)| {
+        let other = entry.record.as_ref().unwrap();
+        (other.created_unix_ms, entry.journal_path.clone())
+    }).map(|(index, _)| index)
+}
+
+fn newer_interrupted_job(entries: &[RecoveryEntry], selected: &RecoveryEntry) -> Option<usize> {
+    let current = selected.record.as_ref()?;
+    entries.iter().enumerate().filter(|(_, entry)| {
+        entry.journal_path != selected.journal_path && unresolved_overlap_predecessor(entry)
+            && entries_share_folder(selected, entry)
+    }).filter(|(_, entry)| {
+        let other = entry.record.as_ref().unwrap();
+        (other.created_unix_ms, entry.journal_path.as_path())
+            > (current.created_unix_ms, selected.journal_path.as_path())
+    }).min_by_key(|(_, entry)| {
+        let other = entry.record.as_ref().unwrap();
+        (other.created_unix_ms, entry.journal_path.clone())
+    }).map(|(index, _)| index)
 }
 
 fn entry_has_destination_overlap(entries: &[RecoveryEntry], selected: &RecoveryEntry) -> bool {
-    entries
-        .iter()
-        .filter(|entry| entry.journal_path != selected.journal_path)
-        .any(|entry| entries_have_destination_overlap(selected, entry))
+    entries.iter().filter(|other| other.journal_path != selected.journal_path)
+        .any(|other| unresolved_overlap_predecessor(other) && entries_share_folder(selected, other))
 }
 
+#[cfg(test)]
 fn overlapping_entry_count(entries: &[RecoveryEntry], selected: &RecoveryEntry) -> usize {
-    entries
-        .iter()
-        .filter(|entry| entry.journal_path != selected.journal_path)
-        .filter(|entry| entries_have_destination_overlap(selected, entry))
-        .count()
+    entries.iter().filter(|other| other.journal_path != selected.journal_path)
+        .filter(|other| unresolved_overlap_predecessor(other) && entries_share_folder(selected, other)).count()
 }
 
 fn unix_ms_now() -> u64 {
@@ -3867,15 +1528,6 @@ fn age_label(updated_unix_ms: u64) -> String {
         3600..=86_399 => format!("{}h ago", seconds / 3600),
         _ => format!("{}d ago", seconds / 86_400),
     }
-}
-
-fn timestamp_clock(unix_ms: u64) -> String {
-    let Ok(unix_ms) = i64::try_from(unix_ms) else {
-        return "--:--".to_string();
-    };
-    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(unix_ms)
-        .map(|time| time.with_timezone(&chrono::Local).format("%H:%M").to_string())
-        .unwrap_or_else(|| "--:--".to_string())
 }
 
 fn human_bytes(bytes: u64) -> String {
@@ -3923,20 +1575,20 @@ fn user_safe_discard_error(raw: &str) -> String {
 }
 
 fn user_safe_diagnostic(raw: &str) -> String {
-    // The specification reserves implementation vocabulary for diagnostics,
-    // not ordinary UI. Keep the inspector useful without surfacing those
-    // internal nouns verbatim.
-    let lowered = raw.to_ascii_lowercase();
-    if lowered.contains("schema") {
-        "The saved record uses a format this build cannot interpret safely.".to_string()
-    } else if lowered.contains("ownership") || lowered.contains("descriptor") {
-        "Tonepoet cannot prove that this operation is safe to take over automatically.".to_string()
-    } else if lowered.contains("uuid") || lowered.contains("identifier") {
-        "The saved operation identifier is invalid.".to_string()
-    } else {
-        "The saved record could not be interpreted safely. No automatic changes are available."
-            .to_string()
+    // This is the only saved explanation for an unreadable record. Translate
+    // implementation nouns without discarding the distinguishing I/O or parse
+    // failure (permission denied, unexpected EOF, malformed data, etc.).
+    let message = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if message.is_empty() {
+        return "No read error details were saved for this record.".into();
     }
+    message
+        .replace("RecoveryReserved", "waiting for review")
+        .replace("owner gone", "worker no longer present")
+        .replace("Journal", "Saved record")
+        .replace("journal", "saved record")
+        .replace("Descriptor", "information")
+        .replace("descriptor", "information")
 }
 
 #[cfg(test)]
@@ -4012,7 +1664,6 @@ mod tests {
             resume_committed: false,
             approved_resume_queue_id: None,
             discard_committed: false,
-            session_deferred: false,
             live_snapshot: None,
             stop_requested_unix_ms: None,
         }
@@ -4024,193 +1675,6 @@ mod tests {
         assert!(paths_overlap(Path::new("/a"), Path::new("/a/b")));
         assert!(!paths_overlap(Path::new("/a/b"), Path::new("/a/c")));
     }
-
-    #[test]
-    fn byte_sizes_follow_mockup_decimal_units() {
-        assert_eq!(human_bytes(999), "999 B");
-        assert_eq!(human_bytes(1_000), "1.0 KB");
-        assert_eq!(human_bytes(1_000_000), "1.0 MB");
-    }
-
-    #[test]
-    fn restored_surface_sizing_uses_mockups_as_floors_and_terminal_as_headroom() {
-        let large = Rect::new(0, 0, 200, 60);
-        let prompt = surface_rect(
-            large,
-            PROMPT_MIN_WIDTH,
-            PROMPT_MIN_HEIGHT,
-            PROMPT_WIDTH_PERCENT,
-            Some(PROMPT_HEIGHT_PERCENT),
-            false,
-        );
-        assert_eq!((prompt.width, prompt.height), (120, 24));
-
-        let window = surface_rect(
-            large,
-            WINDOW_MIN_WIDTH,
-            WINDOW_MIN_HEIGHT,
-            WINDOW_WIDTH_PERCENT,
-            Some(WINDOW_HEIGHT_PERCENT),
-            false,
-        );
-        assert_eq!((window.width, window.height), (150, 33));
-
-        let details = surface_rect(
-            large,
-            DETAILS_MIN_WIDTH,
-            17,
-            EPI_POPUP_WIDTH_PERCENT,
-            None,
-            false,
-        );
-        assert_eq!((details.width, details.height), (156, 17));
-
-        let near_floor = Rect::new(0, 0, 120, 30);
-        let window = surface_rect(
-            near_floor,
-            WINDOW_MIN_WIDTH,
-            WINDOW_MIN_HEIGHT,
-            WINDOW_WIDTH_PERCENT,
-            Some(WINDOW_HEIGHT_PERCENT),
-            false,
-        );
-        assert_eq!((window.width, window.height), (116, 23));
-
-        let constrained = Rect::new(0, 0, 90, 20);
-        let window = surface_rect(
-            constrained,
-            WINDOW_MIN_WIDTH,
-            WINDOW_MIN_HEIGHT,
-            WINDOW_WIDTH_PERCENT,
-            Some(WINDOW_HEIGHT_PERCENT),
-            false,
-        );
-        assert_eq!((window.width, window.height), (90, 20));
-    }
-
-    #[test]
-    fn epi_popups_are_sized_against_the_recovery_window_not_the_terminal() {
-        let terminal = Rect::new(0, 0, 200, 60);
-        let window = parent_window_rect(terminal, false);
-        assert_eq!((window.width, window.height), (150, 33));
-
-        let details = surface_rect(
-            window,
-            DETAILS_MIN_WIDTH,
-            17,
-            EPI_POPUP_WIDTH_PERCENT,
-            None,
-            false,
-        );
-        // 78% of the window's 150 columns, not of the terminal's 200.
-        assert_eq!(details.width, 117);
-        assert!(
-            details.width < window.width,
-            "an epi-popup must read as sitting on the window, not replacing it",
-        );
-        assert!(
-            details.x >= window.x && details.x + details.width <= window.x + window.width,
-            "an epi-popup must stay within its parent window",
-        );
-    }
-
-    #[test]
-    fn recovery_footer_rule_preserves_both_frame_rails() {
-        use ratatui::{backend::TestBackend, Terminal};
-
-        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
-        app.recovery_ui.maximized = true;
-        let theme = app.theme;
-        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
-        terminal.draw(|frame| draw_window(frame, &mut app, theme)).unwrap();
-        let popup = parent_window_rect(Rect::new(0, 0, 140, 40), true);
-        let inner = Rect::new(popup.x + 1, popup.y + 1,
-            popup.width - 2, popup.height - 2);
-        let rule_y = inner.y + inner.height - 3;
-        let buffer = terminal.backend().buffer();
-        for (x, glyph) in [(popup.x, "├"), (popup.right() - 1, "┤")] {
-            let cell = buffer.get(x, rule_y);
-            assert_eq!(cell.symbol(), glyph, "footer rule must join the frame");
-            assert_eq!(cell.fg, theme.cyan, "footer junction must match frame colour");
-            for y in [rule_y - 1, rule_y + 1] {
-                let rail = buffer.get(x, y);
-                assert_eq!(rail.symbol(), "│", "frame rail must be continuous");
-                assert_eq!(rail.fg, theme.cyan);
-            }
-        }
-        let interior = buffer.get(popup.x + 2, rule_y);
-        assert_eq!(interior.symbol(), "─");
-        assert_eq!(interior.fg, theme.border_dim,
-            "the separator interior must retain its subdued style");
-    }
-
-    #[test]
-    fn recovery_tab_labels_match_operator_language() {
-        assert_eq!(RecoveryDetailsTab::BlockedPaths.label(), "Blocked paths");
-        assert_eq!(RecoveryDetailsTab::IncompleteFiles.label(), "Staging paths");
-        assert_eq!(RecoveryDetailsTab::RenamedSources.label(), "Renamed sources");
-    }
-
-    #[test]
-    fn decide_later_is_only_offered_for_a_current_deferable_review_entry() {
-        let available = test_entry("available", "dest/available", false, Some(11));
-        assert!(available.can_defer());
-        assert!(window_actions(&available).contains(&WindowAction::Later));
-
-        let mut deferred = available.clone();
-        deferred.queue_id = None;
-        deferred.session_deferred = true;
-        assert!(!deferred.can_defer());
-        let deferred_actions = window_actions(&deferred);
-        assert!(!deferred_actions.contains(&WindowAction::Resume));
-        assert!(!deferred_actions.contains(&WindowAction::Later));
-
-        let mut resume_committed = available.clone();
-        resume_committed.resume_committed = true;
-        assert!(!resume_committed.can_defer());
-
-        let mut discard_committed = available;
-        discard_committed.discard_committed = true;
-        assert!(!discard_committed.can_defer());
-    }
-
-    #[test]
-    fn startup_later_and_window_escape_remain_global_minimize_actions() {
-        let _home = crate::tui::test_support::XdgConfigHomeGuard::new(
-            "tonepoet-recovery-global-later-and-escape",
-        );
-        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
-        app.recovery_ui.entries = vec![test_entry(
-            "available",
-            "dest/available",
-            false,
-            Some(11),
-        )];
-        let (tx, _rx) = mpsc::channel(8);
-
-        app.recovery_ui.surface = RecoverySurface::Prompt;
-        app.active_overlay = ActiveOverlay::FileRecovery;
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-            &tx,
-        );
-        assert!(app.recovery_ui.session_deferred.is_empty());
-        assert_eq!(app.recovery_ui.surface, RecoverySurface::Window);
-        assert!(matches!(&app.active_overlay, ActiveOverlay::None));
-
-        app.recovery_ui.surface = RecoverySurface::Window;
-        app.active_overlay = ActiveOverlay::FileRecovery;
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-            &tx,
-        );
-        assert!(app.recovery_ui.session_deferred.is_empty());
-        assert_eq!(app.recovery_ui.surface, RecoverySurface::Window);
-        assert!(matches!(&app.active_overlay, ActiveOverlay::None));
-    }
-
     #[test]
     fn overlapping_destinations_are_excluded_from_unattended_bulk_resume_only() {
         let a = test_entry("a", "dest/album", false, Some(21));
@@ -4235,7 +1699,6 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(bulk_ids, vec![23]);
     }
-
     #[test]
     fn adjacent_destinations_remain_eligible_for_unattended_resume() {
         let mut state = RecoveryUiState::default();
@@ -4255,30 +1718,6 @@ mod tests {
             &state.entries[1]
         ));
     }
-
-    #[test]
-    fn layer_three_recovery_surfaces_identify_copy_move_scope() {
-        let copy = test_entry("copy", "dest/copy", false, Some(41));
-        let move_entry = test_entry("move", "dest/move", true, Some(42));
-
-        assert_eq!(
-            single_discard_header(&copy),
-            "Discard this interrupted copy operation:"
-        );
-        assert_eq!(
-            single_discard_header(&move_entry),
-            "Discard this interrupted move operation:"
-        );
-        assert_eq!(
-            bulk_discard_header(2),
-            "Discard 2 reversible interrupted copy/move operations:"
-        );
-        assert_eq!(
-            INSPECTOR_SCOPE_LINE,
-            "This interrupted copy/move operation cannot be changed automatically."
-        );
-    }
-
     #[test]
     fn diagnostic_sanitizer_does_not_expose_reserved_implementation_terms() {
         let text = user_safe_diagnostic("journal ownership descriptor missing");
@@ -4286,7 +1725,6 @@ mod tests {
             assert!(!text.contains(prohibited));
         }
     }
-
     #[test]
     fn discard_error_sanitizer_hides_internal_reservation_language() {
         let text = user_safe_discard_error(
@@ -4296,81 +1734,6 @@ mod tests {
             assert!(!text.to_ascii_lowercase().contains(prohibited));
         }
     }
-
-    #[test]
-    fn live_worker_is_not_interrupted_and_has_actionable_choices() {
-        let mut entry = test_entry("running", "dest/music", true, None);
-        entry.availability = RecoverySurfaceAvailability::Live;
-        let now = unix_ms_now();
-        entry.live_snapshot = Some(LiveWorkerSnapshot {
-            schema: 1,
-            job_id: uuid::Uuid::new_v4().to_string(),
-            generation: 1,
-            worker: crate::concurrency::OwnerProcessIdentity::current(),
-            observed_unix_ms: now, forward_unix_ms: now,
-            phase: tui_file_picker::FileTaskPhase::Running,
-            status: "copying".into(),
-            current_item: Some(tui_file_picker::ProgressItem::new("large.iso")),
-            totals: tui_file_picker::ProgressTotals {bytes_done: 4_000, bytes_total: Some(10_000), ..Default::default()},
-            rate_bytes_per_sec: Some(2_000), conflict: None,
-        });
-        assert_eq!(entry.state_label(), "running");
-        assert!(!entry.needs_attention());
-        let actions = window_actions(&entry);
-        for action in [WindowAction::Watch, WindowAction::Pause, WindowAction::StopAndUndo,
-            WindowAction::LeaveRunning, WindowAction::Details] {
-            assert!(actions.contains(&action), "missing {action:?}");
-        }
-        assert!(!actions.contains(&WindowAction::Resume));
-        assert!(!actions.contains(&WindowAction::Discard));
-
-        entry.live_snapshot.as_mut().unwrap().phase = tui_file_picker::FileTaskPhase::Paused;
-        assert_eq!(entry.state_label(), "paused");
-        assert!(entry.needs_attention());
-        assert!(window_actions(&entry).contains(&WindowAction::ResumeRunning));
-        assert!(!window_actions(&entry).contains(&WindowAction::Pause));
-    }
-
-    #[test]
-    fn compact_and_full_rows_share_live_byte_progress() {
-        let mut entry = test_entry("large", "destination/large.iso", false, None);
-        entry.availability = RecoverySurfaceAvailability::Live;
-        let identity = uuid::Uuid::new_v4().to_string();
-        entry.live_snapshot = Some(LiveWorkerSnapshot {
-            schema: 1, job_id: identity, generation: 1,
-            worker: crate::concurrency::OwnerProcessIdentity::current(),
-            observed_unix_ms: unix_ms_now(), forward_unix_ms: unix_ms_now(),
-            phase: tui_file_picker::FileTaskPhase::Running,
-            status: "Copying a large file".into(), current_item: None,
-            totals: tui_file_picker::ProgressTotals { bytes_done: 4_000,
-                bytes_total: Some(10_000), ..Default::default() },
-            rate_bytes_per_sec: Some(1_000), conflict: None,
-        });
-        assert_eq!(recovery_row_progress(&entry), ("███░░░░░".into(), " 40%".into()));
-        entry.live_snapshot.as_mut().unwrap().totals.bytes_done = 6_000;
-        assert_eq!(recovery_row_progress(&entry), ("████░░░░".into(), " 60%".into()));
-        entry.live_snapshot = None;
-        assert_eq!(recovery_row_progress(&entry), ("????????".into(), "waiting".into()));
-    }
-
-    #[test]
-    fn approved_resume_queued_has_cancel_and_never_offers_undo() {
-        let mut entry = test_entry("retry", "dest/retry.flac", false, None);
-        entry.resume_committed = true;
-        entry.approved_resume_queue_id = Some(88);
-        assert_eq!(entry.state_label(), "resume queued");
-        assert!(!entry.needs_attention());
-        let actions = window_actions(&entry);
-        assert!(actions.contains(&WindowAction::CancelQueuedResume));
-        assert!(actions.contains(&WindowAction::KeepWaiting));
-        assert!(!actions.contains(&WindowAction::Discard));
-        assert!(!actions.contains(&WindowAction::Resume));
-        entry.approved_resume_queue_id = None;
-        assert_eq!(entry.state_label(), "resume starting");
-        assert!(!window_actions(&entry).contains(&WindowAction::CancelQueuedResume));
-        assert!(window_actions(&entry).contains(&WindowAction::KeepWaiting));
-    }
-
     #[test]
     fn cancel_approved_queue_retry_preserves_source_and_destination() {
         let _home = crate::tui::test_support::XdgConfigHomeGuard::new(
@@ -4409,58 +1772,6 @@ mod tests {
         assert_eq!(std::fs::read(&source).unwrap(), b"original");
         assert!(!target.exists(), "queue cancellation must not touch user files");
     }
-
-    #[test]
-    fn unreadable_records_admit_unknown_reserved_paths_without_fabricated_zero() {
-        let mut entry = test_entry("unreadable", "dest/unreadable", false, None);
-        entry.availability = RecoverySurfaceAvailability::Unreadable;
-        entry.record = None;
-        entry.diagnostic = Some("corrupt saved record".into());
-        assert!(UNREADABLE_BLOCKING_NOTE.contains("may remain blocked"));
-        assert!(UNREADABLE_PATH_NOTE.contains("unknown, not empty"));
-        assert!(window_actions(&entry).contains(&WindowAction::SetAside));
-        assert!(window_actions(&entry).contains(&WindowAction::Inspect));
-    }
-
-    #[test]
-    fn stalled_worker_offers_identity_checked_force_stop() {
-        let mut entry = test_entry("stalled", "dest/music", false, None);
-        entry.availability = RecoverySurfaceAvailability::Live;
-        entry.live_snapshot = Some(LiveWorkerSnapshot {
-            schema: 1, job_id: uuid::Uuid::new_v4().to_string(), generation: 1,
-            worker: crate::concurrency::OwnerProcessIdentity::current(),
-            observed_unix_ms: unix_ms_now().saturating_sub(15_000),
-            forward_unix_ms: unix_ms_now().saturating_sub(15_000),
-            phase: tui_file_picker::FileTaskPhase::Stalled,
-            status: "stalled".into(), current_item: None,
-            totals: tui_file_picker::ProgressTotals::default(), rate_bytes_per_sec: None,
-            conflict: None,
-        });
-        assert!(entry.is_stalled());
-        assert_eq!(entry.state_label(), "running · stalled");
-        assert!(window_actions(&entry).contains(&WindowAction::ForceStop));
-        assert!(!entry.needs_attention(), "live stall needs observation or intervention, not an interrupted decision");
-    }
-
-    #[test]
-    fn all_unresolved_states_have_a_real_action_beyond_details() {
-        let mut unreadable = test_entry("unreadable", "dest/unreadable", true, None);
-        unreadable.availability = RecoverySurfaceAvailability::Unreadable;
-        unreadable.record = None;
-        assert_eq!(window_actions(&unreadable)[0], WindowAction::SetAside);
-        assert!(window_actions(&unreadable).contains(&WindowAction::Inspect));
-        let interrupted = test_entry("interrupted", "dest/interrupted", false, Some(5));
-        assert!(window_actions(&interrupted).contains(&WindowAction::Resume));
-        assert!(window_actions(&interrupted).contains(&WindowAction::Discard));
-        assert!(window_actions(&interrupted).contains(&WindowAction::Later));
-        let mut cleanup = interrupted;
-        cleanup.queue_id = None;
-        cleanup.record.as_mut().unwrap().lifecycle =
-            crate::tui::file_task_runtime::DurableFileTaskLifecycle::AwaitingReconciliation;
-        cleanup.record.as_mut().unwrap().last_status = Some("recovery-ui-discard-in-progress".into());
-        assert!(window_actions(&cleanup).contains(&WindowAction::Discard));
-    }
-
     #[test]
     fn stop_and_undo_never_cleans_a_live_lease() {
         let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
@@ -4474,7 +1785,6 @@ mod tests {
         assert!(app.recovery_ui.stop_and_undo_pending.contains(&path));
         assert!(!app.recovery_ui.discard_in_flight.contains(&path));
     }
-
     #[test]
     fn reconnect_conflict_abort_requires_stop_confirmation_before_any_worker_command() {
         use super::super::app::{FileTaskControl, FileTaskProgressSession};
@@ -4563,9 +1873,9 @@ mod tests {
             assert!(received.try_recv().is_err());
         }
 
-        // A reconnected watcher may still return to Recovery with Esc.
+        // A reconnected watcher may return to Interrupted jobs with Esc, without minimizing.
         let back = session.progress.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(back, FileTaskUserAction::Minimize);
+        assert_eq!(back, FileTaskUserAction::Acknowledge);
         assert!(!super::super::keybindings::handle_file_task_user_action(
             &mut app, &mut session, back, &tx));
         assert!(received.try_recv().is_err());
@@ -4610,7 +1920,6 @@ mod tests {
             request_id: 72, resolution: ConflictResolution::Abort,
         });
     }
-
     #[test]
     fn reconnected_progress_closes_when_its_live_worker_is_gone() {
         let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
@@ -4633,30 +1942,452 @@ mod tests {
     }
 
     #[test]
-    fn inspector_scroll_cannot_overshoot_empty_content_model() {
-        let mut state = RecoveryUiState::default();
-        state.surface = RecoverySurface::Inspector;
-        state.details_scroll = 99;
-        scroll_auxiliary(&mut state, 3);
-        assert_eq!(state.details_scroll, 0);
+    fn older_interrupted_job_precedes_newer_overlapping_job() {
+        let mut older = test_entry("older", "dest/album", false, Some(10));
+        older.record.as_mut().unwrap().created_unix_ms = 2;
+        let mut newer = test_entry("newer", "dest/album/disc", true, Some(11));
+        newer.record.as_mut().unwrap().created_unix_ms = 3;
+        let entries = vec![newer, older]; // Review list is newest first.
+        assert_eq!(older_interrupted_job(&entries, &entries[0]), Some(1));
+        assert_eq!(older_interrupted_job(&entries, &entries[1]), None);
+        assert!(window_actions(&entries[0], &entries).contains(&WindowAction::Older));
+        assert!(!window_actions(&entries[0], &entries).contains(&WindowAction::Finish));
+        assert!(window_actions(&entries[1], &entries).contains(&WindowAction::Finish));
+        assert!(window_actions(&entries[0], &entries).contains(&WindowAction::Undo));
     }
 
     #[test]
-    fn live_legacy_worker_without_feed_has_journal_checkpoint_but_no_dead_controls() {
-        let mut entry = test_entry("legacy", "dest/legacy", true, None);
+    fn running_without_feed_offers_no_false_worker_controls() {
+        let mut entry = test_entry("no-feed", "dest/music", false, None);
         entry.availability = RecoverySurfaceAvailability::Live;
         entry.live_snapshot = None;
-        assert_eq!(entry.state_label(), "running · no feed");
-        let actions = window_actions(&entry);
-        assert!(actions.contains(&WindowAction::Watch));
-        assert!(actions.contains(&WindowAction::Details));
-        assert!(actions.contains(&WindowAction::LeaveRunning));
-        for invalid in [WindowAction::Pause, WindowAction::ResumeRunning,
-            WindowAction::StopAndUndo, WindowAction::ForceStop] {
-            assert!(!actions.contains(&invalid), "no-feed command must not be offered");
+        assert_eq!(ui_state(&entry, &[entry.clone()]), "running");
+        assert!(window_actions(&entry, &[entry.clone()]).is_empty());
+        assert!(!entry.needs_attention());
+        assert_eq!(entry_progress(&entry), "still running");
+    }
+
+    #[test]
+    fn unreadable_record_does_not_invent_locks_or_items() {
+        let mut entry = test_entry("bad", "dest/bad", false, None);
+        entry.record = None;
+        entry.availability = RecoverySurfaceAvailability::Unreadable;
+        assert!(entry.blocked_paths().is_empty());
+        assert_eq!(entry.item_count(), 0);
+        let entries = vec![entry];
+        assert_eq!(locked_total(&entries), (0, true));
+        assert_eq!(window_actions(&entries[0], &entries),
+            vec![WindowAction::Error, WindowAction::Release]);
+    }
+
+    #[test]
+    fn selected_item_count_never_counts_directory_contents_or_temp_paths() {
+        let mut entry = test_entry("folder", "dest/album", true, Some(42));
+        let record = entry.record.as_mut().unwrap();
+        record.path_claims.clear();
+        record.mappings[0].source = PathBuf::from("/source/album");
+        // Even a folder with thousands of files counts as one selected item.
+        assert_eq!(entry.item_count(), 1);
+        assert_eq!(entry.completed_count(), 0);
+        assert_eq!(entry.remaining_count(), 1);
+        assert_eq!(entry_progress(&entry), "0 of 1 items");
+    }
+
+    #[test]
+    fn completed_clean_extraction_offers_dismiss_without_undo() {
+        let mut entry = test_entry("extract", "dest/album", false, None);
+        let record = entry.record.as_mut().unwrap();
+        record.job = serde_json::json!({"kind": "native_extraction", "native_extraction": {"source":"disc.iso","destination":"dest/album"}});
+        record.lifecycle = DurableFileTaskLifecycle::Completed;
+        assert!(record.is_native_extraction());
+        let actions = window_actions(&entry, &[entry.clone()]);
+        assert_eq!(actions, vec![WindowAction::Dismiss]);
+    }
+
+    #[test]
+    fn queued_finish_cannot_be_undone_while_job_is_owned() {
+        let mut entry = test_entry("queued", "dest/queued", true, None);
+        entry.resume_committed = true;
+        entry.approved_resume_queue_id = Some(12);
+        let actions = window_actions(&entry, &[entry.clone()]);
+        assert_eq!(actions, vec![WindowAction::CancelFinish]);
+        assert!(!entry.can_discard());
+    }
+
+    #[test]
+    fn body_footer_and_popup_sizing_fit_small_terminals() {
+        let area = Rect::new(0, 0, 80, 24);
+        let main = window_rect(area, false);
+        let popup = popup_rect(area, false);
+        assert_eq!(main, area);
+        assert!(popup.right() <= area.right());
+        assert!(popup.bottom() <= area.bottom());
+    }
+
+    #[test]
+    fn empty_window_has_close_but_no_dummy_job_actions() {
+        let state = RecoveryUiState::default();
+        assert_eq!(state.needs_attention_count(), 0);
+        assert_eq!(state.bulk_discard_count(), 0);
+        assert!(!state.resume_all_available());
+    }
+
+    #[test]
+    fn stopped_job_counts_are_selection_not_live_transfer_totals() {
+        let entry = test_entry("folder", "dest/album", true, Some(13));
+        assert_eq!(entry_progress(&entry), "0 of 1 items");
+        assert!(!entry_progress(&entry).contains("bytes"));
+        assert!(!entry_progress(&entry).contains("files"));
+    }
+
+    #[test]
+    fn cancellation_popup_initially_focuses_cancel() {
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.recovery_ui.entries.push(test_entry("copy", "dest/copy", false, Some(1)));
+        open_selected_discard_confirm(&mut app);
+        assert_eq!(app.recovery_ui.surface, RecoverySurface::DiscardConfirm);
+        assert_eq!(app.recovery_ui.focus, 1);
+        let (tx, _rx) = mpsc::channel(8);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert_eq!(app.recovery_ui.surface, RecoverySurface::Window);
+        assert!(app.recovery_ui.discard_in_flight.is_empty());
+    }
+
+    #[test]
+    fn completed_records_are_not_bulk_finished_or_undone() {
+        let mut a = test_entry("a", "dest/a", false, Some(1));
+        let b = test_entry("b", "dest/b", false, Some(2));
+        a.record.as_mut().unwrap().lifecycle = DurableFileTaskLifecycle::Completed;
+        let state = RecoveryUiState { entries: vec![a,b], ..Default::default() };
+        assert!(!state.resume_all_available());
+        assert_eq!(state.bulk_discard_count(), 0);
+    }
+
+    #[test]
+    fn approved_queued_and_live_older_jobs_keep_the_newer_finish_blocked() {
+        let mut older = test_entry("older", "dest/album", true, Some(51));
+        older.record.as_mut().unwrap().created_unix_ms = 1;
+        let mut newer = test_entry("newer", "dest/album/disc", true, Some(52));
+        newer.record.as_mut().unwrap().created_unix_ms = 2;
+        older.resume_committed = true;
+        older.approved_resume_queue_id = Some(51);
+        older.queue_id = None;
+        let mut state = RecoveryUiState { entries: vec![newer, older], ..Default::default() };
+        assert_eq!(older_interrupted_job(&state.entries, &state.entries[0]), Some(1));
+        assert_eq!(window_actions(&state.entries[0], &state.entries),
+            vec![WindowAction::Older, WindowAction::Undo]);
+        assert!(entry_has_destination_overlap(&state.entries, &state.entries[0]));
+        assert!(!state.can_resume_unattended(&state.entries[0]));
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.recovery_ui = state.clone();
+        assert!(resume_has_older_overlap(&app, &state.entries[0].journal_path));
+
+        state.entries[1].availability = RecoverySurfaceAvailability::Live;
+        assert_eq!(older_interrupted_job(&state.entries, &state.entries[0]), Some(1));
+        state.entries[1].availability = RecoverySurfaceAvailability::Recoverable;
+        state.entries[1].resume_committed = false;
+        state.entries[1].approved_resume_queue_id = None;
+        state.entries[1].discard_committed = true; // Undo cleanup is still in progress.
+        assert_eq!(older_interrupted_job(&state.entries, &state.entries[0]), Some(1));
+        state.entries[1].discard_committed = false;
+        state.entries[1].record.as_mut().unwrap().lifecycle = DurableFileTaskLifecycle::Completed;
+        assert!(state.entries[1].is_completed_clean());
+        assert_eq!(older_interrupted_job(&state.entries, &state.entries[0]), None);
+        assert!(window_actions(&state.entries[0], &state.entries).contains(&WindowAction::Finish));
+        assert!(!entry_has_destination_overlap(&state.entries, &state.entries[0]));
+    }
+
+    fn queued_test_retry(entry: &RecoveryEntry, id: u64) -> QueuedFileTransfer {
+        let mapping = entry.record.as_ref().unwrap().mappings[0].clone();
+        let clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Copy, vec![mapping.source.clone()],
+        ).expect("clipboard for a test recovery");
+        let plan = tui_file_picker::PastePlan {
+            mode: tui_file_picker::FilePickerClipboardMode::Copy,
+            mappings: vec![mapping],
+        };
+        let mut retry = super::super::browse::BrowsePasteRetryPlan::from_plan(plan.clone());
+        retry.recovery_journal_path = Some(entry.journal_path.clone());
+        QueuedFileTransfer {
+            queue_id: id,
+            clipboard,
+            clipboard_owner_generation: None,
+            destination_dir: PathBuf::from("dest"),
+            enqueue_plan: plan,
+            retry_plan: Some(retry),
+            recovered: true,
         }
-        let (checkpoint, status) = journal_checkpoint(&entry);
-        assert!(checkpoint.starts_with("Journal:"));
-        assert!(status.starts_with("Last journal status:"));
+    }
+
+    #[test]
+    fn direct_resume_command_cannot_prepend_newer_job_before_approved_older_one() {
+        let mut older = test_entry("older-cmd", "dest/album", false, Some(61));
+        older.record.as_mut().unwrap().created_unix_ms = 1;
+        let mut newer = test_entry("newer-cmd", "dest/album/disc", false, Some(62));
+        newer.record.as_mut().unwrap().created_unix_ms = 2;
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.file_transfers.active_session_id = Some(9901); // unrelated task occupies scheduler
+        app.file_transfers.recovery_queued.push_back(queued_test_retry(&older, 61));
+        app.file_transfers.recovery_queued.push_back(queued_test_retry(&newer, 62));
+        app.recovery_ui.entries = vec![newer.clone(), older.clone()];
+        let (tx, _rx) = mpsc::channel(8);
+        super::super::keybindings::resume_file_transfer_recovery(&mut app, Some(61), &tx);
+        assert_eq!(app.file_transfers.queued.len(), 1);
+        assert_eq!(app.file_transfers.recovery_queued.len(), 1);
+        let old_path = older.journal_path.clone();
+        let new_path = newer.journal_path.clone();
+        assert_eq!(app.file_transfers.queued[0].transfer().and_then(queued_recovery_journal),
+            Some(old_path.as_path()));
+        app.recovery_ui.entries[1].resume_committed = true;
+        app.recovery_ui.entries[1].approved_resume_queue_id = Some(61);
+        app.recovery_ui.entries[1].queue_id = None;
+        assert!(resume_has_older_overlap(&app, &new_path));
+        // The typed command uses the shared promotion boundary, not a UI-only check.
+        super::super::keybindings::resume_file_transfer_recovery(&mut app, Some(62), &tx);
+        assert_eq!(app.file_transfers.queued.len(), 1);
+        assert_eq!(app.file_transfers.recovery_queued.len(), 1);
+        assert_eq!(app.file_transfers.recovery_queued[0].queue_id, 62);
+        assert_eq!(app.file_transfers.queued[0].transfer().and_then(queued_recovery_journal),
+            Some(old_path.as_path()));
+        // Once A has finished, an unretired clean record no longer blocks B.
+        app.file_transfers.queued.clear();
+        app.recovery_ui.entries[1].resume_committed = false;
+        app.recovery_ui.entries[1].approved_resume_queue_id = None;
+        app.recovery_ui.entries[1].record.as_mut().unwrap().lifecycle = DurableFileTaskLifecycle::Completed;
+        assert!(!resume_has_older_overlap(&app, &new_path));
+        super::super::keybindings::resume_file_transfer_recovery(&mut app, Some(62), &tx);
+        assert!(app.file_transfers.recovery_queued.is_empty());
+        assert_eq!(app.file_transfers.queued[0].transfer().and_then(queued_recovery_journal),
+            Some(new_path.as_path()));
+    }
+
+    fn root_test_result(
+        mapping: &tui_file_picker::PasteMapping,
+        disposition: tui_file_picker::FileTaskRootDisposition,
+    ) -> tui_file_picker::FileTaskRootResult {
+        tui_file_picker::FileTaskRootResult {
+            source: mapping.source.clone(), destination: mapping.destination.clone(),
+            disposition, message: None,
+            undo_disposition: tui_file_picker::FileTaskUndoDisposition::NotReversible,
+            proof: None,
+        }
+    }
+
+    #[test]
+    fn files_popup_uses_last_selected_root_checkpoint_and_groups_folders() {
+        let mut entry = test_entry("mixed", "dest/album-a/first", false, Some(71));
+        let record = entry.record.as_mut().unwrap();
+        record.mappings[0].source = PathBuf::from("/source/album-a/first");
+        record.mappings[0].destination = PathBuf::from("/dest/album-a/first");
+        let skipped = tui_file_picker::PasteMapping {
+            source: PathBuf::from("/source/album-b/skipped"),
+            destination: PathBuf::from("/dest/album-b/skipped"),
+        };
+        record.mappings.push(skipped.clone());
+        record.roots.push(root_test_result(&record.mappings[0], tui_file_picker::FileTaskRootDisposition::Failed));
+        record.roots.push(root_test_result(&record.mappings[0], tui_file_picker::FileTaskRootDisposition::Completed));
+        record.roots.push(root_test_result(&skipped, tui_file_picker::FileTaskRootDisposition::Skipped));
+        assert_eq!(entry.completed_count(), 1);
+        assert_eq!(entry.failed_count(), 0);
+        assert_eq!(entry.skipped_count(), 1);
+        for number in 0..9 {
+            let parent = if number < 5 { "/dest/album-a" } else { "/dest/album-b" };
+            let record = entry.record.as_mut().unwrap();
+            record.temp_artifacts.push(super::super::file_task_runtime::DurableTempArtifact {
+                path: PathBuf::from(format!("{parent}/.partial-{number}.tmp")),
+                destination: PathBuf::from(format!("{parent}/track-{number}.flac")),
+                kind: super::super::file_task_runtime::DurableTempArtifactKind::File,
+                owner_job_id: record.job_id.clone(), owner_generation: 1,
+            });
+        }
+        let state = RecoveryUiState { entries: vec![entry], ..Default::default() };
+        let rows = files_popup_lines(&state);
+        assert_eq!(rows.iter().filter(|(line, _)| line == "/dest/album-a").count(), 1);
+        assert_eq!(rows.iter().filter(|(line, _)| line == "/dest/album-b").count(), 1);
+        assert_eq!(rows.iter().filter(|(line, _)| line.starts_with("  track-")).count(), 9);
+        assert_eq!(rows.iter().filter(|(line, _)| line.starts_with("    on disk:")).count(), 9);
+        assert!(rows.iter().all(|(line, _)| line != "FAILED"));
+        assert!(rows.iter().any(|(line, _)| line == "SKIPPED"));
+        assert!(rows.iter().any(|(line, _)| line == "  skipped"));
+    }
+
+    #[test]
+    fn undo_single_and_bulk_share_record_derived_effects_and_keep_error_color() {
+        let mut first = test_entry("undo-one", "/dest/album-one", true, Some(81));
+        let record = first.record.as_mut().unwrap();
+        record.temp_artifacts.push(super::super::file_task_runtime::DurableTempArtifact {
+            path: PathBuf::from("/dest/album-one/.partial.tmp"),
+            destination: PathBuf::from("/dest/album-one/unfinished"),
+            kind: super::super::file_task_runtime::DurableTempArtifactKind::File,
+            owner_job_id: record.job_id.clone(), owner_generation: 1,
+        });
+        record.quarantine_artifacts.extend([
+            super::super::file_task_runtime::DurableQuarantineArtifact {
+                path: PathBuf::from("/source/.held-a/payload"),
+                original_source: PathBuf::from("/source/old-a"),
+                destination: PathBuf::from("/dest/album-one/a"),
+                state: DurableQuarantineState::RenameConfirmed,
+            },
+            super::super::file_task_runtime::DurableQuarantineArtifact {
+                path: PathBuf::from("/source/.held-b/payload"),
+                original_source: PathBuf::from("/source/old-b"),
+                destination: PathBuf::from("/dest/album-one/b"),
+                state: DurableQuarantineState::DeletionStarted,
+            },
+        ]);
+        record.roots.push(root_test_result(&record.mappings[0],
+            tui_file_picker::FileTaskRootDisposition::Completed));
+        let second = test_entry("undo-two", "/dest/album-two", false, Some(82));
+        let mut state = RecoveryUiState { entries: vec![first, second], ..Default::default() };
+        state.incomplete_sizes.insert(PathBuf::from("/dest/album-one/.partial.tmp"), Some(520));
+        let theme = super::super::theme::theme_by_slug_or_default("tokyo-night");
+        state.surface = RecoverySurface::DiscardConfirm;
+        let (_, one, _) = confirm_description(&state, theme);
+        let text = one.iter().map(|(line, _)| line.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("520 B so far"));
+        assert!(text.contains("Check 1 original name"));
+        assert!(text.contains("whose deletion began"));
+        assert!(text.contains("1 finished item"));
+        assert!(!text.contains("Restore 2 original"));
+        assert!(one.iter().any(|(line, color)| line.starts_with('×')
+            && line.contains("deleted content") && *color == theme.error));
+        state.surface = RecoverySurface::BulkDiscardConfirm;
+        let (_, all, _) = confirm_description(&state, theme);
+        let all_text = all.iter().map(|(line, _)| line.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(all_text.contains("MOVE  undo-one"));
+        assert!(all_text.contains("COPY  undo-two"));
+        assert!(all_text.contains("520 B so far"));
+        assert!(all_text.contains("deleted content"));
+        assert!(all.iter().any(|(line, color)| line.contains("deleted content") && *color == theme.error));
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.recovery_ui = state;
+        open_safety_confirm(&mut app, RecoverySurface::BulkDiscardConfirm);
+        assert_eq!(app.recovery_ui.focus, 1);
+        let (tx, _rx) = mpsc::channel(8);
+        handle_key(&mut app, KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE), &tx);
+        assert_eq!(app.recovery_ui.details_scroll, 8);
+        assert_eq!(app.recovery_ui.focus, 1);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &tx);
+        assert_eq!(app.recovery_ui.details_scroll, 7);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert_eq!(app.recovery_ui.surface, RecoverySurface::Window);
+        assert!(app.recovery_ui.discard_in_flight.is_empty());
+    }
+
+    #[test]
+    fn unreadable_records_keep_path_and_distinguishing_error_for_popup() {
+        let mut first = test_entry("truncated", "unused/path", false, None);
+        first.journal_path = PathBuf::from("/saved/jobs/truncated.jsonl");
+        first.record = None;
+        first.availability = RecoverySurfaceAvailability::Unreadable;
+        first.diagnostic = Some("parse journal: unexpected end of file at byte 40".into());
+        let mut second = first.clone();
+        second.journal_path = PathBuf::from("/saved/jobs/protected.jsonl");
+        second.diagnostic = Some("read journal: Permission denied (os error 13)".into());
+        assert_ne!(first.journal_path, second.journal_path);
+        let text_a = user_safe_diagnostic(first.diagnostic.as_deref().unwrap());
+        let text_b = user_safe_diagnostic(second.diagnostic.as_deref().unwrap());
+        assert!(text_a.contains("unexpected end of file at byte 40"));
+        assert!(text_b.contains("Permission denied (os error 13)"));
+        assert!(!text_a.contains("journal"));
+        assert!(first.blocked_paths().is_empty());
+        assert_eq!(first.item_count(), 0);
+        assert!(!job_has_files(&first));
+        assert!(files_popup_lines(&RecoveryUiState { entries: vec![first], ..Default::default() }).is_empty());
+    }
+
+    #[test]
+    fn popup_scroll_clamps_at_render_before_the_next_page_up() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let theme = super::super::theme::theme_by_slug_or_default("tokyo-night");
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        for number in 0..12 {
+            app.recovery_ui.entries.push(test_entry(
+                &format!("scroll-{number}"),
+                &format!("dest/album-{number}"),
+                false,
+                Some(number + 1),
+            ));
+        }
+        let record = app.recovery_ui.entries[0].record.as_mut().unwrap();
+        let job_id = record.job_id.clone();
+        for number in 0..30 {
+            record.temp_artifacts.push(super::super::file_task_runtime::DurableTempArtifact {
+                path: PathBuf::from(format!("dest/album-0/.partial-{number}")),
+                destination: PathBuf::from(format!("dest/album-0/track-{number}")),
+                kind: super::super::file_task_runtime::DurableTempArtifactKind::File,
+                owner_job_id: job_id.clone(),
+                owner_generation: 1,
+            });
+        }
+
+        // Help is shorter than its viewport at 80x24 with today's actions;
+        // use a shorter terminal for that popup to exercise its scroll path.
+        for (surface, height) in [
+            (RecoverySurface::BulkDiscardConfirm, 24),
+            (RecoverySurface::Files, 24),
+            (RecoverySurface::Help, 12),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
+            app.recovery_ui.surface = surface;
+            app.recovery_ui.details_scroll = 0;
+            app.recovery_ui.focus = 1; // Cancel is the default in confirmations.
+            for _ in 0..30 {
+                handle_key(&mut app, KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE), &tx);
+            }
+            let before_draw = app.recovery_ui.details_scroll;
+            terminal.draw(|frame| match surface {
+                RecoverySurface::BulkDiscardConfirm => draw_confirm_popup(frame, &mut app, theme),
+                RecoverySurface::Files => draw_files_popup(frame, &mut app, theme),
+                RecoverySurface::Help => draw_help_popup(frame, &mut app, theme),
+                _ => unreachable!(),
+            }).unwrap();
+            let last_page = app.recovery_ui.details_scroll;
+            assert!(last_page < before_draw, "scroll overshoot not clamped: {surface:?}");
+            assert!(last_page > 0, "popup must have more rows than fit: {surface:?}");
+            handle_key(&mut app, KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), &tx);
+            assert_eq!(app.recovery_ui.details_scroll, last_page.saturating_sub(8),
+                "first PageUp must move immediately: {surface:?}");
+            terminal.draw(|frame| match surface {
+                RecoverySurface::BulkDiscardConfirm => draw_confirm_popup(frame, &mut app, theme),
+                RecoverySurface::Files => draw_files_popup(frame, &mut app, theme),
+                RecoverySurface::Help => draw_help_popup(frame, &mut app, theme),
+                _ => unreachable!(),
+            }).unwrap();
+            assert_eq!(app.recovery_ui.details_scroll, last_page.saturating_sub(8));
+            assert_eq!(app.recovery_ui.focus, 1);
+        }
+    }
+
+    #[test]
+    fn interrupted_help_only_advertises_actions_of_the_current_job() {
+        let mut clean = test_entry("finished", "dest/finished", false, None);
+        clean.record.as_mut().unwrap().job = serde_json::json!({"native_extraction": {"source": "disc.iso"}});
+        clean.record.as_mut().unwrap().lifecycle = DurableFileTaskLifecycle::Completed;
+        let clean_lines = interrupted_help_lines(&RecoveryUiState { entries: vec![clean], ..Default::default() });
+        assert!(clean_lines.iter().any(|line| line == "d  Dismiss"));
+        assert!(!clean_lines.iter().any(|line| line == "f  Finish"));
+        assert!(clean_lines.iter().any(|line| line == "Enter / Esc  close Help"));
+        assert!(clean_lines.iter().any(|line| line == "AFTER CLOSING HELP, IN INTERRUPTED JOBS"));
+        let mut unreadable = test_entry("bad", "dest/bad", false, None);
+        unreadable.record = None;
+        unreadable.availability = RecoverySurfaceAvailability::Unreadable;
+        let keys = interrupted_help_lines(&RecoveryUiState { entries: vec![unreadable], ..Default::default() });
+        assert!(keys.iter().any(|line| line == "e  Error…"));
+        assert!(keys.iter().any(|line| line == "r  Release…"));
+        assert!(!keys.iter().any(|line| line == "f  Finish"));
+        let mut no_feed = test_entry("live", "dest/live", false, None);
+        no_feed.availability = RecoverySurfaceAvailability::Live;
+        let keys = interrupted_help_lines(&RecoveryUiState { entries: vec![no_feed], ..Default::default() });
+        assert!(!keys.iter().any(|line| line == "p  Pause" || line == "x  Stop…"));
+        let mut older = test_entry("old", "dest/album", false, Some(91));
+        older.record.as_mut().unwrap().created_unix_ms = 1;
+        let mut newer = test_entry("new", "dest/album/track", false, Some(92));
+        newer.record.as_mut().unwrap().created_unix_ms = 2;
+        let keys = interrupted_help_lines(&RecoveryUiState { entries: vec![newer, older], ..Default::default() });
+        assert!(keys.iter().any(|line| line == "o  Go to older job"));
+        assert!(!keys.iter().any(|line| line == "f  Finish"));
     }
 }

@@ -153,6 +153,16 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
         return;
     }
 
+    // Global, non-letter Browse shortcut. Keep modal editors in control of
+    // their own keys; the status indicator remains clickable on every screen.
+    if matches!((key.code, key.modifiers),
+        (KeyCode::Char('j'), KeyModifiers::ALT))
+        && matches!(app.active_overlay, ActiveOverlay::None)
+    {
+        super::recovery_ui::open_recovery_window(app);
+        return;
+    }
+
     // The centered Browse artwork view is modal without displacing the
     // existing overlay machinery. Keyboard navigation cannot fall through
     // into directory operations while the image occupies the terminal.
@@ -315,6 +325,19 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
 
     if app.current_screen == AppScreen::Browse && app.browse.filter_input.is_some() {
         handle_browse_filter_key(app, key, tx);
+        return;
+    }
+
+    // Hide the startup notice only when it is actually on screen and the
+    // underlying screen owns keyboard input. Overlay, dropdown and inline
+    // editor dispatch above must retain priority over this temporary chord.
+    if matches!((key.code, key.modifiers), (KeyCode::Char('h'), KeyModifiers::ALT))
+        && app.current_screen != AppScreen::Wizard
+        && (app.current_screen != AppScreen::Browse || !app.browse.options_menu.is_open())
+        && !current_focus_needs_generic_host_clipboard(app)
+        && app.file_task_footer_state().is_some_and(|state| state.startup_notice)
+    {
+        super::recovery_ui::hide_startup_notice(app);
         return;
     }
 
@@ -22043,7 +22066,7 @@ pub(super) fn handle_file_task_user_action(
     use super::app::FileTaskControl;
     if session.is_recovery_monitor() {
         let Some(remote) = session.remote_worker.as_ref() else {
-            app.set_status("Recovery monitor lost its worker identity");
+            app.set_status("Interrupted-job progress lost its worker identity");
             return true;
         };
         if !session.progress.task_controls_available()
@@ -22052,14 +22075,25 @@ pub(super) fn handle_file_task_user_action(
                     | tui_file_picker::FileTaskUserAction::Minimize
                     | tui_file_picker::FileTaskUserAction::Acknowledge)
         {
-            app.set_status("This worker has no verified progress/control feed; only Back is available");
+            app.set_status("Worker progress cannot be read; Back and Minimize remain available");
             return true;
         }
         let control = match action {
             tui_file_picker::FileTaskUserAction::None => return true,
-            tui_file_picker::FileTaskUserAction::Minimize
-            | tui_file_picker::FileTaskUserAction::Acknowledge => {
+            tui_file_picker::FileTaskUserAction::Acknowledge => {
                 super::recovery_ui::return_from_progress_watch(app);
+                return false;
+            }
+            tui_file_picker::FileTaskUserAction::Minimize => {
+                if session.progress.is_terminal() {
+                    super::recovery_ui::return_from_progress_watch(app);
+                    return false;
+                }
+                // The remote monitor is only a viewer. Do not change the
+                // ordinary scheduler's future minimize preference.
+                app.minimized_file_task_progress = Some(session.clone());
+                app.active_overlay = ActiveOverlay::None;
+                app.set_status("Job still running; its progress is in the footer meter");
                 return false;
             }
             tui_file_picker::FileTaskUserAction::Pause => Some(FileTaskControl::Pause),
@@ -22084,7 +22118,7 @@ pub(super) fn handle_file_task_user_action(
                 return false;
             }
             _ => {
-                app.set_status("This progress window does not own the transfer; choose an action in Recovery");
+                app.set_status("Use Interrupted jobs to choose what happens to this transfer");
                 return true;
             }
         };
@@ -55953,40 +55987,6 @@ pub(super) fn cancel_queued_file_transfer(
     queue_id: u64,
     tx: &mpsc::Sender<AppMessage>,
 ) {
-    if let Some(index) = app
-        .file_transfers
-        .recovery_queued
-        .iter()
-        .position(|job| job.queue_id == queue_id)
-    {
-        let Some(deferred) = app.file_transfers.recovery_queued.remove(index) else {
-            app.set_status("Interrupted operation was already removed from this session's review queue");
-            return;
-        };
-        if let Some(journal_path) = deferred
-            .retry_plan
-            .as_ref()
-            .and_then(|retry| retry.recovery_journal_path.as_ref())
-        {
-            app.recovery_ui
-                .session_deferred
-                .insert(journal_path.clone());
-        }
-        let kind = if deferred.clipboard.mode() == tui_file_picker::FilePickerClipboardMode::Cut {
-            "move"
-        } else {
-            "copy"
-        };
-        let count = deferred.clipboard.paths().len();
-        app.sync_file_transfer_queue_surfaces();
-        app.set_status(format!(
-            "Interrupted {kind} of {count} item{} saved for later; its paths stay unavailable to overlapping file changes and undo/redo remains unavailable until it is resolved",
-            if count == 1 { "" } else { "s" },
-        ));
-        maybe_start_next_file_transfer(app, tx);
-        return;
-    }
-
     let Some(index) = app
         .file_transfers
         .queued
@@ -56050,6 +56050,7 @@ pub(super) fn resume_file_transfer_recoveries(
     tx: &mpsc::Sender<AppMessage>,
 ) {
     let mut promoted = Vec::with_capacity(queue_ids.len());
+    let mut blocked_by_older = 0usize;
     for queue_id in queue_ids {
         let Some(index) = app
             .file_transfers
@@ -56059,12 +56060,24 @@ pub(super) fn resume_file_transfer_recoveries(
         else {
             continue;
         };
+        // Apply the same ordering rule as the window at the queue mutation
+        // boundary. This also covers explicit :recovery-resume queue IDs.
+        let journal = app.file_transfers.recovery_queued[index].retry_plan.as_ref()
+            .and_then(|retry| retry.recovery_journal_path.as_deref());
+        if journal.is_some_and(|path| super::recovery_ui::resume_has_older_overlap(app, path)) {
+            blocked_by_older += 1;
+            continue;
+        }
         if let Some(recovery) = app.file_transfers.recovery_queued.remove(index) {
             promoted.push(recovery);
         }
     }
     if promoted.is_empty() {
-        app.set_status("No matching interrupted file operation is awaiting recovery review");
+        app.set_status(if blocked_by_older > 0 {
+            "Finish or undo the older overlapping job before resuming this job"
+        } else {
+            "No matching interrupted file operation is awaiting recovery review"
+        });
         return;
     }
 
@@ -56087,30 +56100,15 @@ pub(super) fn resume_file_transfer_recoveries(
             "Resume approved for {promoted_count} interrupted operations; each saved recovery state will be rechecked before any files change"
         ));
     }
+    if blocked_by_older > 0 {
+        app.set_status(format!(
+            "Approved {promoted_count} job{}; {blocked_by_older} newer overlapping job{} must wait for older work",
+            if promoted_count == 1 { "" } else { "s" },
+            if blocked_by_older == 1 { "" } else { "s" },
+        ));
+    }
     maybe_start_next_file_transfer(app, tx);
 }
-
-pub(super) fn defer_file_transfer_recovery(
-    app: &mut AppState,
-    queue_id: Option<u64>,
-    tx: &mpsc::Sender<AppMessage>,
-) {
-    let selected = match queue_id {
-        Some(queue_id) => app
-            .file_transfers
-            .recovery_queued
-            .iter()
-            .find(|job| job.queue_id == queue_id)
-            .map(|job| job.queue_id),
-        None => app.file_transfers.recovery_queued.front().map(|job| job.queue_id),
-    };
-    let Some(queue_id) = selected else {
-        app.set_status("No matching interrupted file operation is awaiting recovery review");
-        return;
-    };
-    cancel_queued_file_transfer(app, queue_id, tx);
-}
-
 
 fn recovery_source_quarantine_path_is_private(
     artifact: &super::file_task_runtime::DurableQuarantineArtifact,
@@ -62957,7 +62955,7 @@ mod file_task_supervisor_tests {
         let key = |code| crossterm::event::KeyEvent::new(code,
             crossterm::event::KeyModifiers::NONE);
         assert_eq!(viewer.handle_key(key(crossterm::event::KeyCode::Esc)),
-            tui_file_picker::FileTaskUserAction::Minimize,
+            tui_file_picker::FileTaskUserAction::Acknowledge,
             "Esc must not abort a surviving worker at a conflict");
         assert_eq!(viewer.conflict.as_ref().map(|c| c.request_id), Some(first.request_id));
         let choose = viewer.handle_key(key(crossterm::event::KeyCode::Char('s')));
@@ -73721,6 +73719,12 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
 
             // ── Convert screen: tab bar ──
+            TuiButton::InterruptedJobsStatus | TuiButton::InterruptedJobsReview => {
+                super::recovery_ui::open_recovery_window(app);
+            }
+            TuiButton::InterruptedJobsHide => {
+                super::recovery_ui::hide_startup_notice(app);
+            }
             TuiButton::FileTaskMessages => {
                 super::command::execute_command(app, super::command::Command::FileTaskMessages, tx);
             }
@@ -74876,13 +74880,16 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::MetadataAutoNumberRow(_)
             | TuiButton::MetadataAutoNumberApply
             | TuiButton::MetadataAutoNumberCancel
+            | TuiButton::InterruptedTab(_)
+            | TuiButton::InterruptedShowFiles
+            | TuiButton::InterruptedHelp
+            | TuiButton::InterruptedClose
+            | TuiButton::InterruptedRefusalAction(_)
             | TuiButton::RecoveryTitle
-            | TuiButton::RecoveryPromptAction(_)
             | TuiButton::RecoveryListRow(_)
             | TuiButton::RecoveryAction(_)
             | TuiButton::RecoveryBulkResume
             | TuiButton::RecoveryBulkDiscard
-            | TuiButton::RecoveryDetailsTab(_)
             | TuiButton::RecoveryDetailsClose
             | TuiButton::RecoveryConfirm(_)
             => {
@@ -115977,59 +115984,6 @@ mod file_transfer_queue_state_tests {
     }
 
     #[test]
-    fn deferring_one_recovery_removes_only_that_review_entry_for_the_session() {
-        let _home = crate::tui::test_support::XdgConfigHomeGuard::new(
-            "tonepoet-file-transfer-recovery-defer-one",
-        );
-        let temp = tempfile::tempdir().expect("tempdir");
-        let destination = temp.path().join("destination");
-        std::fs::create_dir(&destination).expect("destination");
-        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
-
-        let mut journals = Vec::new();
-        for (queue_id, name) in [(71, "a.flac"), (72, "b.flac")] {
-            let source = temp.path().join(name);
-            std::fs::write(&source, name.as_bytes()).expect("source");
-            let clipboard = tui_file_picker::FilesystemClipboard::new(
-                tui_file_picker::FilePickerClipboardMode::Copy,
-                vec![source.clone()],
-            )
-            .expect("clipboard");
-            let plan = tui_file_picker::PastePlan {
-                mode: tui_file_picker::FilePickerClipboardMode::Copy,
-                mappings: vec![tui_file_picker::PasteMapping {
-                    source,
-                    destination: destination.join(name),
-                }],
-            };
-            let journal = temp.path().join(format!("{name}.jsonl"));
-            let mut retry = super::super::browse::BrowsePasteRetryPlan::from_plan(plan.clone());
-            retry.recovery_journal_path = Some(journal.clone());
-            journals.push(journal);
-            app.file_transfers.recovery_queued.push_back(QueuedFileTransfer {
-                queue_id,
-                clipboard,
-                clipboard_owner_generation: None,
-                destination_dir: destination.clone(),
-                enqueue_plan: plan,
-                retry_plan: Some(retry),
-                recovered: true,
-            });
-        }
-        let (tx, _rx) = mpsc::channel(8);
-
-        defer_file_transfer_recovery(&mut app, Some(72), &tx);
-
-        assert_eq!(app.file_transfers.recovery_queued.len(), 1);
-        assert_eq!(app.file_transfers.recovery_queued[0].queue_id, 71);
-        assert!(!app.recovery_ui.session_deferred.contains(&journals[0]));
-        assert!(app.recovery_ui.session_deferred.contains(&journals[1]));
-        assert!(app.status_message.as_ref().is_some_and(|(message, _)| {
-            message.contains("saved for later") && message.contains("paths stay unavailable")
-        }));
-    }
-
-    #[test]
     fn repeated_paste_does_not_duplicate_exact_recovery_journal_ownership() {
         let _home = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-file-transfer-queue-recovery-owner",
@@ -117267,5 +117221,104 @@ mod r30c_extract_disc_save_notification_tests {
         record_extract_sidecar_save(&mut editor);
         assert!(editor.extract_tags_saved);
         assert!(editor.extract_mb_saved);
+    }
+}
+
+
+#[cfg(test)]
+mod interrupted_jobs_startup_hide_shortcut_tests {
+    use super::*;
+
+    fn pending_notice(jobs: usize) -> AppState {
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.recovery_ui.entries = (0..jobs).map(|i| super::super::recovery_ui::RecoveryEntry {
+            journal_path: std::path::PathBuf::from(format!("interrupted-{i}.jsonl")),
+            record: None,
+            version: None,
+            availability: super::super::file_task_runtime::RecoverySurfaceAvailability::Unreadable,
+            diagnostic: None,
+            queue_id: None,
+            resume_committed: false,
+            approved_resume_queue_id: None,
+            discard_committed: false,
+            live_snapshot: None,
+            stop_requested_unix_ms: None,
+        }).collect();
+        app.recovery_ui.prompt_pending = true;
+        app.recovery_ui.prompt_shown = false;
+        assert!(app.file_task_footer_state().is_some_and(|state| state.startup_notice));
+        app
+    }
+
+    fn alt_h() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT)
+    }
+
+    #[test]
+    fn alt_h_hides_only_the_startup_notice_and_preserves_the_indicator() {
+        let (tx, _rx) = mpsc::channel(4);
+        for count in [1, 3] {
+            let mut app = pending_notice(count);
+            handle_key(&mut app, alt_h(), &tx);
+            assert!(!app.recovery_ui.prompt_pending);
+            assert!(app.recovery_ui.prompt_shown);
+            assert!(matches!(app.active_overlay, ActiveOverlay::None));
+            let footer = app.file_task_footer_state().expect("persistent indicator");
+            assert_eq!(footer.recovery_unresolved, count);
+            assert!(!footer.startup_notice);
+        }
+    }
+
+    #[test]
+    fn alt_h_respects_modal_menu_search_editor_and_wizard_input_ownership() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut app = pending_notice(1);
+        app.active_overlay = ActiveOverlay::Help { screen: AppScreen::Browse, scroll: 0 };
+        handle_key(&mut app, alt_h(), &tx);
+        assert!(app.recovery_ui.prompt_pending);
+        app.active_overlay = ActiveOverlay::None;
+
+        app.browse.options_menu = BrowseOptionsMenu::Root;
+        handle_key(&mut app, alt_h(), &tx);
+        assert!(app.recovery_ui.prompt_pending);
+        app.browse.options_menu = BrowseOptionsMenu::Closed;
+
+        app.browse.search.active = true;
+        handle_key(&mut app, alt_h(), &tx);
+        assert!(app.recovery_ui.prompt_pending);
+        app.browse.search.active = false;
+
+        app.browse.path_input = Some(super::super::text_input::TextInputState::empty());
+        handle_key(&mut app, alt_h(), &tx);
+        assert!(app.recovery_ui.prompt_pending);
+        app.browse.path_input = None;
+
+        app.current_screen = AppScreen::Convert;
+        app.convert.focus = ConvertFocus::Metadata;
+        app.convert.metadata.editing = Some(ConvertMetadataField::Title);
+        handle_key(&mut app, alt_h(), &tx);
+        assert!(app.recovery_ui.prompt_pending);
+        app.convert.metadata.editing = None;
+
+        app.current_screen = AppScreen::Wizard;
+        handle_key(&mut app, alt_h(), &tx);
+        assert!(app.recovery_ui.prompt_pending);
+        app.current_screen = AppScreen::Browse;
+
+        handle_key(&mut app, alt_h(), &tx);
+        assert!(!app.recovery_ui.prompt_pending);
+        assert!(app.recovery_ui.prompt_shown);
+    }
+
+    #[test]
+    fn alt_j_still_opens_interrupted_jobs_without_using_hide() {
+        let _root = crate::concurrency::scoped_test_coordination_root();
+        let (tx, _rx) = mpsc::channel(4);
+        let mut app = pending_notice(2);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT), &tx);
+        assert!(matches!(app.active_overlay, ActiveOverlay::FileRecovery));
+        assert!(!app.recovery_ui.prompt_pending);
+        assert!(app.recovery_ui.prompt_shown);
     }
 }

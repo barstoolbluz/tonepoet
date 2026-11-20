@@ -116,7 +116,7 @@ pub(super) fn dispatch_queued(
 }
 
 /// Called only after a reviewed, ownerless native journal is selected in the
-/// existing Recovery window. Other outstanding file tasks still own their
+/// Interrupted jobs window. Other outstanding file tasks still own their
 /// serial slot; an interrupted extraction does not reserve its own UI forever.
 pub(super) fn resume_from_journal(
     app: &mut AppState,
@@ -125,17 +125,20 @@ pub(super) fn resume_from_journal(
 ) -> Result<(), String> {
     if app.file_transfers.active_session_id.is_some()
         || !app.file_transfers.queued.is_empty()
-        || !app.file_transfers.recovery_queued.is_empty()
+        // A review-only queued copy/move is not running. The serial slot,
+        // runnable queue and other live progress guards above remain the
+        // ownership checks; waiting recoveries must not block an older native
+        // extraction that a user explicitly chose to finish.
         || app.minimized_file_task_progress.is_some()
         || app.file_task_preempted_overlay.is_some()
     {
-        return Err("Finish the other file tasks and unresolved recoveries before resuming this extraction".into());
+        return Err("Finish the active or queued file task before this extraction".into());
     }
     let record = file_task_runtime::load_record(journal_path)?;
     if !record.is_native_extraction() || record.lifecycle == DurableFileTaskLifecycle::Completed
         || file_task_runtime::recovery_record_is_discard_cleanup(&record)
     {
-        return Err("Selected recovery is not an unfinished native extraction".into());
+        return Err("The selected job is not an unfinished extraction".into());
     }
     let saved: DurableNativeExtractionTask = serde_json::from_value(record.job)
         .map_err(|error| format!("Decode saved extraction selection: {error}"))?;
@@ -616,6 +619,21 @@ fn native_recovery_baseline(
         }
     }
     base
+}
+
+/// Count the original selected tracks from durable publication and skip
+/// receipts. Sidecars and log files do not count as selected tracks. This is
+/// presentation accounting only; it never reads an output or resumes a job.
+pub(super) fn recorded_selection_counts(
+    record: &DurableFileTaskRecord,
+) -> Option<(usize, usize, usize)> {
+    let job = serde_json::from_value::<NativeExtractionJob>(
+        record.job.get("native_extraction")?.clone(),
+    ).ok()?;
+    let baseline = native_recovery_baseline(
+        &job, &record.native_published_paths, &record.native_skipped_selections,
+    );
+    Some((baseline.done.saturating_sub(baseline.skipped), baseline.skipped, baseline.total))
 }
 
 fn add_native_recovery_baseline(

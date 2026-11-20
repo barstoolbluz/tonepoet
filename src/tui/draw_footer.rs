@@ -115,17 +115,36 @@ fn draw_context_bar(
     file_task: Option<FileTaskFooterState>,
     theme: super::theme::Theme,
 ) {
-    let details_label = file_task_details_label(area.width, file_task);
+    // The startup notice is the indicator while it is visible, not a
+    // second caption next to another indicator. Reserve its entire width
+    // before giving space to hints, status messages or the progress meter.
+    // One cell is kept for an active meter whenever both can fit.
+    let meter_min_width = u16::from(area.width > 1 && file_task.is_some_and(|state| state.live));
+    let indicator_capacity = area.width.saturating_sub(meter_min_width);
+    let startup_notice = file_task
+        .filter(|state| state.startup_notice && state.recovery_unresolved > 0)
+        .map(|state| startup_notice_parts(state.recovery_unresolved, indicator_capacity));
+    let interrupted = if startup_notice.is_some() {
+        String::new()
+    } else {
+        interrupted_label(indicator_capacity, file_task)
+    };
+    let interrupted_width = startup_notice.as_ref().map_or_else(
+        || interrupted.chars().count() as u16,
+        StartupNoticeParts::width,
+    );
+    let details_label = file_task_details_label(area.width.saturating_sub(interrupted_width), file_task);
     let details_width = details_label.chars().count() as u16;
     let content_area = Rect::new(
-        area.x,
-        area.y,
-        area.width.saturating_sub(details_width),
+        area.x, area.y,
+        area.width.saturating_sub(details_width.saturating_add(interrupted_width)),
         area.height,
     );
-
     // When a transient status message is set, it replaces the hints on this row.
-    if let Some(msg) = status_message {
+    if startup_notice.is_some() {
+        // The notice occupies the reserved indicator slot below. The normal
+        // hint/status area stays empty while the startup notice is shown.
+    } else if let Some(msg) = status_message {
         let max_chars = (content_area.width as usize).saturating_sub(2);
         let display: String = if msg.chars().count() > max_chars && max_chars >= 2 {
             let t: String = msg.chars().take(max_chars - 1).collect();
@@ -163,36 +182,109 @@ fn draw_context_bar(
         f.render_widget(Paragraph::new(Line::from(spans)), content_area);
     }
 
-    if let Some(details_area) = file_task_details_rect(area, file_task) {
+    let details_area = Rect::new(
+        area.right().saturating_sub(interrupted_width.saturating_add(details_width)),
+        area.y, details_width, 1,
+    );
+    if details_width > 0 {
         buttons.record_button(TuiButton::FileTaskMessages, details_area);
         let attention = file_task.is_some_and(|state| state.attention);
-        let recovery = file_task.is_some_and(|state| state.recovery_unresolved > 0);
-        let style = Style::default()
-            .fg(if attention {
-                theme.destructive
-            } else if recovery {
-                theme.warning
-            } else {
-                theme.cyan
-            })
-            .add_modifier(Modifier::BOLD);
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(details_label, style))),
-            details_area,
-        );
+        f.render_widget(Paragraph::new(Span::styled(details_label,
+            Style::default().fg(if attention { theme.destructive } else { theme.cyan })
+                .add_modifier(Modifier::BOLD))), details_area);
+    }
+    if interrupted_width > 0 {
+        let indicator = Rect::new(area.right().saturating_sub(interrupted_width),
+            area.y, interrupted_width, 1);
+        if let Some(notice) = startup_notice.as_ref() {
+            draw_startup_notice(f, indicator, buttons, notice, theme);
+        } else {
+            buttons.record_button(TuiButton::InterruptedJobsStatus, indicator);
+            f.render_widget(Paragraph::new(Span::styled(interrupted,
+                Style::default().fg(theme.warning).add_modifier(Modifier::BOLD))), indicator);
+        }
     }
 }
 
-fn file_task_details_rect(area: Rect, file_task: Option<FileTaskFooterState>) -> Option<Rect> {
-    let width = file_task_details_label(area.width, file_task).chars().count() as u16;
-    (width > 0).then(|| {
-        Rect::new(
-            area.x.saturating_add(area.width.saturating_sub(width)),
-            area.y,
-            width,
-            1,
-        )
-    })
+/// Dedicated status-bar slot, never covered by a hint, status message or
+/// minimized transfer meter. At tiny widths the actionable marker remains.
+fn interrupted_label(width: u16, file_task: Option<FileTaskFooterState>) -> String {
+    let Some(count) = file_task.map(|state| state.recovery_unresolved).filter(|count| *count > 0) else {
+        return String::new();
+    };
+    let labels = [format!(" ▲ {count} interrupted "), format!(" ▲ {count} "),
+        format!("▲{count}"), "▲".to_string()];
+    labels.into_iter().find(|label| label.chars().count() <= width as usize)
+        .unwrap_or_default()
+}
+
+/// One reserved, clickable presentation of the startup warning. The
+/// longer caption is preferred when space permits; narrower terminals keep
+/// the same action on the visible warning rather than drawing dead text.
+#[derive(Debug)]
+struct StartupNoticeParts {
+    caption: String,
+    review: &'static str,
+    hide: &'static str,
+}
+
+impl StartupNoticeParts {
+    fn width(&self) -> u16 {
+        (self.caption.chars().count() + self.review.chars().count()
+            + self.hide.chars().count()) as u16
+    }
+}
+
+fn startup_notice_parts(count: usize, width: u16) -> StartupNoticeParts {
+    let noun = if count == 1 { "job" } else { "jobs" };
+    let possessive = if count == 1 { "Its" } else { "Their" };
+    let full = format!("▲ tonepoet closed before {count} {noun} finished. {possessive} files stay locked.");
+    let short = format!("▲ tonepoet closed before {count} {noun} finished.");
+    let compact = format!("▲ {count} interrupted");
+    let tiny = format!("▲{count}");
+    let candidates = [
+        (full, " Review… ", " Hide "),
+        (short, " Review… ", " Hide "),
+        (compact.clone(), " Review… ", " Hide "),
+        (compact.clone(), " Review… ", ""),
+        (compact, "", ""),
+        (tiny, "", ""),
+        ("▲".to_string(), "", ""),
+    ];
+    candidates.into_iter().find_map(|(caption, review, hide)| {
+        (caption.chars().count() + review.chars().count() + hide.chars().count()
+            <= width as usize).then_some(StartupNoticeParts { caption, review, hide })
+    }).unwrap_or(StartupNoticeParts { caption: String::new(), review: "", hide: "" })
+}
+
+fn draw_startup_notice(
+    f: &mut Frame,
+    area: Rect,
+    buttons: &mut ButtonRenderMap,
+    notice: &StartupNoticeParts,
+    theme: super::theme::Theme,
+) {
+    let caption_width = notice.caption.chars().count() as u16;
+    let review_width = notice.review.chars().count() as u16;
+    let hide_width = notice.hide.chars().count() as u16;
+    if caption_width > 0 {
+        let rect = Rect::new(area.x, area.y, caption_width, 1);
+        f.render_widget(Paragraph::new(Span::styled(notice.caption.as_str(),
+            Style::default().fg(theme.warning).add_modifier(Modifier::BOLD))), rect);
+        buttons.record_button(TuiButton::InterruptedJobsStatus, rect);
+    }
+    if review_width > 0 {
+        let rect = Rect::new(area.x + caption_width, area.y, review_width, 1);
+        f.render_widget(Paragraph::new(Span::styled(notice.review,
+            Style::default().fg(theme.blue))), rect);
+        buttons.record_button(TuiButton::InterruptedJobsReview, rect);
+    }
+    if hide_width > 0 {
+        let rect = Rect::new(area.x + caption_width + review_width, area.y, hide_width, 1);
+        f.render_widget(Paragraph::new(Span::styled(notice.hide,
+            Style::default().fg(theme.dismiss))), rect);
+        buttons.record_button(TuiButton::InterruptedJobsHide, rect);
+    }
 }
 
 fn compact_progress_bar(ratio: Option<f64>) -> String {
@@ -218,30 +310,9 @@ fn file_task_details_label(width: u16, file_task: Option<FileTaskFooterState>) -
         return String::new();
     }
     if !state.live {
-        if state.recovery_unresolved > 0 {
-            let count = if state.recovery_unresolved > 999 {
-                "999+".to_string()
-            } else {
-                state.recovery_unresolved.to_string()
-            };
-            let candidates = [
-                format!(" ▲ {count} unresolved "),
-                format!(" {count} unresolved "),
-                format!("{count}!"),
-                "!".to_string(),
-            ];
-            return candidates
-                .into_iter()
-                .find(|label| label.chars().count() <= width as usize)
-                .unwrap_or_default();
-        }
-        return if width >= 18 {
-            " details ".to_string()
-        } else if width >= 7 {
-            " msgs ".to_string()
-        } else {
-            "d".to_string()
-        };
+        if state.ratio.is_none() && !state.attention { return String::new(); }
+        return if width >= 18 { " details ".to_string() }
+        else if width >= 7 { " msgs ".to_string() } else { "d".to_string() };
     }
 
     let percent = progress_percent(state.ratio);
@@ -401,14 +472,16 @@ fn truncate_groups_to_width(groups: &[Vec<Hint>], available: usize) -> Vec<Vec<H
 
 #[cfg(test)]
 mod tests {
-    use super::{file_task_details_label, file_task_details_rect, hint_groups_for};
+    use super::{draw_context_bar, file_task_details_label, interrupted_label, hint_groups_for};
+    use crate::tui::button_map::{ButtonRenderMap, TuiButton};
+    use ratatui::{backend::TestBackend, layout::Rect, Terminal};
     use crate::tui::app::{AppScreen, FileTaskFooterState};
-    use ratatui::layout::Rect;
 
     fn retained() -> Option<FileTaskFooterState> {
         Some(FileTaskFooterState {
             live: false,
             recovery_unresolved: 0,
+            startup_notice: false,
             ratio: Some(1.0),
             queued: 0,
             attention: false,
@@ -419,6 +492,7 @@ mod tests {
         Some(FileTaskFooterState {
             live: true,
             recovery_unresolved: 0,
+            startup_notice: false,
             ratio: Some(0.61),
             queued,
             attention,
@@ -429,6 +503,7 @@ mod tests {
         Some(FileTaskFooterState {
             live: false,
             recovery_unresolved: count,
+            startup_notice: false,
             ratio: None,
             queued: 0,
             attention: false,
@@ -460,24 +535,19 @@ mod tests {
         assert_eq!(file_task_details_label(17, retained()), " msgs ");
         assert_eq!(file_task_details_label(18, retained()), " details ");
         assert_eq!(file_task_details_label(80, None), "");
-
-        assert_eq!(
-            file_task_details_rect(Rect::new(9, 4, 1, 1), retained()),
-            Some(Rect::new(9, 4, 1, 1)),
-        );
-        assert_eq!(file_task_details_rect(Rect::new(9, 4, 0, 1), retained()), None);
     }
 
     #[test]
-    fn unresolved_recovery_label_shares_the_restore_slot_at_every_width() {
-        assert_eq!(file_task_details_label(30, unresolved(2)), " ▲ 2 unresolved ");
-        assert_eq!(file_task_details_label(14, unresolved(2)), " 2 unresolved ");
-        assert_eq!(file_task_details_label(2, unresolved(2)), "2!");
-        assert_eq!(file_task_details_label(1, unresolved(2)), "!");
-        assert_eq!(
-            file_task_details_rect(Rect::new(9, 4, 1, 1), unresolved(2)),
-            Some(Rect::new(9, 4, 1, 1)),
-        );
+    fn interrupted_decision_has_its_own_visible_status_slot() {
+        assert_eq!(interrupted_label(40, unresolved(2)), " ▲ 2 interrupted ");
+        assert_eq!(interrupted_label(6, unresolved(2)), " ▲ 2 ");
+        assert_eq!(interrupted_label(2, unresolved(2)), "▲2");
+        assert_eq!(interrupted_label(1, unresolved(2)), "▲");
+        assert_eq!(file_task_details_label(80, unresolved(2)), "");
+        let mut state = live(2, false).unwrap();
+        state.recovery_unresolved = 2;
+        assert_eq!(interrupted_label(80, Some(state)), " ▲ 2 interrupted ");
+        assert_eq!(file_task_details_label(80, Some(state)), " [██░] 61% +2 ");
     }
 
     #[test]
@@ -491,4 +561,103 @@ mod tests {
         assert!(huge.chars().count() <= 8);
         assert_eq!(huge, "61%");
     }
+
+    fn rendered_status_row(
+        width: u16,
+        state: Option<FileTaskFooterState>,
+        status: Option<&str>,
+    ) -> (String, ButtonRenderMap) {
+        let theme = crate::tui::theme::theme_by_slug_or_default(
+            crate::tui::theme::default_theme_slug(),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(width, 1)).expect("terminal");
+        let mut buttons = ButtonRenderMap::new();
+        terminal.draw(|frame| draw_context_bar(
+            frame, Rect::new(0, 0, width, 1), AppScreen::Browse, 1,
+            &mut buttons, status, state, theme,
+        )).expect("render footer");
+        let buffer = terminal.backend().buffer();
+        let row = (0..width)
+            .map(|x| buffer.get(x, 0).symbol())
+            .collect::<String>();
+        (row, buttons)
+    }
+
+    #[test]
+    fn startup_warning_is_one_clickable_message_and_uses_correct_singular() {
+        for count in [1, 2] {
+            let mut state = unresolved(count).expect("recovery state");
+            state.startup_notice = true;
+            let (row, buttons) = rendered_status_row(120, Some(state), Some("unrelated status"));
+            assert_eq!(row.matches('▲').count(), 1, "one warning indicator: {row}");
+            let count_text = format!("before {count} {} finished",
+                if count == 1 { "job" } else { "jobs" });
+            assert!(row.contains(count_text.as_str()));
+            assert!(row.contains(if count == 1 {
+                "Its files stay locked." } else { "Their files stay locked." }));
+            assert!(!row.contains("unrelated status"), "notice replaces status/hints");
+            let caption = buttons.button_rect(TuiButton::InterruptedJobsStatus)
+                .expect("caption itself must be clickable");
+            for x in caption.x..caption.right() {
+                assert_eq!(buttons.find_button_at(x, 0), Some(TuiButton::InterruptedJobsStatus));
+            }
+            let review = buttons.button_rect(TuiButton::InterruptedJobsReview)
+                .expect("Review button");
+            for x in review.x..review.right() {
+                assert_eq!(buttons.find_button_at(x, 0), Some(TuiButton::InterruptedJobsReview));
+            }
+            let hide = buttons.button_rect(TuiButton::InterruptedJobsHide).expect("Hide button");
+            for x in hide.x..hide.right() {
+                assert_eq!(buttons.find_button_at(x, 0), Some(TuiButton::InterruptedJobsHide));
+            }
+            assert_eq!(caption.right(), review.x);
+            assert_eq!(review.right(), hide.x);
+            assert_eq!(hide.right(), 120);
+        }
+    }
+
+    #[test]
+    fn startup_notice_and_minimized_meter_fit_without_overlapping() {
+        for width in [1, 2, 6, 16, 32, 80, 120] {
+            let mut state = live(2, false).expect("live footer state");
+            state.recovery_unresolved = 2;
+            state.startup_notice = true;
+            let (row, buttons) = rendered_status_row(width, Some(state), None);
+            assert_eq!(row.matches('▲').count(), 1, "one warning at width {width}: {row}");
+            let caption = buttons.button_rect(TuiButton::InterruptedJobsStatus)
+                .expect("warning remains clickable even at one column");
+            assert!(caption.width > 0);
+            assert_eq!(buttons.find_button_at(caption.x, 0), Some(TuiButton::InterruptedJobsStatus));
+            if width > 1 {
+                let meter = buttons.button_rect(TuiButton::FileTaskMessages)
+                    .expect("live meter gets its own slot");
+                assert!(meter.width > 0);
+                assert!(meter.right() <= caption.x);
+                assert_eq!(buttons.find_button_at(meter.x, 0), Some(TuiButton::FileTaskMessages));
+            }
+            if width >= 80 {
+                assert!(row.contains("tonepoet closed before 2 jobs finished."));
+                assert!(buttons.button_rect(TuiButton::InterruptedJobsReview).is_some());
+                assert!(buttons.button_rect(TuiButton::InterruptedJobsHide).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn hidden_startup_notice_restores_hints_and_sole_persistent_indicator() {
+        let state = unresolved(2).expect("recovery state");
+        let (row, buttons) = rendered_status_row(120, Some(state), Some("some status"));
+        assert_eq!(row.matches('▲').count(), 1);
+        assert!(row.contains("▲ 2 interrupted"));
+        assert!(row.contains("some status"));
+        assert!(!row.contains("tonepoet closed"));
+        assert!(buttons.button_rect(TuiButton::InterruptedJobsReview).is_none());
+        assert!(buttons.button_rect(TuiButton::InterruptedJobsHide).is_none());
+        let indicator = buttons.button_rect(TuiButton::InterruptedJobsStatus)
+            .expect("persistent status indicator");
+        for x in indicator.x..indicator.right() {
+            assert_eq!(buttons.find_button_at(x, 0), Some(TuiButton::InterruptedJobsStatus));
+        }
+    }
+
 }

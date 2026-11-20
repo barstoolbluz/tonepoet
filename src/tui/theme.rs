@@ -100,6 +100,9 @@ pub struct Theme {
     pub hover_bg: Color,
     pub pill_active_bg: Color,
     pub pill_active_fg: Color,
+    /// Neutral body controls; reserved affirmative green stays in the footer.
+    pub pill_neutral_bg: Color,
+    pub pill_neutral_hover_bg: Color,
     pub pill_dim_bg: Color,
     pub pill_preset_bg: Color,
     pub pill_preset_fg: Color,
@@ -326,6 +329,13 @@ impl Theme {
             hover_bg,
             pill_active_bg: palette.tab_active,
             pill_active_fg: palette.panel_bg,
+            pill_neutral_bg: mix(palette.panel_bg, palette.value, 1,
+                if relative_luminance(palette.panel_bg) < 0.4 { 4 } else { 3 }),
+            pill_neutral_hover_bg: {
+                let base = mix(palette.panel_bg, palette.value, 1,
+                    if relative_luminance(palette.panel_bg) < 0.4 { 4 } else { 3 });
+                mix(base, palette.value, 1, 6)
+            },
             pill_dim_bg: text_dim,
             pill_preset_bg: mix(palette.panel_bg, palette.chip_go, 1, 2),
             pill_preset_fg: palette.chip_go,
@@ -865,6 +875,8 @@ const DERIVED_SPECS: &[DerivedElementSpec] = &[
     DerivedElementSpec { key: "dropdown_bg", label: "dropdown bg", formula: "mix(panel_bg, border, 1:4)", used_by: "dropdowns, menus, overlays", group: "interaction" },
     DerivedElementSpec { key: "pill_active_bg", label: "pill active bg", formula: "tab_active", used_by: "active footer/navigation pills", group: "pills" },
     DerivedElementSpec { key: "pill_active_fg", label: "pill active fg", formula: "panel_bg", used_by: "text inside active pills", group: "pills" },
+    DerivedElementSpec { key: "pill_neutral_bg", label: "pill neutral bg", formula: "mix(panel_bg, value, 1:4 dark / 1:3 light)", used_by: "interrupted-job body buttons", group: "pills" },
+    DerivedElementSpec { key: "pill_neutral_hover_bg", label: "pill neutral hover bg", formula: "mix(pill_neutral_bg, value, 1:6)", used_by: "interrupted-job hovered body buttons", group: "pills" },
     DerivedElementSpec { key: "pill_dim_bg", label: "pill dim bg", formula: "text_dim", used_by: "dimmed footer pills", group: "pills" },
     DerivedElementSpec { key: "pill_preset_bg", label: "pill preset bg", formula: "mix(panel_bg, chip_go, 1:2)", used_by: "preset-selection pills", group: "pills" },
     DerivedElementSpec { key: "pill_preset_fg", label: "pill preset fg", formula: "chip_go", used_by: "preset-selection pill text", group: "pills" },
@@ -1062,6 +1074,8 @@ fn quantize_theme_for_depth(theme: &mut Theme, depth: ColorDepth) {
     theme.hover_bg = quantize_color_for_depth(theme.hover_bg, depth);
     theme.pill_active_bg = quantize_color_for_depth(theme.pill_active_bg, depth);
     theme.pill_active_fg = quantize_color_for_depth(theme.pill_active_fg, depth);
+    theme.pill_neutral_bg = quantize_color_for_depth(theme.pill_neutral_bg, depth);
+    theme.pill_neutral_hover_bg = quantize_color_for_depth(theme.pill_neutral_hover_bg, depth);
     theme.pill_dim_bg = quantize_color_for_depth(theme.pill_dim_bg, depth);
     theme.pill_preset_bg = quantize_color_for_depth(theme.pill_preset_bg, depth);
     theme.pill_preset_fg = quantize_color_for_depth(theme.pill_preset_fg, depth);
@@ -1759,6 +1773,8 @@ pub fn theme_color_by_derived_key(theme: Theme, key: &str) -> Option<Color> {
         "dropdown_bg" => theme.dropdown_bg,
         "pill_active_bg" => theme.pill_active_bg,
         "pill_active_fg" => theme.pill_active_fg,
+        "pill_neutral_bg" => theme.pill_neutral_bg,
+        "pill_neutral_hover_bg" => theme.pill_neutral_hover_bg,
         "pill_dim_bg" => theme.pill_dim_bg,
         "pill_preset_bg" => theme.pill_preset_bg,
         "pill_preset_fg" => theme.pill_preset_fg,
@@ -1795,6 +1811,8 @@ pub fn set_theme_derived_color(theme: &mut Theme, key: &str, color: Color) -> bo
         "dropdown_bg" => theme.dropdown_bg = color,
         "pill_active_bg" => theme.pill_active_bg = color,
         "pill_active_fg" => theme.pill_active_fg = color,
+        "pill_neutral_bg" => theme.pill_neutral_bg = color,
+        "pill_neutral_hover_bg" => theme.pill_neutral_hover_bg = color,
         "pill_dim_bg" => theme.pill_dim_bg = color,
         "pill_preset_bg" => theme.pill_preset_bg = color,
         "pill_preset_fg" => theme.pill_preset_fg = color,

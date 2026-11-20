@@ -466,8 +466,11 @@ pub async fn run_app(
         }
         let recovery_visible = matches!(app.active_overlay, ActiveOverlay::FileRecovery)
             || matches!(&app.active_overlay, ActiveOverlay::FileTaskProgress(session)
-                if session.is_recovery_monitor());
+                if session.is_recovery_monitor())
+            || app.minimized_file_task_progress.as_ref().is_some_and(|session|
+                session.is_recovery_monitor());
         if !input_waiting_at_frame_start && (recovery_visible
+            || app.recovery_ui.needs_attention_count() > 0
             || !app.recovery_ui.stop_and_undo_pending.is_empty())
             && last_recovery_inventory.elapsed() >= Duration::from_secs(2)
         {
@@ -482,6 +485,7 @@ pub async fn run_app(
         if recovery_visible && last_recovery_progress.elapsed() >= Duration::from_millis(350) {
             last_recovery_progress = Instant::now();
             redraw_requested |= super::recovery_ui::refresh_live_observation(app);
+            super::recovery_ui::refresh_visible_sizes(app, &tx);
         }
         super::recovery_ui::maybe_open_startup_prompt(app);
 
@@ -9986,6 +9990,9 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             // source/destination mounts. This keeps the footer indicator in
             // sync when a running transfer becomes (or ceases to be) unresolved.
             super::recovery_ui::refresh_from_runtime(app);
+        }
+        AppMessage::RecoveryDismissComplete { journal_path, result } => {
+            super::recovery_ui::complete_dismiss(app, journal_path, result);
         }
         AppMessage::RecoveryDiscardComplete {
             journal_path,
