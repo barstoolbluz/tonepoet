@@ -6058,7 +6058,7 @@ mod inline_edit_behavior_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while app.browse_artwork.count() != 2 && std::time::Instant::now() < deadline {
             app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
-                &app.browse.artwork_config);
+                &app.browse.artwork_config, app.theme.bg);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(app.browse_artwork.count(), 2);
@@ -6118,14 +6118,14 @@ mod inline_edit_behavior_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !app.browse_artwork.has_image() && std::time::Instant::now() < deadline {
             app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
-                &app.browse.artwork_config);
+                &app.browse.artwork_config, app.theme.bg);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(app.browse_artwork.has_image());
         app.browse_artwork.set_desired_area(Rect::new(20, 12, 25, 12),
             super::super::browse_artwork::ImageVerticalPlacement::Center);
         assert!(app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
-            &app.browse.artwork_config), "Info art protocol must be prepared");
+            &app.browse.artwork_config, app.theme.bg), "Info art protocol must be prepared");
         app.button_map.record_button(TuiButton::BrowseInfoArtworkArea,
             Rect::new(20, 12, 25, 12));
         let original_selection = app.browse.selected_index;
@@ -6162,7 +6162,7 @@ mod inline_edit_behavior_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !app.browse_artwork.has_image() && std::time::Instant::now() < deadline {
             app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
-                &app.browse.artwork_config);
+                &app.browse.artwork_config, app.theme.bg);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(app.browse_artwork.has_image());
@@ -6208,7 +6208,7 @@ mod inline_edit_behavior_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !app.browse_artwork.has_image() && std::time::Instant::now() < deadline {
             app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
-                &app.browse.artwork_config);
+                &app.browse.artwork_config, app.theme.bg);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(app.browse_artwork.has_image());
@@ -6217,7 +6217,7 @@ mod inline_edit_behavior_tests {
         // the menu's overwriting of pixels away from the image-origin cell.
         let draw_artwork = |app: &mut AppState, terminal: &mut Terminal<TestBackend>| {
             app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
-                &app.browse.artwork_config);
+                &app.browse.artwork_config, app.theme.bg);
             let menu_open = matches!(&app.active_overlay, ActiveOverlay::ContextMenu { .. });
             terminal.draw(|frame| {
                 assert!(app.browse_artwork.render_image(frame, viewport,
@@ -6321,7 +6321,7 @@ mod inline_edit_behavior_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !app.browse_artwork.has_image() && std::time::Instant::now() < deadline {
             app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
-                &app.browse.artwork_config);
+                &app.browse.artwork_config, app.theme.bg);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(app.browse_artwork.has_image());
@@ -6334,7 +6334,7 @@ mod inline_edit_behavior_tests {
         // and the frame's buffer, whose diff is what reaches the terminal.
         let mut draw_frame = |app: &mut AppState, menu_open: bool| {
             app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
-                &app.browse.artwork_config);
+                &app.browse.artwork_config, app.theme.bg);
             let mut repaired = false;
             let buffer = terminal.draw(|frame| {
                 let screen = frame.size();
@@ -6354,7 +6354,7 @@ mod inline_edit_behavior_tests {
                 }
             }).unwrap().buffer.clone();
             let redraw = app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
-                &app.browse.artwork_config);
+                &app.browse.artwork_config, app.theme.bg);
             (repaired, redraw, buffer)
         };
 
@@ -6412,7 +6412,7 @@ mod inline_edit_behavior_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while app.browse_artwork.count() != 3 && std::time::Instant::now() < deadline {
             app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
-                &app.browse.artwork_config);
+                &app.browse.artwork_config, app.theme.bg);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(app.browse_artwork.count(), 3);

@@ -9688,7 +9688,9 @@ impl FileTransferQueueState {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FileTaskFooterState {
     pub live: bool,
-    /// Jobs currently needing a user decision, independent of any live meter.
+    /// Worker-owned records found by recovery, including after reopening.
+    pub recovery_running: usize,
+    /// Non-live records that still need a user decision or journal cleanup.
     pub recovery_unresolved: usize,
     /// Startup notice replaces the indicator in its reserved footer slot
     /// until Review or Hide is chosen.
@@ -17784,7 +17786,8 @@ impl AppState {
 
     #[must_use]
     pub fn file_task_footer_state(&self) -> Option<FileTaskFooterState> {
-        let decisions = self.recovery_ui.needs_attention_count();
+        let decisions = self.recovery_ui.review_count();
+        let running = self.recovery_ui.running_count();
         let startup_notice = self.recovery_ui.prompt_pending && !self.recovery_ui.prompt_shown && decisions > 0;
         let live_progress = self
             .minimized_file_task_progress
@@ -17805,6 +17808,7 @@ impl AppState {
         if let Some(progress) = live_progress {
             return Some(FileTaskFooterState {
                 live: true,
+                recovery_running: running,
                 recovery_unresolved: decisions,
                 startup_notice,
                 ratio: progress.totals.ratio(),
@@ -17817,9 +17821,10 @@ impl AppState {
                     ),
             });
         }
-        if decisions > 0 {
+        if decisions > 0 || running > 0 {
             return Some(FileTaskFooterState {
                 live: false,
+                recovery_running: running,
                 recovery_unresolved: decisions,
                 startup_notice,
                 ratio: None,
@@ -17829,6 +17834,7 @@ impl AppState {
         }
         self.last_file_task_progress.as_ref().map(|(_, progress)| FileTaskFooterState {
             live: false,
+            recovery_running: 0,
             recovery_unresolved: 0,
             startup_notice: false,
             ratio: progress.totals.ratio(),
@@ -18163,6 +18169,7 @@ impl AppState {
                 protocol_generation,
                 retransmit_generation,
                 &self.browse.artwork_config,
+                self.theme.bg,
             );
         } else {
             self.browse_artwork.suspend();

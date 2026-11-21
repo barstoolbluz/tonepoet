@@ -101,7 +101,7 @@ impl RecoveryEntry {
             || snapshot.age_since_forward_ms() >= self.record.as_ref().map_or(8_000, |r| r.stall_timeout_secs.max(8).saturating_mul(1_000))
     }
 
-    fn kind_label(&self) -> &'static str {
+    pub(super) fn kind_label(&self) -> &'static str {
         match self.record.as_ref() {
             Some(record) if record.is_native_extraction() => "extract",
             Some(record) if record.is_move => "move",
@@ -120,7 +120,7 @@ impl RecoveryEntry {
         })
     }
 
-    fn is_live(&self) -> bool {
+    pub(super) fn is_live(&self) -> bool {
         self.availability == RecoverySurfaceAvailability::Live
     }
 
@@ -307,6 +307,11 @@ impl RecoveryEntry {
         !self.resume_committed && !self.discard_committed
     }
 
+    /// A live worker, even a stalled one, is running rather than interrupted.
+    fn needs_review(&self) -> bool {
+        !self.is_live() && self.needs_attention()
+    }
+
 }
 
 #[derive(Debug, Clone)]
@@ -367,7 +372,7 @@ impl RecoveryUiState {
     pub fn from_records(records: Vec<RecoverySurfaceRecord>, queued: &VecDeque<QueuedFileTransfer>) -> Self {
         let mut state = Self::default();
         state.replace_records(records, queued);
-        state.prompt_pending = state.entries.iter().any(RecoveryEntry::needs_attention);
+        state.prompt_pending = state.entries.iter().any(RecoveryEntry::needs_review);
         state
     }
 
@@ -431,7 +436,7 @@ impl RecoveryUiState {
             .collect::<BTreeSet<_>>();
         self.incomplete_sizes
             .retain(|path, _| current_incomplete.contains(path));
-        if !self.entries.iter().any(RecoveryEntry::needs_attention) && !self.prompt_shown {
+        if !self.entries.iter().any(RecoveryEntry::needs_review) && !self.prompt_shown {
             // The startup set was resolved by another process before the
             // prompt could be shown. Do not let a later unrelated recovery
             // resurrect a stale "session-start" prompt.
@@ -498,6 +503,14 @@ impl RecoveryUiState {
 
     pub(super) fn needs_attention_count(&self) -> usize {
         self.entries.iter().filter(|entry| entry.needs_attention()).count()
+    }
+
+    pub(super) fn review_count(&self) -> usize {
+        self.entries.iter().filter(|entry| entry.needs_review()).count()
+    }
+
+    pub(super) fn running_count(&self) -> usize {
+        self.entries.iter().filter(|entry| entry.is_live()).count()
     }
 
     fn open_refusal(&mut self, attempted: &Path) -> bool {
@@ -2022,6 +2035,33 @@ mod tests {
         assert_eq!(main, area);
         assert!(popup.right() <= area.right());
         assert!(popup.bottom() <= area.bottom());
+    }
+
+    #[test]
+    fn live_recovery_is_running_not_a_startup_decision() {
+        let mut running = test_entry("running", "dest/running", false, None);
+        running.availability = RecoverySurfaceAvailability::Live;
+        let surface = RecoverySurfaceRecord {
+            journal_path: running.journal_path.clone(),
+            record: running.record.clone(),
+            version: running.version,
+            availability: running.availability,
+            diagnostic: None,
+        };
+        let state = RecoveryUiState::from_records(vec![surface], &VecDeque::new());
+        assert_eq!(state.running_count(), 1);
+        assert_eq!(state.review_count(), 0);
+        assert!(!state.prompt_pending, "live-only work is not a startup interruption");
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.recovery_ui = state;
+        let footer = app.file_task_footer_state().unwrap();
+        assert_eq!((footer.recovery_running, footer.recovery_unresolved), (1, 0));
+        assert!(!footer.startup_notice);
+
+        app.recovery_ui.entries.push(test_entry("review", "dest/review", false, None));
+        let footer = app.file_task_footer_state().unwrap();
+        assert_eq!((footer.recovery_running, footer.recovery_unresolved), (1, 1));
     }
 
     #[test]

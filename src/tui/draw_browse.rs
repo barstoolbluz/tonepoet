@@ -2741,7 +2741,8 @@ fn draw_browse_list(
                 is_selected,
                 is_checked,
                 is_range_preview,
-                is_hovered, theme));
+                is_hovered,
+                theme));
         }
 
         let mut rendered = end - start;
@@ -2965,7 +2966,7 @@ fn render_entry_line(
     }
 
     let cached = cached_info_for_entry(browse, entry);
-    let mut spans = Vec::with_capacity(7 + columns.len().saturating_mul(2));
+    let mut spans = Vec::with_capacity(9 + columns.len().saturating_mul(2));
     let mut inline_editor_span_range: Option<std::ops::Range<usize>> = None;
     spans.push(Span::styled("│", theme.border(border_color)));
     spans.push(Span::styled(cursor, cursor_style));
@@ -3023,9 +3024,7 @@ fn render_entry_line(
             if !inline_editor_owns_style && !matches!(span.content.as_ref(), "│") {
                 span.style = span.style.bg(bg_color);
                 if is_selected {
-                    span.style = span
-                        .style
-                        .fg(theme.text_bright)
+                    span.style = span.style.fg(theme.text_bright)
                         .add_modifier(Modifier::BOLD);
                 }
             }
@@ -3602,6 +3601,7 @@ fn draw_browse_info_with_artwork_cursor(
     ));
 
     let content_height = (area.height as usize).saturating_sub(2);
+    let normal_height = content_height;
     let artwork_context = ArtworkContext::from_browse(browse);
     let has_album_context = artwork_context.is_some();
     if let Some((state, _)) = artwork.as_mut() {
@@ -3660,16 +3660,15 @@ fn draw_browse_info_with_artwork_cursor(
             matches!(c.kind, FolderClassificationKind::Album | FolderClassificationKind::Disc |
                 FolderClassificationKind::MultiDisc)))
     });
-    // First choose the metadata layout using the ENTIRE pane. The artwork
-    // preference must not trigger the compact layout or hide action rows.
-    let compact_media = media_selection && (content_height <= MEDIA_COMPACT_MAX_CONTENT_ROWS
-        || info.lines.len() > content_height);
+    // Artwork is never allowed to compete with action or information rows.
+    let compact_media = media_selection && (normal_height <= MEDIA_COMPACT_MAX_CONTENT_ROWS
+        || info.lines.len() > normal_height);
     let compact_directory = !media_selection && physical_folder
-        && info.lines.len() > content_height;
+        && info.lines.len() > normal_height;
     let info = if media_selection {
-        compact_media_info(info, content_height)
+        compact_media_info(info, normal_height)
     } else if compact_directory {
-        compact_directory_info(info, content_height, content_width)
+        compact_directory_info(info, normal_height, content_width)
     } else { info };
     // Never reinterpret a compact layout as a four-row header: its rows are
     // reindexed and its hitboxes already refer to that compact ordering.

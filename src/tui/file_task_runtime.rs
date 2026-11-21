@@ -1919,7 +1919,7 @@ fn recovery_descriptor_path(
     ))
 }
 
-/// A completed native file task keeps its *journal* for later inspection,
+/// A completed native file task may briefly retain its private journal, but
 /// not a durable filesystem mutation reservation. The retirement primitive
 /// itself refuses release while any helper still owns the lease.
 pub(crate) fn retire_completed_native_reservation(
@@ -1940,6 +1940,22 @@ pub(crate) fn retire_completed_native_reservation(
         crate::concurrency::retire_descriptor_after_lifecycle_release(&descriptor, &family)?;
     }
     Ok(())
+}
+
+/// This journal is no longer actionable only when every selected track has
+/// a durable publication or intentional-skip receipt. Sidecars and logs are
+/// accounted for by the successful terminal lifecycle and recorded cleanup
+/// obligations, not by counting them as extra tracks.
+fn completed_native_extraction_ready_to_retire(record: &DurableFileTaskRecord) -> bool {
+    record.is_native_extraction()
+        && record.lifecycle == DurableFileTaskLifecycle::Completed
+        && record.temp_artifacts.is_empty()
+        && record.quarantine_artifacts.is_empty()
+        && record.native_rename_intents.is_empty()
+        && super::native_extract_task::recorded_selection_counts(record)
+            .is_some_and(|(done, skipped, total)| {
+                total > 0 && done.checked_add(skipped) == Some(total)
+            })
 }
 
 /// Retire a clean, completed native extraction that was left in the journal
@@ -2077,13 +2093,24 @@ pub fn recovery_surface_records() -> Vec<RecoverySurfaceRecord> {
                         && record.lifecycle == DurableFileTaskLifecycle::Completed) =>
             {
                 match classify_recovery_surface(&path, &record) {
-                    Ok(availability) => Some(RecoverySurfaceRecord {
-                        journal_path: path,
-                        record: Some(record),
-                        version: Some(version),
-                        availability,
-                        diagnostic: None,
-                    }),
+                    Ok(availability) => {
+                        // Reuse Dismiss's version-checked, lease-safe, private-
+                        // journal-only retirement. A live helper or an error
+                        // leaves the record in the review inventory.
+                        if availability == RecoverySurfaceAvailability::Recoverable
+                            && completed_native_extraction_ready_to_retire(&record)
+                            && dismiss_completed_native_recovery(&path, version).is_ok()
+                        {
+                            return None;
+                        }
+                        Some(RecoverySurfaceRecord {
+                            journal_path: path,
+                            record: Some(record),
+                            version: Some(version),
+                            availability,
+                            diagnostic: None,
+                        })
+                    },
                     Err(error) => Some(RecoverySurfaceRecord {
                         journal_path: path,
                         record: Some(record),
@@ -3246,6 +3273,75 @@ mod tests {
         // A late-closing fork-time duplicate cannot resurrect the retired
         // claim because it shared the explicitly unlocked OFD.
         unsafe { libc::close(shared_fd); }
+    }
+
+    #[test]
+    fn clean_native_completion_retires_only_private_journal_after_worker_release() {
+        let _lock = test_environment_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let _environment = JournalDirGuard::install(&temp.path().join("journals"));
+        let source = temp.path().join("disc.iso");
+        let dest = temp.path().join("Extracted");
+        fs::write(&source, b"original disc").unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        let job = native_reservation_fixture(&source, &dest);
+        let output = crate::convert::pipeline::native_extract::proposed_destination(
+            &job, &job.programs[0], &job.programs[0].tracks[0]);
+        if let Some(parent) = output.parent() { fs::create_dir_all(parent).unwrap(); }
+        fs::write(&output, b"published audio").unwrap();
+        let journal = FileTaskJournalHandle::create(
+            uuid::Uuid::new_v4().to_string(), 1, 22, false,
+            tui_file_picker::VerificationMode::Standard, 600,
+            vec![tui_file_picker::PasteMapping {
+                source: source.clone(), destination: dest.clone(),
+            }],
+            None, serde_json::json!({"native_extraction": job}),
+        ).unwrap();
+        let journal_path = journal.path().to_path_buf();
+        journal.record_native_published(&output).unwrap();
+        journal.mark_lifecycle(DurableFileTaskLifecycle::Completed, "all selected tracks published")
+            .unwrap();
+        assert!(completed_native_extraction_ready_to_retire(&journal.load().unwrap()));
+        let with_live_owner = recovery_surface_records();
+        assert_eq!(with_live_owner.len(), 1);
+        assert_eq!(with_live_owner[0].availability, RecoverySurfaceAvailability::Live);
+        assert!(journal_path.exists(), "a still-owned journal cannot be retired");
+
+        journal.retire_reaped_completed_native_reservation().unwrap();
+        assert!(recovery_surface_records().is_empty(), "completed inventory is retired");
+        assert!(recovery_surface_records().is_empty(), "repeated replay is idempotent");
+        assert!(!journal_path.exists());
+        assert_eq!(fs::read(&source).unwrap(), b"original disc");
+        assert_eq!(fs::read(&output).unwrap(), b"published audio");
+    }
+
+    #[test]
+    fn completed_native_record_without_all_track_receipts_stays_reviewable() {
+        let _lock = test_environment_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let _environment = JournalDirGuard::install(&temp.path().join("journals"));
+        let source = temp.path().join("disc.iso");
+        let dest = temp.path().join("Extracted");
+        fs::write(&source, b"original disc").unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        let job = native_reservation_fixture(&source, &dest);
+        let journal = FileTaskJournalHandle::create(
+            uuid::Uuid::new_v4().to_string(), 1, 23, false,
+            tui_file_picker::VerificationMode::Standard, 600,
+            vec![tui_file_picker::PasteMapping {
+                source, destination: dest,
+            }],
+            None, serde_json::json!({"native_extraction": job}),
+        ).unwrap();
+        let path = journal.path().to_path_buf();
+        journal.mark_lifecycle(DurableFileTaskLifecycle::Completed, "completion without receipt")
+            .unwrap();
+        assert!(!completed_native_extraction_ready_to_retire(&journal.load().unwrap()));
+        journal.retire_reaped_completed_native_reservation().unwrap();
+        let records = recovery_surface_records();
+        assert_eq!(records.len(), 1, "missing selection needs an explicit review");
+        assert!(path.exists());
+        assert_eq!(records[0].availability, RecoverySurfaceAvailability::Recoverable);
     }
 
     #[cfg(unix)]
