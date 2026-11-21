@@ -1015,6 +1015,7 @@ mod tests {
         let contents = map_matroska_file(&input).unwrap();
         assert_eq!(contents.presentations[0].format.codec.as_deref(), Some("pcm_s16le"));
         let mut state = crate::tui::disc_browser::DiscBrowserState::new(contents, input.clone());
+        state.cue = false;
         state.tags = false;
         state.extraction_log = false;
         state.destination = temp.path().join("export");
@@ -1080,6 +1081,8 @@ mod tests {
             stream_index: 2, audio_ordinal: 2, chapter_count: 2,
         });
         let mut state = crate::tui::disc_browser::DiscBrowserState::new(contents, source.clone());
+        state.extraction_log = false;
+        state.cue = false;
         state.selected[1] = false;
         state.tags = false;
         state.destination = temp.path().join("copies");
@@ -1192,6 +1195,8 @@ mod tests {
         assert_eq!(stream_origin_samples(&source, 1, 48_000).unwrap(), 24_000);
         let contents = map_matroska_file(&source).unwrap();
         let mut state = crate::tui::disc_browser::DiscBrowserState::new(contents, source.clone());
+        state.extraction_log = false;
+        state.cue = false;
         state.file_per_program = false;
         state.tags = false;
         state.destination = temp.path().join("split");
@@ -1237,6 +1242,8 @@ mod tests {
         let contents = map_matroska_file(&source).unwrap();
         assert_eq!(contents.presentations[0].format.channel_layout.as_deref(), Some("5.1(side)"));
         let mut state = crate::tui::disc_browser::DiscBrowserState::new(contents, source);
+        state.extraction_log = false;
+        state.cue = false;
         state.file_per_program = false;
         state.tags = false;
         state.destination = temp.path().join("split");
@@ -1291,6 +1298,8 @@ mod tests {
         assert_eq!(stream_origin_samples(&source, 1, 48_000).unwrap(), 48_000);
         let contents = map_matroska_file(&source).unwrap();
         let mut state = crate::tui::disc_browser::DiscBrowserState::new(contents, source.clone());
+        state.extraction_log = false;
+        state.cue = false;
         state.file_per_program = false;
         state.tags = false;
         state.destination = temp.path().join("split");
@@ -1344,6 +1353,8 @@ mod tests {
         assert_eq!(stream_origin_samples(&source, 0, 48_000).unwrap(), 0);
         let contents = map_matroska_file(&source).unwrap();
         let mut state = crate::tui::disc_browser::DiscBrowserState::new(contents, source.clone());
+        state.extraction_log = false;
+        state.cue = false;
         state.file_per_program = false;
         state.tags = false;
         state.destination = temp.path().join("split");
@@ -1399,6 +1410,8 @@ mod tests {
 
         let contents = map_matroska_file(&source).unwrap();
         let mut state = crate::tui::disc_browser::DiscBrowserState::new(contents, source.clone());
+        state.extraction_log = false;
+        state.cue = false;
         state.file_per_program = false;
         state.tags = false;
         state.destination = temp.path().join("split");
@@ -1459,6 +1472,8 @@ mod tests {
 
         let contents = map_matroska_file(&source).unwrap();
         let mut state = crate::tui::disc_browser::DiscBrowserState::new(contents, source.clone());
+        state.extraction_log = false;
+        state.cue = false;
         state.file_per_program = false;
         state.tags = false;
         state.destination = temp.path().join("split");
@@ -1555,10 +1570,13 @@ mod tests {
         let contents = map_matroska_file(&source).unwrap();
         assert_eq!(contents.presentations[0].format.codec.as_deref(),Some("ac3"));
         let mut state = crate::tui::disc_browser::DiscBrowserState::new(contents, source.clone());
+        state.extraction_log = false;
         state.tags = false;
         state.destination = temp.path().join("without-cue");
         assert!(state.matroska_cue_available());
-        assert!(state.output_rows().contains(&"CUE"));
+        assert!(state.native_cue_applicable());
+        assert!(!state.output_rows().contains(&"CUE"));
+        state.cue = false; // First exercise the explicit CUE-off route.
         let preview = state.native_preview_path().unwrap();
         assert_eq!(preview.extension().and_then(|v|v.to_str()),Some("ac3"));
         let job = state.native_job(temp.path().join("scratch"));
@@ -1614,6 +1632,8 @@ mod tests {
         let contents = map_matroska_file(&source).unwrap();
         assert_eq!(contents.presentations[0].format.bit_depth,Some(24));
         let mut state = crate::tui::disc_browser::DiscBrowserState::new(contents,source.clone());
+        state.extraction_log = false;
+        state.cue = false;
         state.file_per_program = false;
         state.tags = false;
         state.destination = temp.path().join("chapters-out");
@@ -1676,6 +1696,8 @@ mod tests {
             ] {
                 let mut state = crate::tui::disc_browser::DiscBrowserState::new(
                     contents.clone(), source.clone());
+                state.extraction_log = false;
+                state.cue = false;
                 state.tags = tags;
                 state.tag_artwork = artwork;
                 state.destination = temp.path().join(format!(
@@ -1788,6 +1810,8 @@ mod tests {
             let contents = map_matroska_file(&source).unwrap();
             assert_eq!(contents.presentations.len(), 1);
             let mut state = crate::tui::disc_browser::DiscBrowserState::new(contents, source.clone());
+            state.extraction_log = false;
+            state.cue = false;
             state.tags = false;
             state.destination = temp.path().join(if with_video { "out-video" } else { "out-audio" });
             assert!(!state.matroska_cue_available());
@@ -1844,6 +1868,8 @@ mod tests {
             assert!(create.status.success(), "{}", String::from_utf8_lossy(&create.stderr));
             let contents = map_matroska_file(&source).unwrap();
             let mut state = crate::tui::disc_browser::DiscBrowserState::new(contents, source.clone());
+            state.extraction_log = false;
+            state.cue = false;
             state.tags = false;
             state.destination = temp.path().join(format!("out-{duration}"));
             assert!(!state.matroska_cue_available(), "MKA retains embedded chapters");
@@ -1977,6 +2003,7 @@ mod tests {
             let contents = crate::tui::disc_browser::probe_disc_contents(&source).unwrap();
             assert!(contents.diagnostics.iter().any(|d| d.message.contains("No chapters found")));
             let mut state = crate::tui::disc_browser::DiscBrowserState::new(contents, source.clone());
+            state.cue = false;
             state.tags = false;
             state.extraction_log = false;
             state.destination = temp.path().join(format!("out-{label}"));
@@ -2045,6 +2072,8 @@ mod tests {
         assert_eq!(contents.presentations[0].format.codec.as_deref(), Some("pcm_dvd"));
         assert_eq!(contents.presentations[0].format.bit_depth, Some(16));
         let mut state = crate::tui::disc_browser::DiscBrowserState::new(contents, source.clone());
+        state.extraction_log = false;
+        state.cue = false;
         state.tags = false;
         state.destination = temp.path().join("pcm-output");
         let report = execute_with_controls(state.native_job(temp.path().join("scratch")),
