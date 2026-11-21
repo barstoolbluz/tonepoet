@@ -246,10 +246,22 @@ pub(super) fn package_raw_pcm(
 
 /// Extraction-only pause checkpoint. Ordinary callers retain the original
 /// signature and do not pay for any extra shared-state polling.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn package_raw_pcm_checked(
     raw: &Path, output: &Path, format: NativePcmFormat,
     container: NativeWavContainer, cancel: &CancellationToken,
+    checkpoint: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    package_raw_pcm_checked_with_tap(raw,output,format,container,cancel,checkpoint,None)
+}
+
+/// An optional producer-time audio tap shares the actual private WAV writer
+/// traversal. No extra traversal or allocation is needed in the default mode.
+pub(super) fn package_raw_pcm_checked_with_tap(
+    raw: &Path, output: &Path, format: NativePcmFormat,
+    container: NativeWavContainer, cancel: &CancellationToken,
     mut checkpoint: impl FnMut() -> Result<(), String>,
+    mut audio_tap: Option<&mut dyn FnMut(&[u8])>,
 ) -> Result<(), String> {
     let size = fs::metadata(raw).map_err(|e| format!("Raw PCM not found: {e}"))?.len();
     let align = u64::from(format.block_align()?);
@@ -281,6 +293,7 @@ pub(super) fn package_raw_pcm_checked(
             }
         }
         output_file.write_all(&buffer[..want]).map_err(|e| format!("Write native WAV: {e}"))?;
+        if let Some(tap)=audio_tap.as_mut() {tap(&buffer[..want]);}
         remaining -= want as u64;
     }
     checkpoint()?;
@@ -297,6 +310,37 @@ mod tests {
     fn sample() -> NativePcmFormat {
         NativePcmFormat { rate: 96000, channels: 2, container_bits: 24, valid_bits: 20, channel_mask: 3 }
     }
+    #[test]
+    fn r2d02_native_pcm_writer_hashes_during_the_write_not_from_a_finished_file() {
+        use sha2::{Digest,Sha256};
+        let temp=tempfile::tempdir().unwrap();
+        let raw=temp.path().join("track.raw");
+        let wav=temp.path().join("track.wav");
+        let samples=[1234i16,-1234,3000,-3000,0,1,32767,-32768];
+        let bytes=samples.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>();
+        fs::write(&raw,&bytes).unwrap();
+        let format=NativePcmFormat {rate:48_000,channels:1,container_bits:16,
+            valid_bits:16,channel_mask:4};
+        let mut producer=Sha256::new();
+        let mut tap=|audio:&[u8]|producer.update(audio);
+        package_raw_pcm_checked_with_tap(&raw,&wav,format,NativeWavContainer::Riff,
+            &CancellationToken::new(),||Ok(()),Some(&mut tap)).unwrap();
+        let expected=producer.finalize();
+        assert_eq!(expected,Sha256::digest(&bytes));
+        // The completed private WAV is intentionally not read to compute the
+        // reference. A decoder checks that its original samples still match.
+        if std::process::Command::new("ffmpeg").arg("-version").output().is_ok() {
+            let receipt=temp.path().join("decoded.sha256");
+            let decoded=std::process::Command::new("ffmpeg")
+                .args(["-hide_banner","-loglevel","error","-nostdin","-i"])
+                .arg(&wav).args(["-map","0:a:0","-c:a","pcm_s16le","-f","hash",
+                    "-hash","SHA256"]).arg(&receipt).output().unwrap();
+            assert!(decoded.status.success(),"{}",String::from_utf8_lossy(&decoded.stderr));
+            assert_eq!(fs::read_to_string(&receipt).unwrap().trim(),
+                format!("SHA256={expected:x}"));
+        }
+    }
+
     #[test]
     fn riff_20bit_explicit_valid_depth_and_chunk_lengths() {
         let dir = tempfile::tempdir().unwrap();
@@ -413,7 +457,7 @@ mod tests {
 /// Validate a *generated* PCM WAV (the native writer's fixed RIFF/RF64/W64
 /// headers) and locate its sample payload without reading it into memory.
 /// This is deliberately not a general-purpose WAV parser.
-fn generated_wave_span(path: &Path) -> Result<(NativePcmFormat, u64, u64), String> {
+pub(super) fn generated_wave_span(path: &Path) -> Result<(NativePcmFormat, u64, u64), String> {
     let mut file = File::open(path).map_err(|e| e.to_string())?;
     let len = file.metadata().map_err(|e| e.to_string())?.len();
     let mut bytes = [0u8; 128];
@@ -462,10 +506,20 @@ fn generated_wave_span(path: &Path) -> Result<(NativePcmFormat, u64, u64), Strin
 
 /// Assemble a continuous native PCM presentation from fully completed private
 /// per-item containers. Returns exact source sample-frame counts for CUE.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn concatenate_generated_waves_checked(
     inputs: &[std::path::PathBuf], output: &Path,
     container: NativeWavContainer, cancel: &CancellationToken,
+    checkpoint: impl FnMut() -> Result<(), String>,
+) -> Result<(Vec<u64>, u32), String> {
+    concatenate_generated_waves_with_tap(inputs,output,container,cancel,checkpoint,None)
+}
+
+pub(super) fn concatenate_generated_waves_with_tap(
+    inputs: &[std::path::PathBuf], output: &Path,
+    container: NativeWavContainer, cancel: &CancellationToken,
     mut checkpoint: impl FnMut() -> Result<(), String>,
+    audio_tap: Option<&mut dyn FnMut(&[u8])>,
 ) -> Result<(Vec<u64>, u32), String> {
     if inputs.is_empty() { return Err("No selected chapters to concatenate".into()); }
     let spool = output.with_extension("native-join-pcm");
@@ -497,7 +551,8 @@ pub(super) fn concatenate_generated_waves_checked(
     raw.sync_all().map_err(|e| e.to_string())?;
     drop(raw);
     let format = common.ok_or("No native PCM format found")?;
-    package_raw_pcm_checked(&spool, output, format, container, cancel, &mut checkpoint)?;
+    package_raw_pcm_checked_with_tap(&spool, output, format, container, cancel,
+        &mut checkpoint, audio_tap)?;
     fs::remove_file(&spool).map_err(|e| e.to_string())?;
     Ok((samples, format.rate))
 }

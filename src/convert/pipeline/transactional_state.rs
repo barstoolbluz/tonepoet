@@ -89,9 +89,57 @@ pub(crate) fn publish_validated_to_final_checked_observed(
             Ok(())
         }
         Err(err) if is_cross_device_error(&err) =>
-            copy_across_devices_atomically_checked_observed(
-                validated_path, final_path, checkpoint, private_temp, on_temporary),
+            copy_across_devices_atomically_checked_preverified_observed(
+                validated_path, final_path, checkpoint, private_temp, on_temporary, |_, _|Ok(())),
         Err(err) => Err(err),
+    }
+}
+
+/// Extraction may check the fully written artifact before its destructive
+/// rename. For a cross-device copy the hook receives the synchronized
+/// destination-directory temporary instead of the original staging file.
+/// Convert retains its original, unverified publication behavior above.
+pub(crate) fn publish_validated_to_final_checked_preverified_observed(
+    validated_path: &Path,
+    final_path: &Path,
+    mut checkpoint: impl FnMut() -> io::Result<()>,
+    private_temp: Option<PathBuf>,
+    on_temporary: impl FnMut(Option<&Path>) -> io::Result<()>,
+    mut before_replace: impl FnMut(&Path, &mut dyn FnMut() -> io::Result<()>) -> io::Result<()>,
+) -> io::Result<()> {
+    checkpoint()?;
+    if let Some(parent) = final_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    checkpoint()?;
+    // Do not try the destructive rename first when verification is requested.
+    // Check device identity on the same source/destination parents to decide
+    // whether the existing transaction's cross-volume temporary is needed.
+    if same_device(validated_path, final_path.parent().unwrap_or_else(||Path::new(".")))? {
+        before_replace(validated_path, &mut checkpoint)?;
+        checkpoint()?;
+        fs::rename(validated_path, final_path)?;
+        sync_parent_dir_best_effort(final_path);
+        Ok(())
+    } else {
+        copy_across_devices_atomically_checked_preverified_observed(
+            validated_path, final_path, checkpoint, private_temp, on_temporary,
+            before_replace,
+        )
+    }
+}
+
+fn same_device(source: &Path, destination_parent: &Path) -> io::Result<bool> {
+    #[cfg(unix)] {
+        use std::os::unix::fs::MetadataExt;
+        Ok(fs::metadata(source)?.dev() == fs::metadata(destination_parent)?.dev())
+    }
+    #[cfg(not(unix))] {
+        // On Windows a cross-device rename is detected by the original
+        // publisher. Avoid a destructive trial rename for verified Replace.
+        let source=fs::canonicalize(source)?;
+        let destination=fs::canonicalize(destination_parent)?;
+        Ok(source.components().next()==destination.components().next())
     }
 }
 
@@ -130,12 +178,13 @@ pub fn is_transactional_state_file(path: &Path) -> bool {
     name.ends_with(PARTIAL_SUFFIX) || name.ends_with(VALIDATED_SUFFIX)
 }
 
-fn copy_across_devices_atomically_checked_observed(
+fn copy_across_devices_atomically_checked_preverified_observed(
     src: &Path,
     dst: &Path,
     mut checkpoint: impl FnMut() -> io::Result<()>,
     private_temp: Option<PathBuf>,
     mut on_temporary: impl FnMut(Option<&Path>) -> io::Result<()>,
+    mut before_replace: impl FnMut(&Path, &mut dyn FnMut() -> io::Result<()>) -> io::Result<()>,
 ) -> io::Result<()> {
     let parent = dst.parent().unwrap_or_else(|| Path::new("."));
     let file_name = dst.file_name().and_then(|s| s.to_str()).unwrap_or("tonepoet-output");
@@ -166,6 +215,8 @@ fn copy_across_devices_atomically_checked_observed(
         out_file.sync_all()?;
         checkpoint()?;
         drop(out_file);
+        before_replace(&tmp, &mut checkpoint)?;
+        checkpoint()?;
         fs::rename(&tmp, dst)?;
         sync_parent_dir_best_effort(dst);
         if journaled_native_temp {
@@ -246,6 +297,40 @@ fn is_cross_device_error(err: &io::Error) -> bool {
 #[cfg(test)]
 mod native_publication_checkpoint_tests {
     use super::*;
+
+    #[test]
+    fn cd01_cross_volume_copy_checks_private_temp_before_replace() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("complete.wav");
+        let target = temporary.path().join("existing.wav");
+        let candidate = b"new audio";
+        let original = b"previous audio";
+        fs::write(&source, candidate).unwrap();
+        fs::write(&target, original).unwrap();
+        let private = temporary.path().join(".existing.tonepoet-part-fixture.tmp");
+        let result = copy_across_devices_atomically_checked_preverified_observed(
+            &source, &target, || Ok(()), Some(private.clone()), |_| Ok(()),
+            |ready, _| {
+                assert_eq!(ready, private.as_path());
+                assert_eq!(fs::read(ready).unwrap(), candidate);
+                Err(io::Error::new(io::ErrorKind::InvalidData, "audio checksum mismatch"))
+            },
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&target).unwrap(), original);
+        assert!(source.exists(), "a failed verify retains staging for task cleanup");
+        assert!(!private.exists(), "failed private copy is not left in destination");
+        copy_across_devices_atomically_checked_preverified_observed(
+            &source, &target, || Ok(()), Some(private.clone()), |_| Ok(()),
+            |ready, _| {
+                assert_eq!(ready, private.as_path());
+                assert_eq!(fs::read(ready).unwrap(), candidate);
+                Ok(())
+            },
+        ).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), candidate);
+        assert!(!private.exists());
+    }
 
     #[test]
     fn stopped_publication_never_exposes_an_output_filename() {

@@ -521,17 +521,64 @@ fn open_native_naming_builder(app: &mut AppState) {
 }
 
 fn activate_native_option(state:&mut DiscBrowserState,control:ExtractOptionControl) {
+    use crate::convert::pipeline::native_extract::{NativeCueBetweenGap as B, NativeCueFirstGap as F};
+    use ExtractOptionControl as C;
     match control {
-        ExtractOptionControl::WriteLog => state.extraction_log=!state.extraction_log,
-        ExtractOptionControl::CueFiles => {state.panel=Some(ExtractPanel::CueFiles);state.panel_cursor=0;},
-        ExtractOptionControl::CreateCue => state.cue=!state.cue,
-        ExtractOptionControl::SaveNext => state.save_extract_defaults=!state.save_extract_defaults,
-        ExtractOptionControl::Done => {
-            if state.panel==Some(ExtractPanel::CueFiles) {
+        C::WriteLog => state.extraction_log=!state.extraction_log,
+        C::Verify => state.extract_settings.verify_after=!state.extract_settings.verify_after,
+        C::Chapters | C::CueFiles | C::CopyFolder => {
+            state.option_parent_cursor=state.panel_cursor;
+            state.panel=Some(match control { C::Chapters=>ExtractPanel::Chapters,
+                C::CueFiles=>ExtractPanel::CueFiles,_=>ExtractPanel::CopyFolder });
+            state.panel_cursor=0;
+        },
+        C::WriteChapters => state.extract_settings.write_chapters=!state.extract_settings.write_chapters,
+        C::CreateCue => state.cue=!state.cue,
+        C::EmbedCue => state.extract_settings.embed_cue=!state.extract_settings.embed_cue,
+        C::KeepPreemphasis => state.extract_settings.keep_preemphasis=!state.extract_settings.keep_preemphasis,
+        C::BetweenAppend => state.extract_settings.between_gap=B::AppendPrevious,
+        C::BetweenPrepend => state.extract_settings.between_gap=B::PrependNext,
+        C::BetweenDrop => state.extract_settings.between_gap=B::Drop,
+        C::FirstPrepend => state.extract_settings.first_gap=F::PrependFirst,
+        C::FirstOwn00 => state.extract_settings.first_gap=F::OwnTrack00,
+        C::FirstDrop => state.extract_settings.first_gap=F::Drop,
+        C::CopyArtwork => state.extract_settings.copy_folder.artwork=!state.extract_settings.copy_folder.artwork,
+        C::CopyArtFolders => state.extract_settings.copy_folder.art_folders=!state.extract_settings.copy_folder.art_folders,
+        C::CopyLog => state.extract_settings.copy_folder.log=!state.extract_settings.copy_folder.log,
+        C::CopyCue => state.extract_settings.copy_folder.cue=!state.extract_settings.copy_folder.cue,
+        C::CopyTxt => state.extract_settings.copy_folder.txt=!state.extract_settings.copy_folder.txt,
+        C::CopyNfo => state.extract_settings.copy_folder.nfo=!state.extract_settings.copy_folder.nfo,
+        C::CopyMd => state.extract_settings.copy_folder.md=!state.extract_settings.copy_folder.md,
+        C::CopyPdf => state.extract_settings.copy_folder.pdf=!state.extract_settings.copy_folder.pdf,
+        C::CopyMd5 => state.extract_settings.copy_folder.md5=!state.extract_settings.copy_folder.md5,
+        C::CopyOther => state.extract_settings.copy_folder.other=!state.extract_settings.copy_folder.other,
+        C::SaveNext => state.save_extract_defaults=!state.save_extract_defaults,
+        C::Done => {
+            if matches!(state.panel,Some(ExtractPanel::Chapters | ExtractPanel::CueFiles | ExtractPanel::CopyFolder)) {
                 state.panel=Some(ExtractPanel::Options);
-                state.panel_cursor=1;
+                state.panel_cursor=state.option_parent_cursor;
             } else {state.panel=None;state.panel_cursor=0;}
         }
+    }
+}
+
+/// The native-radio keys move only within the currently focused group.
+fn cycle_extract_radio(state:&mut DiscBrowserState,forward:bool) {
+    use ExtractOptionControl as C;
+    let controls=state.option_controls();
+    let Some(current)=controls.get(state.panel_cursor) else {return;};
+    let group:&[C]=match current {
+        C::BetweenAppend | C::BetweenPrepend | C::BetweenDrop =>
+            &[C::BetweenAppend,C::BetweenPrepend,C::BetweenDrop],
+        C::FirstPrepend | C::FirstOwn00 | C::FirstDrop =>
+            &[C::FirstPrepend,C::FirstOwn00,C::FirstDrop],
+        _=>return,
+    };
+    let index=group.iter().position(|value|value==current).unwrap_or(0);
+    let next=group[(index+if forward {1}else{group.len()-1})%group.len()];
+    if let Some(position)=controls.iter().position(|value|*value==next) {
+        state.panel_cursor=position;
+        activate_native_option(state,next);
     }
 }
 
@@ -539,6 +586,7 @@ fn restore_extract_options(state:&mut DiscBrowserState,config:&crate::config::To
     let saved=config.extract_defaults.clone().unwrap_or_default();
     state.extraction_log=saved.write_log;
     state.cue=saved.create_cue;
+    state.extract_settings=saved;
     state.save_extract_defaults=false;
 }
 
@@ -560,10 +608,7 @@ fn start_native_extraction(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
         return;
     }
     let probe_cancel = state.probe_cancel.clone();
-    let save_defaults=state.save_extract_defaults.then(||crate::config::ExtractSavedOptions {
-        write_log:state.extraction_log,
-        create_cue:state.cue,
-    });
+    let save_defaults=state.save_extract_defaults.then(||state.current_extract_settings());
     if let Err(error) = super::native_extract_task::launch(app, job, tx) {
         app.set_status(format!("Cannot start native extraction: {error}"));
         return;
@@ -603,7 +648,7 @@ pub fn handle_disc_browser_button_click_with_shift(
     // precedence over the extraction window below it. Other panels remain
     // modal but read-only, as before.
     if let ActiveOverlay::DiscBrowser(state) = &app.active_overlay {
-        if matches!(state.panel,Some(ExtractPanel::Options | ExtractPanel::CueFiles)) {
+        if matches!(state.panel,Some(ExtractPanel::Options | ExtractPanel::Chapters | ExtractPanel::CueFiles | ExtractPanel::CopyFolder)) {
             if let ActiveOverlay::DiscBrowser(state)=&mut app.active_overlay {
                 match button {
                     TuiButton::DiscBrowserOptionControl(index) => {
@@ -1752,12 +1797,14 @@ pub fn handle_disc_browser_key(
     }
 
     if let Some(panel) = state.panel {
-        if matches!(panel,ExtractPanel::Options | ExtractPanel::CueFiles) {
+        if matches!(panel,ExtractPanel::Options | ExtractPanel::Chapters | ExtractPanel::CueFiles | ExtractPanel::CopyFolder) {
             let len=state.option_controls().len();
             match key.code {
                 KeyCode::Esc => activate_native_option(state,ExtractOptionControl::Done),
                 KeyCode::Up | KeyCode::BackTab => state.panel_cursor=state.panel_cursor.saturating_sub(1),
                 KeyCode::Down | KeyCode::Tab => state.panel_cursor=(state.panel_cursor+1).min(len.saturating_sub(1)),
+                KeyCode::Char('[') | KeyCode::Left => cycle_extract_radio(state,false),
+                KeyCode::Char(']') | KeyCode::Right => cycle_extract_radio(state,true),
                 KeyCode::Enter | KeyCode::Char(' ') => {
                     if let Some(control)=state.option_controls().get(state.panel_cursor).copied() {
                         activate_native_option(state,control);
@@ -4164,7 +4211,7 @@ mod tests {
         let mut config=TonepoetConfig::default();
         config.conversion.write_log_file=true;
         config.extract_defaults=Some(ExtractSavedOptions {
-            write_log:false,create_cue:false,
+            write_log:false,create_cue:false, ..Default::default()
         });
         let mut state=DiscBrowserState::new(contents,source);
         state.file_per_program=true;
@@ -4176,8 +4223,9 @@ mod tests {
 
         state.panel=Some(ExtractPanel::Options);
         assert_eq!(state.option_controls(),vec![ExtractOptionControl::WriteLog,
-            ExtractOptionControl::CueFiles,ExtractOptionControl::SaveNext,
-            ExtractOptionControl::Done]);
+            ExtractOptionControl::Verify,ExtractOptionControl::Chapters,
+            ExtractOptionControl::CueFiles,ExtractOptionControl::CopyFolder,
+            ExtractOptionControl::SaveNext,ExtractOptionControl::Done]);
         activate_native_option(&mut state,ExtractOptionControl::WriteLog);
         activate_native_option(&mut state,ExtractOptionControl::SaveNext);
         assert!(state.extraction_log && state.save_extract_defaults);
@@ -4189,7 +4237,7 @@ mod tests {
         assert!(state.cue);
         activate_native_option(&mut state,ExtractOptionControl::Done);
         assert_eq!(state.panel,Some(ExtractPanel::Options));
-        assert_eq!(state.panel_cursor,1);
+        assert_eq!(state.panel_cursor,3);
         activate_native_option(&mut state,ExtractOptionControl::Done);
         assert_eq!(state.panel,None);
     }

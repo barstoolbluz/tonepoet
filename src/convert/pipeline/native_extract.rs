@@ -10,6 +10,7 @@
 mod matroska;
 mod cue;
 mod archive;
+mod options;
 
 /// File-backed stream routes do not invoke optical-disc materializers.
 fn is_file_stream_format(format: DiscFormat) -> bool {
@@ -20,8 +21,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
-use super::native_wav::{inspect_carrier, package_raw_pcm_checked, concatenate_generated_waves_checked, NativePcmFormat};
+use std::io::{Read, Write};
+use sha2::{Digest, Sha256};
+use super::native_wav::{inspect_carrier, NativePcmFormat};
 use super::actions::ActionPipeline;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -48,6 +50,71 @@ pub const EXTRACTION_LOG_FILE: &str = "extraction.log";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NativeOverwritePolicy { Fail, Skip, Replace }
+
+/// Source-CUE gap ownership. These settings affect only CUE-image splitting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeCueBetweenGap { AppendPrevious, PrependNext, Drop }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeCueFirstGap { PrependFirst, OwnTrack00, Drop }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NativeCopyFolderOptions {
+    pub artwork: bool,
+    pub art_folders: bool,
+    pub log: bool,
+    pub cue: bool,
+    pub txt: bool,
+    pub nfo: bool,
+    pub md: bool,
+    pub pdf: bool,
+    pub md5: bool,
+    pub other: bool,
+}
+
+impl Default for NativeCopyFolderOptions {
+    fn default() -> Self {
+        Self { artwork: true, art_folders: true, log: true, cue: false,
+            txt: true, nfo: true, md: true, pdf: true, md5: false, other: false }
+    }
+}
+
+impl NativeCopyFolderOptions {
+    pub fn enabled_count(&self) -> usize {
+        [self.artwork, self.art_folders, self.log, self.cue, self.txt,
+            self.nfo, self.md, self.pdf, self.md5, self.other]
+            .into_iter().filter(|enabled|*enabled).count()
+    }
+}
+
+/// The extraction Options window and the saved defaults share one schema.
+/// Selection-specific applicability is evaluated in the worker, not by
+/// changing the user's stored choices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NativeExtractSettings {
+    pub write_log: bool,
+    pub verify_after: bool,
+    pub write_chapters: bool,
+    pub create_cue: bool,
+    pub embed_cue: bool,
+    pub keep_preemphasis: bool,
+    pub between_gap: NativeCueBetweenGap,
+    pub first_gap: NativeCueFirstGap,
+    pub copy_folder: NativeCopyFolderOptions,
+}
+
+impl Default for NativeExtractSettings {
+    fn default() -> Self {
+        Self { write_log: true, verify_after: false, write_chapters: true,
+            create_cue: true, embed_cue: false, keep_preemphasis: true,
+            between_gap: NativeCueBetweenGap::AppendPrevious,
+            first_gap: NativeCueFirstGap::OwnTrack00,
+            copy_folder: NativeCopyFolderOptions::default() }
+    }
+}
+
 
 /// Tags collected from actually probed disc/sidecar evidence. A missing
 /// field stays missing; generic filename labels never become fabricated tags.
@@ -152,6 +219,17 @@ pub struct NativeDiscIdentity {
     pub catalog: Option<String>,
 }
 
+/// An interval on the following physical CUE image assigned to the previous
+/// track under Append to previous. Admission binds its immutable geometry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeCueAppendedGap {
+    pub image: PathBuf,
+    pub end_sample: u64,
+    pub total_samples: u64,
+    pub source_length: u64,
+    pub source_modified: Option<std::time::SystemTime>,
+}
+
 /// Exact sample geometry and source carrier for one CUE track. These facts are
 /// bound at admission and checked again before encoding and publication.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +240,21 @@ pub struct NativeCueSegment {
     pub image: PathBuf,
     pub start_sample: u64,
     pub end_sample: u64,
+    /// Original INDEX 00 and 01 from the admitted CUE, before gap ownership.
+    /// INDEX 00 is present only when it addresses this same audio image.
+    #[serde(default)]
+    pub index00_sample: Option<u64>,
+    #[serde(default)]
+    pub index01_sample: u64,
+    #[serde(default)]
+    pub pre_emphasis: bool,
+    /// Recovery has already published this program's hidden track 00.
+    #[serde(default)]
+    pub hidden_track_published: bool,
+    /// Additional audio from the start of the next CUE FILE, when the
+    /// between-track gap is appended to this selected output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub appended_gap: Option<NativeCueAppendedGap>,
     pub total_samples: u64,
     pub sample_rate: u32,
     pub extension: String,
@@ -184,6 +277,102 @@ pub struct NativeCueSegment {
     pub packet_cut_samples: Vec<u64>,
     #[serde(default)]
     pub packet_part_index: usize,
+}
+
+/// Resolve the two independent CUE gap policies from the full admitted CUE,
+/// including unchecked tracks. A selected track never inherits a different
+/// sample boundary merely because its neighbor was unchecked. For lossy
+/// images, cuts also describe discarded parts, so packet verification still
+/// covers every source packet without encoding any of it again.
+pub(crate) fn configure_cue_gap_segments(
+    all: &[NativeCueSegment], selected: &mut [NativeCueSegment],
+    settings: &NativeExtractSettings,
+) -> Result<(), String> {
+    // Reconfiguration must not leave an old appended interval attached.
+    for segment in selected.iter_mut() {segment.appended_gap=None;}
+    // Within an admitted CUE sheet, FILE order is the physical album order.
+    // A later image's first INDEX 00..01 interval belongs to the preceding
+    // track (Append), the following track (Prepend), or nobody (Drop).
+    let transitions: Vec<_> = all.windows(2).filter(|pair|
+        pair[0].presentation==pair[1].presentation &&
+        pair[0].cue_path==pair[1].cue_path && pair[0].image!=pair[1].image &&
+        pair[1].index01_sample>0).map(|pair|(&pair[0],&pair[1])).collect();
+    let mut images = BTreeSet::new();
+    for s in all { images.insert(s.image.clone()); }
+    for image in images {
+        let mut tracks: Vec<_> = all.iter().filter(|s|s.image==image).collect();
+        tracks.sort_by_key(|s|s.index01_sample);
+        if tracks.is_empty() {continue;}
+        let total=tracks[0].total_samples;
+        if tracks.iter().any(|s|s.total_samples!=total || s.index01_sample>=total)
+            || tracks.windows(2).any(|pair|pair[0].index01_sample>=pair[1].index01_sample) {
+            return Err(format!("Invalid indexed CUE image: {}",image.display()));
+        }
+        let mut geometry: Vec<(u64,u64)> = tracks.iter().map(|s|(s.index01_sample,s.end_sample)).collect();
+        if (tracks[0].number==1 && settings.first_gap==NativeCueFirstGap::PrependFirst)
+            || (settings.between_gap==NativeCueBetweenGap::PrependNext &&
+                transitions.iter().any(|(_,next)|
+                    next.presentation==tracks[0].presentation && next.number==tracks[0].number &&
+                    next.image==tracks[0].image)) {
+            geometry[0].0=0;
+        }
+        for index in 1..tracks.len() {
+            let previous=tracks[index-1];
+            let next=tracks[index];
+            let gap_start=next.index00_sample.unwrap_or(next.index01_sample);
+            if gap_start<previous.index01_sample || gap_start>next.index01_sample {
+                return Err(format!("Invalid INDEX 00 boundary in {}",image.display()));
+            }
+            if settings.between_gap!=NativeCueBetweenGap::AppendPrevious {
+                geometry[index-1].1=gap_start;
+            }
+            if settings.between_gap==NativeCueBetweenGap::PrependNext {
+                geometry[index].0=gap_start;
+            }
+        }
+        if geometry.iter().any(|(start,end)|start>=end || *end>total) {
+            return Err(format!("A CUE gap choice makes an empty track in {}",image.display()));
+        }
+        let mut boundaries=vec![0,total];
+        for &(start,end) in &geometry {boundaries.extend([start,end]);}
+        boundaries.sort_unstable();boundaries.dedup();
+        let cuts=boundaries[1..boundaries.len()-1].to_vec();
+        for (position,original) in tracks.iter().enumerate() {
+            if let Some(s)=selected.iter_mut().find(|s|s.image==image &&
+                s.presentation==original.presentation && s.number==original.number) {
+                s.start_sample=geometry[position].0;
+                s.end_sample=geometry[position].1;
+                if matches!(s.encoder.as_str(),"libmp3lame"|"aac"|"libvorbis"|"libopus") {
+                    s.packet_cut_samples=cuts.clone();
+                    s.packet_part_index=boundaries.binary_search(&s.start_sample)
+                        .map_err(|_|"CUE packet partition missing track boundary")?;
+                }
+            }
+        }
+    }
+    if settings.between_gap==NativeCueBetweenGap::AppendPrevious {
+        for (previous,next) in transitions {
+            if let Some(current)=selected.iter_mut().find(|segment|
+                segment.presentation==previous.presentation && segment.number==previous.number) {
+                // A mixed or compressed packet join cannot promise sample- or
+                // packet-identical output via the qualified native splitter.
+                // Refuse it before the first destination is published.
+                if current.encoder!=next.encoder || current.extension!=next.extension ||
+                    current.sample_bits!=next.sample_bits || current.sample_rate!=next.sample_rate ||
+                    current.channels!=next.channels ||
+                    matches!(current.encoder.as_str(),"libmp3lame"|"aac"|"libvorbis"|"libopus") {
+                    return Err(format!("Cannot append cross-image CUE pregap without altering the carrier: {} and {}",
+                        current.image.display(),next.image.display()));
+                }
+                current.appended_gap=Some(NativeCueAppendedGap {
+                    image:next.image.clone(), end_sample:next.index01_sample,
+                    total_samples:next.total_samples,source_length:next.source_length,
+                    source_modified:next.source_modified,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// One regular member discovered from the unpacked archive, bound to its
@@ -233,6 +422,8 @@ pub struct NativeExtractionJob {
     pub overwrite_policy: NativeOverwritePolicy,
     #[serde(default)]
     pub extraction_log: bool,
+    #[serde(default)]
+    pub options: NativeExtractSettings,
     /// Round-4 log destinations are chosen once, before queueing, and stored
     /// in the durable job. An empty list preserves pre-R34 journal semantics.
     #[serde(default)]
@@ -410,6 +601,27 @@ impl std::fmt::Debug for NativePublicationHook {
 /// Independent, cooperative file-task controls. Per-item cancellation is a
 /// child of the job token; Skip never cancels the whole extraction. An Abort
 /// always cancels both. Native loops and supervised tools acknowledge pause.
+/// Reference taken from the live producer's audio sample stream, not by
+/// reopening a completed private container. `decoder` is FFmpeg's canonical
+/// raw PCM representation used for both the producer tap and readback.
+#[derive(Debug, Clone)]
+enum NativeFingerprintFormat {
+    // Encoded containers may change tags, so compare decoded raw samples.
+    Pcm(String),
+    // Identity-copy sources have no transformation or tag writes.
+    IdentityCopy,
+    // Compare compressed audio packets, independent of container metadata.
+    Packets,
+    // Canonical, channel-interleaved MSB-first DSD, including decoded DST.
+    DsdFrames,
+}
+
+#[derive(Debug, Clone)]
+struct NativeAudioFingerprint {
+    digest: [u8; 32],
+    format: NativeFingerprintFormat,
+}
+
 #[derive(Debug, Default)]
 pub struct NativeExtractionControl {
     tool_pause: Arc<NativeToolPause>,
@@ -420,10 +632,30 @@ pub struct NativeExtractionControl {
     recorded_skips: Mutex<Vec<NativeSkippedSelection>>,
     attempted_output: Mutex<Option<PathBuf>>,
     unfinished_outputs: Mutex<Vec<NativeUnfinishedOutput>>,
+    audio_fingerprints: Mutex<HashMap<PathBuf,NativeAudioFingerprint>>,
     execution_started: AtomicBool,
 }
 
 impl NativeExtractionControl {
+    fn record_audio_fingerprint(&self, path: &Path, digest: [u8;32], decoder: &str) {
+        self.record_fingerprint(path, digest, NativeFingerprintFormat::Pcm(decoder.into()));
+    }
+    fn record_identity_fingerprint(&self, path: &Path, digest: [u8;32]) {
+        self.record_fingerprint(path, digest, NativeFingerprintFormat::IdentityCopy);
+    }
+    fn record_packet_fingerprint(&self, path: &Path, digest: [u8;32]) {
+        self.record_fingerprint(path, digest, NativeFingerprintFormat::Packets);
+    }
+    fn record_dsd_fingerprint(&self, path: &Path, digest: [u8;32]) {
+        self.record_fingerprint(path, digest, NativeFingerprintFormat::DsdFrames);
+    }
+    fn record_fingerprint(&self, path: &Path, digest: [u8;32], format: NativeFingerprintFormat) {
+        self.audio_fingerprints.lock().unwrap_or_else(|e|e.into_inner()).insert(
+            path.to_path_buf(),NativeAudioFingerprint {digest,format});
+    }
+    fn take_audio_fingerprint(&self, path: &Path) -> Option<NativeAudioFingerprint> {
+        self.audio_fingerprints.lock().unwrap_or_else(|e|e.into_inner()).remove(path)
+    }
     pub fn pause(&self) { self.tool_pause.request(true); }
     pub fn resume(&self) { self.tool_pause.request(false); }
     pub fn is_paused(&self) -> bool { self.tool_pause.requested() }
@@ -814,7 +1046,9 @@ async fn execute_inner(
                 let controls_copy = controls.clone();
                 let keep_dst = program.keep_dst;
                 let dff = job.sacd_dff || keep_dst;
-                tokio::task::spawn_blocking(move || extract_sacd_native(&src, &dst, dff, keep_dst, &cancel_copy, &item_copy, &controls_copy))
+                let job_verify = job.options.verify_after;
+                tokio::task::spawn_blocking(move || extract_sacd_native(&src, &dst, dff, keep_dst,
+                    job_verify, &cancel_copy, &item_copy, &controls_copy))
                     .await.map_err(|e| format!("SACD extraction task: {e}"))??;
             } else {
                 if job.format == DiscFormat::DvdAudio {
@@ -852,7 +1086,8 @@ async fn execute_inner(
                     track.scalar_sample_rate().or(program.source_rate),
                     if job.downmix.is_active() { None } else { program.source_channels },
                     if job.downmix.is_active() { None } else { program.source_layout.as_deref() },
-                    &item_cancel, &cancel, Arc::clone(&controls), requested.estimated_bytes).await?;
+                    &item_cancel, &cancel, Arc::clone(&controls), requested.estimated_bytes,
+                    job.options.verify_after).await?;
                 // This carrier was made in private staging, never in source.
                 // Reclaim it before decoding the next selected item.
                 let _ = fs::remove_file(&carrier);
@@ -881,8 +1116,32 @@ async fn execute_inner(
             if job.file_per_program {
                 grouped_outputs.push((requested.number, complete.clone(), requested.name.clone()));
             } else {
+                // Journal sidecar contents before audio publication; after
+                // a crash Recovery can finish the companion without replaying
+                // extraction or replacing already completed DFF audio.
+                let dff_cue=if job.format==DiscFormat::Sacd &&
+                    native_program_cue_applies(&job,program) && !job.file_per_program &&
+                    dest.extension().and_then(|ext|ext.to_str())==Some("dff") {
+                    let file_name=dest.file_name().and_then(|s|s.to_str())
+                        .ok_or("Invalid DFF output file name")?;
+                    let rate=track.scalar_sample_rate().or(program.source_rate)
+                        .ok_or("DFF needs a known source DSD sample rate for CUE")?;
+                    let text=options::cue_text(file_name,
+                        &[(requested.name.clone(),0,false)],rate)?;
+                    let cue_path=options::stage_text(temporary.path(),
+                        &format!("track-{pi}-{}.cue",requested.number),&text)?;
+                    let cue_target=dest.with_extension("cue");
+                    controls.record_prepared_cue(&cue_target,&text)?;
+                    Some((cue_path,cue_target))
+                } else {None};
                 publish_finished_file_controlled(&job, &complete, &dest, &cancel, &item_cancel, &controls)?;
-                published.push(dest);
+                published.push(dest.clone());
+                if let Some((cue_path,cue_target))=dff_cue {
+                    controls.set_attempted_output(cue_target.clone());
+                    publish_finished_file_controlled(&job,&cue_path,&cue_target,
+                        &cancel,&item_cancel,&controls)?;
+                    published.push(cue_target);
+                }
                 estimated_bytes_published = estimated_bytes_published
                     .saturating_add(requested.estimated_bytes.unwrap_or(0));
                 // Persist the destination before any next-track work. This
@@ -940,31 +1199,70 @@ async fn execute_inner(
                 Some(grouped_file.clone()), Some(join_bytes),
                 estimated_bytes_done, estimated_bytes_skipped, estimated_bytes_published, published.clone());
             let join_controls = Arc::clone(&controls);
+            let verify_after=job.options.verify_after;
             let (sample_counts, rate) = tokio::task::spawn_blocking(move || {
                 let checkpoint = || if join_controls.wait_blocking(&cancel_copy, &join_copy) {
                     Err("Continuous extraction cancelled".to_owned())
                 } else { Ok(()) };
-                if sacd { concatenate_sacd_tracks_checked(&parts, &grouped, dff, keep_dst, &cancel_copy, checkpoint) }
-                else { concatenate_generated_waves_checked(&parts, &grouped, container, &cancel_copy, checkpoint) }
+                if sacd {
+                    let mut hash=verify_after.then(Sha256::new);
+                    let mut tap=|bytes:&[u8]| {
+                        if let Some(digest)=hash.as_mut() {digest.update(bytes);}
+                    };
+                    let result=concatenate_sacd_tracks_checked_tapped(
+                        &parts,&grouped,dff,keep_dst,&cancel_copy,checkpoint,
+                        if verify_after {Some(&mut tap)} else {None})?;
+                    if let Some(hash)=hash {
+                        join_controls.record_dsd_fingerprint(&grouped,hash.finalize().into());
+                    }
+                    Ok(result)
+                } else {
+                    let mut hash=verify_after.then(Sha256::new);
+                    let mut tap=|bytes:&[u8]| {
+                        if let Some(digest)=hash.as_mut() {digest.update(bytes);}
+                    };
+                    let result=super::native_wav::concatenate_generated_waves_with_tap(
+                        &parts,&grouped,container,&cancel_copy,checkpoint,
+                        if verify_after {Some(&mut tap)}else{None})?;
+                    if let Some(digest)=hash {
+                        // The producer's WAV packet width is carried through
+                        // the original native join, not guessed from filenames.
+                        let (format, _, _)=super::native_wav::generated_wave_span(&grouped)?;
+                        let codec=match format.container_bits {
+                            16=>"pcm_s16le",24=>"pcm_s24le",
+                            other=>return Err(format!("Unsupported continuous verified PCM precision: {other}")),
+                        };
+                        join_controls.record_audio_fingerprint(&grouped,digest.finalize().into(),codec);
+                    }
+                    Ok(result)
+                }
             }).await.map_err(|e| format!("Continuous native audio worker: {e}"))??;
             controls.wait_ready(&cancel, &join_item).await?;
             controls.watch_file_range(grouped_file.clone(), format!("Finishing {}", program.label),
                 Some(join_bytes), 90, 90);
-            let cue_file = if job.cue {
-                let file_name = grouped_target.file_name().and_then(|s|s.to_str()).ok_or("Invalid continuous output name")?;
-                let names = grouped_outputs.iter().map(|(_,_,name)| name.clone()).collect::<Vec<_>>();
-                let cue_text = cue_for_continuous(file_name, &names, &sample_counts, rate)?;
-                let path = temporary.path().join(format!("continuous-{pi}.cue"));
-                let mut file = OpenOptions::new().write(true).create_new(true).open(&path)
-                    .map_err(|e| format!("Cannot create private CUE: {e}"))?;
-                file.write_all(cue_text.as_bytes()).and_then(|()|file.sync_all())
-                    .map_err(|e| format!("Cannot finish private CUE: {e}"))?;
-                // Journal the exact generated indexes *before* publishing the
-                // continuous audio. A restart can then finish a missing CUE
-                // without decoding or rewriting the completed audio.
-                controls.record_prepared_cue(&grouped_target.with_extension("cue"), &cue_text)?;
+            let names=grouped_outputs.iter().map(|(_,_,name)|name.clone()).collect::<Vec<_>>();
+            let starts=native_track_starts(&names,&sample_counts)?;
+            let filename=grouped_target.file_name().and_then(|s|s.to_str())
+                .ok_or("Invalid continuous output name")?;
+            let cue_content=if native_program_cue_applies(&job,program) {
+                let entries=starts.iter().map(|(name,start)|
+                    (name.clone(),*start,false)).collect::<Vec<_>>();
+                Some(options::cue_text(filename,&entries,rate)?)
+            } else {None};
+            let cue_file=if let Some(text)=cue_content.as_ref() {
+                let path=options::stage_text(temporary.path(),
+                    &format!("continuous-{pi}.cue"),text)?;
+                // Recovery learns the authored indexes before audio publication.
+                controls.record_prepared_cue(&grouped_target.with_extension("cue"),text)?;
                 Some(path)
-            } else { None };
+            } else {None};
+            let chapters_file=if native_program_chapters_apply(&job,program) {
+                let content=options::chapter_text(&starts,rate)?;
+                controls.record_prepared_cue(&native_chapters_target(&job,&grouped_target),
+                    &content)?;
+                Some(options::stage_text(temporary.path(),
+                    &format!("continuous-{pi}.chapters.txt"),&content)?)
+            } else {None};
             if job.transfer_tags && !(job.format == DiscFormat::Sacd && (job.sacd_dff || program.keep_dst)) {
                 let root_tags = if job.format == DiscFormat::Sacd { program.tags.clone() }
                 else { native_non_sacd_album_tags(job.tag_source, program, &prepared.album_metadata) };
@@ -975,6 +1273,15 @@ async fn execute_inner(
                     let values = selected_tag_items(&root_tags, fields);
                     write_completed_native_metadata(&grouped_copy, &values, art.as_deref())
                 }).await.map_err(|e|format!("Metadata worker: {e}"))??;
+            }
+            // Embed only in a carrier that actually accepts a CUESHEET tag.
+            // This is independent of publication of an external .cue file.
+            if job.options.embed_cue && matches!(grouped_target.extension()
+                .and_then(|ext|ext.to_str()),Some("flac"|"wv")) {
+                let entries=starts.iter().map(|(name,start)|
+                    (name.clone(),*start,false)).collect::<Vec<_>>();
+                let text=options::cue_text(filename,&entries,rate)?;
+                options::embed_cue(&grouped_file,&text)?;
             }
             controls.wait_ready(&cancel, &join_item).await?;
             publish_finished_file_controlled(&job, &grouped_file, &grouped_target, &cancel, &join_item, &controls)?;
@@ -992,6 +1299,16 @@ async fn execute_inner(
                 published.push(cue_target);
                 emit(done, published.len(), skipped, format!("Published CUE for {}", program.label),
                     None, None, estimated_bytes_done, estimated_bytes_skipped, estimated_bytes_published, published.clone());
+            }
+            if let Some(staged)=chapters_file {
+                let target=native_chapters_target(&job,&grouped_target);
+                controls.set_attempted_output(target.clone());
+                controls.wait_ready(&cancel,&join_item).await?;
+                publish_finished_file_controlled(&job,&staged,&target,&cancel,&join_item,&controls)?;
+                published.push(target);
+                emit(done,published.len(),skipped,format!("Published chapters for {}",program.label),
+                    None,None,estimated_bytes_done,estimated_bytes_skipped,estimated_bytes_published,
+                    published.clone());
             }
             controls.clear_watch();
             emit(done, published.len(), skipped, format!("Completed {}",program.label), None, None, estimated_bytes_done, estimated_bytes_skipped, estimated_bytes_published, published.clone());
@@ -1404,12 +1721,143 @@ fn publish_finished_file_checked(
     publish_finished_file_checked_observed(job, complete, target, checkpoint, None)
 }
 
+/// Parse only FFmpeg's complete `-f hash -hash SHA256` receipt, not a
+/// filename or a staged container. Its producer invocation writes the receipt
+/// while it emits audio, and the destination invocation hashes decoded audio.
+fn native_parse_audio_hash(content: &str) -> Result<[u8;32],String> {
+    let hex=content.trim().strip_prefix("SHA256=")
+        .ok_or("Missing producer-time SHA256 audio receipt")?;
+    if hex.len()!=64 || !hex.bytes().all(|ch|ch.is_ascii_hexdigit()) {
+        return Err("Invalid producer-time SHA256 audio receipt".into());
+    }
+    let mut digest=[0u8;32];
+    for (i,part) in digest.iter_mut().enumerate() {
+        *part=u8::from_str_radix(&hex[i*2..i*2+2],16)
+            .map_err(|_|"Invalid SHA256 hex byte")?;
+    }
+    Ok(digest)
+}
+
+fn native_audio_hash_receipt(path: &Path) -> Result<[u8;32],String> {
+    let content=fs::read_to_string(path).map_err(|e|
+        format!("Read producer-time audio checksum {}: {e}",path.display()))?;
+    native_parse_audio_hash(&content)
+}
+
+/// Read the completed destination as decoded audio, not container bytes.
+/// The private checksum receipt is outside the requested destination. This
+/// path runs only for opt-in verified extraction.
+fn native_readback_audio_hash(
+    path: &Path, decoder: &str, source_format: Option<&str>,
+    checkpoint: &mut impl FnMut() -> std::io::Result<()>,
+) -> Result<[u8;32],String> {
+    let temp=tempfile::Builder::new().prefix("tonepoet-audio-check-").tempdir()
+        .map_err(|e|format!("Private verification storage: {e}"))?;
+    let receipt=temp.path().join("decoded.sha256");
+    let mut command=std::process::Command::new("ffmpeg");
+    command.args(["-hide_banner","-nostdin","-loglevel","error","-xerror","-y"]);
+    // Cross-volume verified publication checks the journaled .tmp name, not
+    // the final file. Explicitly name raw-stream demuxers where suffix-based
+    // input identification would otherwise be lost.
+    if let Some(format)=source_format {command.args(["-f",format]);}
+    let mut child=command.arg("-i").arg(path)
+        .args(["-map","0:a:0","-vn","-sn","-dn","-c:a",decoder,
+            "-f","hash","-hash","SHA256"])
+        .arg(&receipt)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn().map_err(|e|format!("Start audio readback decoder: {e}"))?;
+    let start=std::time::Instant::now();
+    loop {
+        if let Err(e)=checkpoint() {
+            let _=child.kill(); let _=child.wait();
+            return Err(format!("Audio verification interrupted: {e}"));
+        }
+        if start.elapsed()>Duration::from_secs(6*60*60) {
+            let _=child.kill(); let _=child.wait();
+            return Err("Audio verification decoder exceeded six hours".into());
+        }
+        match child.try_wait().map_err(|e|format!("Wait for audio readback: {e}"))? {
+            Some(status) if status.success() => break,
+            Some(status) => return Err(format!("Audio readback decoder failed: {status}")),
+            None => std::thread::sleep(Duration::from_millis(35)),
+        }
+    }
+    native_audio_hash_receipt(&receipt)
+}
+
+/// Compare the extraction-time producer reference in its own representation.
+/// Containers and tags are ignored for PCM, packets and DSD frames; archive
+/// copies are exact identity transfers and therefore use their written bytes.
+fn native_readback_fingerprint(
+    path: &Path, target: &Path, reference: &NativeAudioFingerprint,
+    checkpoint: &mut dyn FnMut() -> std::io::Result<()>,
+) -> Result<[u8;32],String> {
+    match &reference.format {
+        NativeFingerprintFormat::Pcm(decoder) => {
+            let raw_format=if path==target {None} else {
+                match target.extension().and_then(|ext|ext.to_str())
+                    .map(|ext|ext.to_ascii_lowercase()).as_deref() {
+                    Some("aac")=>Some("aac"),Some("ac3")=>Some("ac3"),
+                    Some("eac3")=>Some("eac3"),Some("dts")=>Some("dts"),
+                    Some("thd")=>Some("truehd"),Some("mp2")=>Some("mp3"),
+                    _=>None,
+                }
+            };
+            native_readback_audio_hash(path,decoder,raw_format,&mut ||checkpoint())
+        },
+        NativeFingerprintFormat::IdentityCopy => {
+            let mut input=File::open(path).map_err(|e|format!("Open identity readback: {e}"))?;
+            let mut digest=Sha256::new();
+            let mut bytes=[0u8;256*1024];
+            loop {
+                checkpoint().map_err(|e|format!("Identity readback interrupted: {e}"))?;
+                let read=input.read(&mut bytes).map_err(|e|format!("Read identity output: {e}"))?;
+                if read==0 {break;}
+                digest.update(&bytes[..read]);
+            }
+            Ok(digest.finalize().into())
+        }
+        NativeFingerprintFormat::Packets => cue::packet_audio_fingerprint(path,checkpoint),
+        NativeFingerprintFormat::DsdFrames => {
+            use sacd_rs::dsd_file::{open_dsd_as_decoded_reader,DsdFrameReader};
+            let input=File::open(path).map_err(|e|format!("Open DSD readback: {e}"))?;
+            let mut reader=open_dsd_as_decoded_reader(input)
+                .map_err(|e|format!("Open decoded DSD frames for verification: {e}"))?;
+            let mut digest=Sha256::new();
+            while let Some(frame) = {
+                checkpoint().map_err(|e|format!("DSD readback interrupted: {e}"))?;
+                reader.next_dsd_frame().map_err(|e|format!("Read verified DSD frames: {e}"))?
+            } {
+                digest.update(&frame.data);
+            }
+            Ok(digest.finalize().into())
+        }
+    }
+}
+
+fn native_is_audio_target(path: &Path) -> bool {
+    path.extension().and_then(|ext|ext.to_str()).is_some_and(|ext|matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "wav"|"w64"|"rf64"|"dsf"|"dff"|"flac"|"wv"|"mka"|"mkv"|"m4a"|
+        "aac"|"ac3"|"eac3"|"dts"|"thd"|"mp3"|"mp2"|"ogg"|"opus"|"ape"|"tta"|
+        "aiff"|"aif"|"alac"|"pcm"))
+}
+
 fn publish_finished_file_checked_observed(
     job: &NativeExtractionJob, complete: &Path, target: &Path,
     mut checkpoint: impl FnMut() -> std::io::Result<()>,
     controls: Option<&NativeExtractionControl>,
 ) -> Result<(), String> {
     checkpoint().map_err(|e|format!("Publication cancelled: {e}"))?;
+    // A real producer tap is mandatory when Verify is selected. Never
+    // replace a missing live reference with a post-extraction file read.
+    let expected_audio = if job.options.verify_after && native_is_audio_target(target) {
+        Some(controls.and_then(|control|control.take_audio_fingerprint(complete))
+            .ok_or_else(||format!("Cannot verify {}: this extraction route did not capture audio while writing",
+                target.display()))?)
+    } else {None};
     if job.overwrite_policy != NativeOverwritePolicy::Replace && fs::symlink_metadata(target).is_ok() {
         return Err(format!("Destination already exists: '{}'",target.display()));
     }
@@ -1424,25 +1872,42 @@ fn publish_finished_file_checked_observed(
             hook.job_id, hook.generation, std::process::id(), uuid::Uuid::new_v4().as_u128()))
     });
     let observed_temp = private_temp.clone();
-    if let Err(error) = super::transactional_state::publish_validated_to_final_checked_observed(
-        complete, target, &mut checkpoint, private_temp,
-        |temporary| {
-            if let Some(hook) = &hook {
-                let temp = observed_temp.as_deref().ok_or_else(||std::io::Error::other("Missing native publication temporary"))?;
-                if let Some(controls) = controls {
-                    if temporary.is_some() {
-                        controls.watch_file_range(temp.to_path_buf(),
-                            format!("Publishing {}",target.file_name().unwrap_or_default().to_string_lossy()),
-                            fs::metadata(complete).ok().map(|m|m.len()),
-                            if job.file_per_program { 90 } else { 85 }, 100);
-                    }
+    let mut notify_temporary = |temporary: Option<&Path>| {
+        if let Some(hook) = &hook {
+            let temp = observed_temp.as_deref().ok_or_else(||std::io::Error::other(
+                "Missing native publication temporary"))?;
+            if let Some(controls) = controls {
+                if temporary.is_some() {
+                    controls.watch_file_range(temp.to_path_buf(),
+                        format!("Publishing {}",target.file_name().unwrap_or_default().to_string_lossy()),
+                        fs::metadata(complete).ok().map(|m|m.len()),
+                        if job.file_per_program { 90 } else { 85 }, 100);
                 }
-                (hook.notify)(temp, target, temporary.is_some())
-                    .map_err(std::io::Error::other)?;
             }
-            Ok(())
-        },
-    ) {
+            (hook.notify)(temp, target, temporary.is_some())
+                .map_err(std::io::Error::other)?;
+        }
+        Ok(())
+    };
+    let result = if let Some(expected) = expected_audio.as_ref() {
+        super::transactional_state::publish_validated_to_final_checked_preverified_observed(
+            complete, target, &mut checkpoint, private_temp,
+            &mut notify_temporary,
+            |ready, check| {
+                let observed = native_readback_fingerprint(ready, target, expected, check)
+                    .map_err(std::io::Error::other)?;
+                if expected.digest != observed {
+                    return Err(std::io::Error::other(
+                        "Verification failed: completed audio differs from extraction checksum"));
+                }
+                Ok(())
+            })
+    } else {
+        // Keep the ordinary, unverified publisher entirely unchanged.
+        super::transactional_state::publish_validated_to_final_checked_observed(
+            complete, target, &mut checkpoint, private_temp, &mut notify_temporary)
+    };
+    if let Err(error) = result {
         if !parent_existed { let _ = fs::remove_dir(parent); }
         if !root_existed { let _ = fs::remove_dir(&job.destination); }
         return Err(format!("Cannot publish complete file '{}': {error}", target.display()));
@@ -1462,19 +1927,100 @@ fn prefix_implicit_program_name(job: &NativeExtractionJob) -> bool {
         (job.programs.len() > 1 && !native_template_has_program_token(&job.naming_template)))
 }
 
+/// Contextual sidecars are planned with the audio destination so log naming,
+/// admission and the worker agree on collision handling.
+fn native_program_cue_applies(job: &NativeExtractionJob,
+    program: &NativeProgramChoice) -> bool {
+    if !(job.cue || job.options.create_cue) {return false;}
+    match job.format {
+        DiscFormat::Sacd => job.file_per_program || job.sacd_dff || program.keep_dst,
+        DiscFormat::DvdAudio|DiscFormat::DvdVideo|DiscFormat::BluRay => job.file_per_program,
+        DiscFormat::Matroska|DiscFormat::TransportFile => {
+            let carrier=file_stream_copy_format(job.format,&program.source_codec);
+            let splits_chapters=matches!(program.id,
+                PresentationId::MatroskaStream{chapter_count,..} if chapter_count>0)
+                && !job.file_per_program;
+            !splits_chapters && !carrier.chapters &&
+                !matches!(carrier.extension,"mka"|"mkv"|"m4a")
+        },
+        DiscFormat::CueImage|DiscFormat::Archive => false,
+    }
+}
+
+fn native_program_chapters_apply(job: &NativeExtractionJob,
+    program: &NativeProgramChoice) -> bool {
+    if !job.options.write_chapters {return false;}
+    match job.format {
+        DiscFormat::Sacd|DiscFormat::DvdAudio|DiscFormat::DvdVideo|DiscFormat::BluRay =>
+            job.file_per_program && program.tracks.len()>1,
+        DiscFormat::Matroska => job.file_per_program &&
+            matches!(program.id,PresentationId::MatroskaStream{chapter_count,..} if chapter_count>0) &&
+            !file_stream_copy_format(job.format,&program.source_codec).chapters,
+        _ => false,
+    }
+}
+
+fn native_chapters_target(job: &NativeExtractionJob, audio: &Path) -> PathBuf {
+    let stem=audio.file_stem().unwrap_or_default().to_string_lossy();
+    // When multiple outputs share one directory, names remain distinct.
+    let name=if job.programs.len()>1 && !job.program_subfolders {
+        format!("{stem}.chapters.txt")
+    } else {"chapters.txt".into()};
+    audio.with_file_name(name)
+}
+
+fn native_track_starts(titles:&[String], samples:&[u64])
+    -> Result<Vec<(String,u64)>,String> {
+    if titles.len()!=samples.len() || titles.is_empty() {return Err("Track geometry mismatch".into());}
+    let mut offset=0u64;
+    let mut starts=Vec::with_capacity(samples.len());
+    for (name,count) in titles.iter().zip(samples) {
+        if *count==0 {return Err("Empty track in continuous output".into());}
+        starts.push((name.clone(),offset));
+        offset=offset.checked_add(*count).ok_or("Track offset overflow")?;
+    }
+    Ok(starts)
+}
+
 /// All selected media paths for one authored program, as the worker will
 /// publish them. The same source drives output roots and log reservations.
-fn native_program_media_paths(job: &NativeExtractionJob, program: &NativeProgramChoice) -> Vec<PathBuf> {
+pub(crate) fn native_program_media_paths(job: &NativeExtractionJob, program: &NativeProgramChoice) -> Vec<PathBuf> {
     if job.file_per_program {
         let audio = proposed_destination_for_program(job, program);
         let mut paths = vec![audio.clone()];
-        if job.cue && (job.format != DiscFormat::Matroska || matroska_cue_for_program(job, program)) {
-            paths.push(audio.with_extension("cue"));
+        if native_program_cue_applies(job,program) {paths.push(audio.with_extension("cue"));}
+        if native_program_chapters_apply(job,program) {
+            paths.push(native_chapters_target(job,&audio));
         }
         paths
     } else {
-        program.tracks.iter().map(|track|proposed_destination(job, program, track)).collect()
+        let mut paths=program.tracks.iter().map(|track|
+            proposed_destination(job, program, track)).collect::<Vec<_>>();
+        if let Some(hidden)=native_cue_hidden_target(job,program) {paths.push(hidden);}
+        if job.format==DiscFormat::Sacd && native_program_cue_applies(job,program) {
+            paths.extend(program.tracks.iter().map(|track|
+                proposed_destination(job,program,track).with_extension("cue")));
+        }
+        if is_file_stream_format(job.format) && native_program_cue_applies(job,program) {
+            paths.extend(program.tracks.iter().map(|track|
+                proposed_destination(job,program,track).with_extension("cue")));
+        }
+        paths
     }
+}
+
+/// A hidden first-track pregap is an additional, explicitly requested
+/// audio output. Its target is derived from the first real track's folder,
+/// and is reserved alongside every other selected destination.
+pub(crate) fn native_cue_hidden_target(job: &NativeExtractionJob,
+    program: &NativeProgramChoice) -> Option<PathBuf> {
+    if job.format!=DiscFormat::CueImage ||
+        job.options.first_gap!=NativeCueFirstGap::OwnTrack00 {return None;}
+    let first=program.tracks.iter().find(|track|track.number==1)?;
+    let segment=job.cue_segments.iter().find(|s|
+        s.presentation==program.id && s.number==1 && s.index01_sample>0 && !s.hidden_track_published)?;
+    let track_target=proposed_destination(job,program,first);
+    Some(track_target.with_file_name(format!("00 - Hidden Track.{}",segment.extension)))
 }
 
 /// Deepest common output directory for this program's selected files.
@@ -2117,6 +2663,19 @@ pub(crate) fn proposed_destination(job: &NativeExtractionJob, program: &NativePr
     parent.join(file_name)
 }
 
+/// A skipped audio file must never leave its companion to be overwritten or
+/// silently omitted. Reject companion-only collisions before processing audio.
+fn inspect_companion_target(job:&NativeExtractionJob,planned:&mut HashSet<String>,
+    audio:&Path,companion:PathBuf) -> Result<(),String> {
+    if job.overwrite_policy==NativeOverwritePolicy::Skip &&
+        fs::symlink_metadata(&companion).is_ok() &&
+        fs::symlink_metadata(audio).is_err() {
+        return Err(format!("Companion already exists: '{}'; choose Replace, disable its option, or change the destination",
+            companion.display()));
+    }
+    inspect_publication_target(job,planned,companion)
+}
+
 pub(crate) fn validate_job(job: &NativeExtractionJob) -> Result<(), String> {
     if job.programs.is_empty() || job.programs.iter().any(|p| p.tracks.is_empty()) {
         return Err("Check at least one track or chapter".into());
@@ -2187,24 +2746,25 @@ pub(crate) fn validate_job(job: &NativeExtractionJob) -> Result<(), String> {
                 return Err("Track selection contains duplicate or zero track numbers".into());
             }
             if !job.file_per_program {
-                inspect_publication_target(job, &mut planned, proposed_destination(job, program, track))?;
+                let media=proposed_destination(job,program,track);
+                inspect_publication_target(job,&mut planned,media.clone())?;
+                if native_program_cue_applies(job,program) &&
+                    (job.format==DiscFormat::Sacd || is_file_stream_format(job.format)) {
+                    inspect_companion_target(job,&mut planned,&media,media.with_extension("cue"))?;
+                }
             }
+        }
+        if let Some(hidden) = native_cue_hidden_target(job,program) {
+            inspect_publication_target(job,&mut planned,hidden)?;
         }
         if job.file_per_program {
             let media = proposed_destination_for_program(job, program);
             inspect_publication_target(job, &mut planned, media.clone())?;
-            if job.cue && (job.format != DiscFormat::Matroska ||
-                matroska_cue_for_program(job, program)) {
-                let cue = media.with_extension("cue");
-                // Skip never publishes a CUE when its continuous audio
-                // already exists: the execution loop skips that whole program.
-                // Reject only CUE-only collisions before starting audio work.
-                if job.overwrite_policy == NativeOverwritePolicy::Skip
-                    && fs::symlink_metadata(&cue).is_ok()
-                    && fs::symlink_metadata(&media).is_err() {
-                    return Err(format!("CUE sheet already exists: '{}'; choose Replace, disable CUE output, or change the destination", cue.display()));
-                }
-                inspect_publication_target(job, &mut planned, cue)?;
+            if native_program_cue_applies(job,program) {
+                inspect_companion_target(job,&mut planned,&media,media.with_extension("cue"))?;
+            }
+            if native_program_chapters_apply(job,program) {
+                inspect_companion_target(job,&mut planned,&media,native_chapters_target(job,&media))?;
             }
         }
         if (program.keep_dst || job.sacd_dff) && job.format != DiscFormat::Sacd {
@@ -2325,7 +2885,7 @@ fn materializer_request(job: &NativeExtractionJob, program: &NativeProgramChoice
 }
 
 fn extract_sacd_native(src: &TrackSourceRef, output: &Path, dff: bool, keep_dst: bool,
-    cancel: &CancellationToken, item_cancel: &CancellationToken,
+    verify_after: bool, cancel: &CancellationToken, item_cancel: &CancellationToken,
     controls: &NativeExtractionControl) -> Result<(), String> {
     let TrackSourceRef::SacdTrack { iso, track_index, area } = src else { return Err("Not a SACD track".into()); };
     let metadata = crate::tui::sacd::parse_sacd_iso(iso).map_err(|e| e.to_string())?;
@@ -2341,12 +2901,26 @@ fn extract_sacd_native(src: &TrackSourceRef, output: &Path, dff: bool, keep_dst:
         .map_err(|e| e.to_string())?;
     let mut reader = sacd_rs::iso_reader::IsoReader::open(iso).map_err(|e| e.to_string())?;
     let mut file = OpenOptions::new().write(true).create_new(true).open(output).map_err(|e| e.to_string())?;
-    let report = sacd_rs::extract::extract_track_with_area_frame_format_and_cancel(
-        &mut reader, &mut file, options, area_info.extraction_frame_format(),
-        sacd_rs::extract::ExtractIntegrityOptions::strict(), || controls.wait_blocking(cancel, item_cancel),
-    ).map_err(|e| format!("SACD extraction: {e}"))?;
+    let mut hash=verify_after.then(Sha256::new);
+    let report = if verify_after {
+        let mut tap=|bytes:&[u8]| {
+            if let Some(digest)=hash.as_mut() {digest.update(bytes);}
+        };
+        sacd_rs::extract::extract_track_with_area_frame_format_and_cancel_tapped(
+            &mut reader, &mut file, options, area_info.extraction_frame_format(),
+            sacd_rs::extract::ExtractIntegrityOptions::strict(),
+            ||controls.wait_blocking(cancel,item_cancel), &mut tap,
+        )
+    } else {
+        sacd_rs::extract::extract_track_with_area_frame_format_and_cancel(
+            &mut reader, &mut file, options, area_info.extraction_frame_format(),
+            sacd_rs::extract::ExtractIntegrityOptions::strict(),
+            ||controls.wait_blocking(cancel,item_cancel),
+        )
+    }.map_err(|e|format!("SACD extraction: {e}"))?;
     if report.integrity_loss_detected() { return Err("SACD extractor reported loss of integrity".into()); }
     file.sync_all().map_err(|e| e.to_string())?;
+    if let Some(hash)=hash {controls.record_dsd_fingerprint(output,hash.finalize().into());}
     Ok(())
 }
 
@@ -2364,7 +2938,15 @@ fn concatenate_sacd_tracks(
 
 fn concatenate_sacd_tracks_checked(
     parts: &[PathBuf], output: &Path, dff: bool, keep_dst: bool, cancel: &CancellationToken,
+    checkpoint: impl FnMut() -> Result<(), String>,
+) -> Result<(Vec<u64>, u32), String> {
+    concatenate_sacd_tracks_checked_tapped(parts,output,dff,keep_dst,cancel,checkpoint,None)
+}
+
+fn concatenate_sacd_tracks_checked_tapped(
+    parts: &[PathBuf], output: &Path, dff: bool, keep_dst: bool, cancel: &CancellationToken,
     mut checkpoint: impl FnMut() -> Result<(), String>,
+    mut on_audio: Option<&mut dyn FnMut(&[u8])>,
 ) -> Result<(Vec<u64>, u32), String> {
     use sacd_rs::dsd_file::{DsdFrameReader, DsfStreamReader, DsdDsdiffStreamReader, DstFrameReader, DstDsdiffStreamReader};
     if parts.is_empty() { return Err("Continuous SACD selection is empty".into()); }
@@ -2398,6 +2980,7 @@ fn concatenate_sacd_tracks_checked(
                 }
                 writer.write_passthrough_frame(&frame.encoded, &decoded)
                     .map_err(|e|format!("Join source DST frame: {e}"))?;
+                if let Some(tap)=on_audio.as_mut() { (*tap)(&decoded); }
                 track_samples = track_samples.checked_add((decoded.len() / usize::from(channels)) as u64 * 8)
                     .ok_or("DST sample-count overflow")?;
             }
@@ -2432,6 +3015,7 @@ fn concatenate_sacd_tracks_checked(
                 checkpoint()?;
                 if cancel.is_cancelled() { return Err("SACD extraction cancelled".into()); }
                 writer.write_frame(&frame.data).map_err(|e|format!("Join DFF data: {e}"))?;
+                if let Some(tap)=on_audio.as_mut() { (*tap)(&frame.data); }
                 track_samples = track_samples.checked_add((frame.data.len() / usize::from(channels)) as u64 * 8)
                     .ok_or("DSD sample-count overflow")?;
             }
@@ -2463,6 +3047,7 @@ fn concatenate_sacd_tracks_checked(
                 checkpoint()?;
             if cancel.is_cancelled() { return Err("SACD extraction cancelled".into()); }
                 writer.write_interleaved(&frame.data).map_err(|e|format!("Join DSD data: {e}"))?;
+                if let Some(tap)=on_audio.as_mut() { (*tap)(&frame.data); }
                 track_samples = track_samples.checked_add((frame.data.len() / usize::from(channels)) as u64 * 8)
                     .ok_or("DSD sample-count overflow")?;
             }
@@ -2507,7 +3092,7 @@ async fn encode_pcm_container(
     declared_rate: Option<u32>, declared_channels: Option<u8>,
     source_layout: Option<&str>, cancel: &CancellationToken,
     job_cancel: &CancellationToken, controls: Arc<NativeExtractionControl>,
-    estimated_bytes: Option<u64>,
+    estimated_bytes: Option<u64>, verify_after: bool,
 ) -> Result<(), String> {
     if valid_bits == 0 || valid_bits > output_depth { return Err("Invalid PCM valid-bit depth".into()); }
     let observed = inspect_carrier(carrier)?;
@@ -2548,12 +3133,24 @@ async fn encode_pcm_container(
     let out_copy = output.to_path_buf();
     let cancel_copy = cancel.clone();
     let job_copy = job_cancel.clone();
-    tokio::task::spawn_blocking(move || package_raw_pcm_checked(
-        &raw_copy, &out_copy, format, container, &cancel_copy,
-        || if controls.wait_blocking(&job_copy, &cancel_copy) {
-            Err("PCM packaging stopped".to_owned())
-        } else { Ok(()) },
-    ))
+    tokio::task::spawn_blocking(move || {
+        let mut digest=verify_after.then(Sha256::new);
+        let mut tap=|bytes:&[u8]| {
+            if let Some(hash)=digest.as_mut() {hash.update(bytes);}
+        };
+        super::native_wav::package_raw_pcm_checked_with_tap(
+            &raw_copy, &out_copy, format, container, &cancel_copy,
+            || if controls.wait_blocking(&job_copy, &cancel_copy) {
+                Err("PCM packaging stopped".to_owned())
+            } else { Ok(()) },
+            if verify_after {Some(&mut tap)}else{None},
+        )?;
+        if let Some(hash)=digest {
+            let codec=if output_depth==16 {"pcm_s16le"}else{"pcm_s24le"};
+            controls.record_audio_fingerprint(&out_copy,hash.finalize().into(),codec);
+        }
+        Ok::<(),String>(())
+    })
         .await.map_err(|e| format!("PCM packaging worker: {e}"))??;
     fs::remove_file(&raw).map_err(|e| format!("Cannot remove private PCM staging: {e}"))?;
     Ok(())
@@ -2642,10 +3239,53 @@ mod tests {
             wav_container: NativeWavContainer::Automatic, assume_decrypted: false,
             downmix: DvdaDownmixPolicy::None, naming_template: default_naming_template(),
             program_subfolders: true, overwrite_policy: NativeOverwritePolicy::Fail,
-            extraction_log: false, program_log_paths: Vec::new(), round4_layout: false, file_per_program: false, cue: false,
+            extraction_log: false, options: NativeExtractSettings {create_cue:false, write_chapters:false, ..Default::default()}, program_log_paths: Vec::new(), round4_layout: false, file_per_program: false, cue: false,
             transfer_tags: false, sacd_dff: false, tag_source: default_tag_source(),
             tag_fields: default_tag_fields(), tag_artwork: false,
         }
+    }
+
+    #[test]
+    fn r2_cue_gap_choices_preserve_or_discard_exact_sample_intervals() {
+        let album=PresentationId::CueAlbum(1);
+        let image=PathBuf::from("image.flac");
+        let marks=[(1u32,100u64,None,500u64),
+            (2,500,Some(450),900),(3,900,Some(880),1200)];
+        let all=marks.into_iter().map(|(number,index01,index00,end)|NativeCueSegment {
+            presentation:album,number,cue_path:PathBuf::from("album.cue"),
+            image:image.clone(),start_sample:index01,end_sample:end,
+            index00_sample:index00,index01_sample:index01,pre_emphasis:false,
+            hidden_track_published:false,appended_gap:None,total_samples:1200,sample_rate:48000,extension:"flac".into(),
+            encoder:"flac".into(),muxer:"flac".into(),sample_bits:Some(16),
+            channels:2,source_length:0,source_modified:None,cue_length:0,
+            cue_modified:None,source_bit_rate:None,packet_cut_samples:Vec::new(),
+            packet_part_index:0,
+        }).collect::<Vec<_>>();
+        let mut selected=all.clone();
+        let default=NativeExtractSettings::default();
+        configure_cue_gap_segments(&all,&mut selected,&default).unwrap();
+        assert_eq!(selected.iter().map(|s|(s.start_sample,s.end_sample))
+            .collect::<Vec<_>>(),vec![(100,500),(500,900),(900,1200)]);
+        assert_eq!(selected[0].index01_sample,100); // track 00 owns 0..100
+        let mut prepend=default.clone();
+        prepend.first_gap=NativeCueFirstGap::PrependFirst;
+        prepend.between_gap=NativeCueBetweenGap::PrependNext;
+        configure_cue_gap_segments(&all,&mut selected,&prepend).unwrap();
+        assert_eq!(selected.iter().map(|s|(s.start_sample,s.end_sample))
+            .collect::<Vec<_>>(),vec![(0,450),(450,880),(880,1200)]);
+        let mut drop=default.clone();
+        drop.first_gap=NativeCueFirstGap::Drop;
+        drop.between_gap=NativeCueBetweenGap::Drop;
+        configure_cue_gap_segments(&all,&mut selected,&drop).unwrap();
+        assert_eq!(selected.iter().map(|s|(s.start_sample,s.end_sample))
+            .collect::<Vec<_>>(),vec![(100,450),(500,880),(900,1200)]);
+        let mut lossy=all.clone();
+        for s in &mut lossy {s.encoder="libmp3lame".into();}
+        let mut out=lossy.clone();
+        configure_cue_gap_segments(&lossy,&mut out,&drop).unwrap();
+        assert_eq!(out[0].packet_cut_samples,vec![100,450,500,880,900]);
+        assert_eq!(out.iter().map(|s|s.packet_part_index).collect::<Vec<_>>(),
+            vec![1,3,5]);
     }
 
     /// A new selection must not inherit the older mandatory area-folder rule.
@@ -3793,7 +4433,7 @@ mod tests {
             assume_decrypted: false,
             downmix: DvdaDownmixPolicy::None,
             naming_template:default_naming_template(),program_subfolders:true,
-            overwrite_policy:NativeOverwritePolicy::Fail,extraction_log:false, program_log_paths: Vec::new(), round4_layout: false,
+            overwrite_policy:NativeOverwritePolicy::Fail,extraction_log:false, options: NativeExtractSettings {create_cue:false, write_chapters:false, ..Default::default()}, program_log_paths: Vec::new(), round4_layout: false,
             file_per_program:false,cue:false,
             transfer_tags:false,sacd_dff: false, tag_source:default_tag_source(),tag_fields:default_tag_fields(),tag_artwork:false,
         };
@@ -4154,7 +4794,7 @@ mod tests {
             destination:"/tmp/dest".into(),working_root:"/tmp".into(),
             wav_container:NativeWavContainer::Automatic,assume_decrypted:false,downmix:DvdaDownmixPolicy::None,
             naming_template:default_naming_template(),program_subfolders:true,
-            overwrite_policy:NativeOverwritePolicy::Fail,extraction_log:false, program_log_paths: Vec::new(), round4_layout: false,file_per_program:false,cue:false,
+            overwrite_policy:NativeOverwritePolicy::Fail,extraction_log:false, options: NativeExtractSettings {create_cue:false, write_chapters:false, ..Default::default()}, program_log_paths: Vec::new(), round4_layout: false,file_per_program:false,cue:false,
             transfer_tags:false,sacd_dff: false, tag_source:default_tag_source(),tag_fields:default_tag_fields(),tag_artwork:false };
         assert!(validate_job(&job).unwrap_err().contains("duplicate"));
     }
@@ -4221,4 +4861,203 @@ mod native_file_task_controls_tests {
         assert!(controls.finish_item());
         controls.resume();
     }
+
+    #[test]
+    fn r2d02_audio_verification_requires_producer_receipt_and_detects_tamper() {
+        if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {return;}
+        let dir=tempfile::tempdir().unwrap();
+        let make_wav=|path:&Path,payload:&[u8]| {
+            let len=u32::try_from(payload.len()).unwrap();
+            let mut wav=b"RIFF".to_vec();
+            wav.extend_from_slice(&(36+len).to_le_bytes());
+            wav.extend_from_slice(b"WAVEfmt "); wav.extend_from_slice(&16u32.to_le_bytes());
+            wav.extend_from_slice(&1u16.to_le_bytes());wav.extend_from_slice(&1u16.to_le_bytes());
+            wav.extend_from_slice(&48_000u32.to_le_bytes()); wav.extend_from_slice(&96_000u32.to_le_bytes());
+            wav.extend_from_slice(&2u16.to_le_bytes());wav.extend_from_slice(&16u16.to_le_bytes());
+            wav.extend_from_slice(b"data");wav.extend_from_slice(&len.to_le_bytes());
+            wav.extend_from_slice(payload);fs::write(path,wav).unwrap();
+        };
+        let original=[0x00u8,0x10,0x00,0x20,0x00,0x30];
+        let mutated=[0x00u8,0x10,0x00,0x50,0x00,0x30];
+        let complete=dir.path().join("stage.wav");
+        let target=dir.path().join("verified.wav");
+        let mut job=tests::fixture_job(dir.path(),dir.path());
+        job.options.verify_after=true;
+        make_wav(&complete,&original);
+        let controls=NativeExtractionControl::default();
+        let missing=publish_finished_file_checked_observed(&job,&complete,&target,
+            || Ok(()),Some(&controls)).unwrap_err();
+        assert!(missing.contains("did not capture audio while writing"));
+        assert!(!target.exists());
+        let mut digest=Sha256::new();digest.update(original);
+        controls.record_audio_fingerprint(&complete,digest.finalize().into(),"pcm_s16le");
+        // The producer has finished hashing its frames; change staging audio.
+        make_wav(&complete,&mutated);
+        let err=publish_finished_file_checked_observed(&job,&complete,&target,
+            || Ok(()),Some(&controls)).unwrap_err();
+        assert!(err.contains("Verification failed"),"{err}");
+        assert!(!target.exists(),"a failed check cannot publish a bad final file");
+        // Option-off retains the old no-digest path and does not start readback.
+        job.options.verify_after=false;
+        let plain=dir.path().join("plain.wav");
+        make_wav(&complete,&original);
+        publish_finished_file_checked_observed(&job,&complete,&plain,
+            || Ok(()),Some(&controls)).unwrap();
+        assert!(plain.exists());
+    }
+
+    #[test]
+    fn cd01_verified_replace_keeps_the_old_destination_on_failure() {
+        if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {return;}
+        let root=tempfile::tempdir().unwrap();
+        let stage=root.path().join("private.wav");
+        let target=root.path().join("album.wav");
+        let mut job=tests::fixture_job(root.path(),root.path());
+        job.options.verify_after=true;
+        job.overwrite_policy=NativeOverwritePolicy::Replace;
+        let wav=|sample:u8| {
+            let payload=[sample,0,2,0,3,0,4,0];
+            let mut out=b"RIFF".to_vec();
+            out.extend_from_slice(&(36u32+payload.len() as u32).to_le_bytes());
+            out.extend_from_slice(b"WAVEfmt ");out.extend_from_slice(&16u32.to_le_bytes());
+            out.extend_from_slice(&1u16.to_le_bytes());out.extend_from_slice(&1u16.to_le_bytes());
+            out.extend_from_slice(&48000u32.to_le_bytes());out.extend_from_slice(&96000u32.to_le_bytes());
+            out.extend_from_slice(&2u16.to_le_bytes());out.extend_from_slice(&16u16.to_le_bytes());
+            out.extend_from_slice(b"data");out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            out.extend_from_slice(&payload);
+            out
+        };
+        let old=wav(11);
+        let desired=wav(22);
+        let bad=wav(33);
+        let expected={let mut h=Sha256::new();h.update(&desired[44..]);h.finalize().into()};
+        fs::write(&target,&old).unwrap();
+        fs::write(&stage,&bad).unwrap();
+        let controls=NativeExtractionControl::default();
+        controls.record_audio_fingerprint(&stage,expected,"pcm_s16le");
+        let error=publish_finished_file_checked_observed(&job,&stage,&target,
+            ||Ok(()),Some(&controls)).unwrap_err();
+        assert!(error.contains("Verification failed"),"{error}");
+        assert_eq!(fs::read(&target).unwrap(),old);
+        assert!(stage.exists(),"failed verified publication retains private staging");
+        // A decoder failure must be just as safe as a nonmatching digest.
+        fs::write(&stage,b"not a decodable WAV").unwrap();
+        controls.record_audio_fingerprint(&stage,expected,"pcm_s16le");
+        assert!(publish_finished_file_checked_observed(&job,&stage,&target,
+            ||Ok(()),Some(&controls)).is_err());
+        assert_eq!(fs::read(&target).unwrap(),old);
+        // When readback passes, Replace replaces the old bytes once.
+        fs::write(&stage,&desired).unwrap();
+        controls.record_audio_fingerprint(&stage,expected,"pcm_s16le");
+        publish_finished_file_checked_observed(&job,&stage,&target,
+            ||Ok(()),Some(&controls)).unwrap();
+        assert_eq!(fs::read(&target).unwrap(),desired);
+        // No destination is published for a failed new-file verification.
+        let absent=root.path().join("new.wav");
+        fs::write(&stage,&bad).unwrap();
+        job.overwrite_policy=NativeOverwritePolicy::Fail;
+        controls.record_audio_fingerprint(&stage,expected,"pcm_s16le");
+        assert!(publish_finished_file_checked_observed(&job,&stage,&absent,
+            ||Ok(()),Some(&controls)).is_err());
+        assert!(!absent.exists());
+        // Cancellation does not touch an existing Replace destination.
+        job.overwrite_policy=NativeOverwritePolicy::Replace;
+        controls.record_audio_fingerprint(&stage,expected,"pcm_s16le");
+        assert!(publish_finished_file_checked_observed(&job,&stage,&target,
+            ||Err(std::io::Error::new(std::io::ErrorKind::Interrupted,"stop")),
+            Some(&controls)).is_err());
+        assert_eq!(fs::read(&target).unwrap(),desired);
+    }
+
+    #[test]
+    fn cd02_verified_sacd_dsf_and_dff_joins_use_live_dsd_frames() {
+        use sacd_rs::dsd_file::DsdFrameReader;
+        let root=tempfile::tempdir().unwrap();
+        let source_samples=[0x96u8;1024];
+        for dff in [false,true] {
+            let source=root.path().join(if dff {"part.dff"}else{"part.dsf"});
+            if dff {
+                let mut writer=sacd_rs::dff_writer::DffWriter::new(
+                    File::create(&source).unwrap(),2,2_822_400).unwrap();
+                writer.write_frame(&source_samples).unwrap();
+                writer.finish().unwrap();
+            } else {
+                let mut writer=sacd_rs::dsf_writer::DsfWriter::new(
+                    File::create(&source).unwrap(),2,2_822_400).unwrap();
+                writer.write_interleaved(&source_samples).unwrap();
+                writer.finish().unwrap();
+            }
+            let joined=root.path().join(if dff {"joined.dff"}else{"joined.dsf"});
+            let mut digest=Sha256::new();
+            let mut tap=|data:&[u8]|digest.update(data);
+            let (counts,rate)=concatenate_sacd_tracks_checked_tapped(
+                &[source],&joined,dff,false,&CancellationToken::new(),||Ok(()),Some(&mut tap)).unwrap();
+            assert_eq!(rate,2_822_400);
+            assert_eq!(counts,vec![4096]);
+            let expected: [u8;32]=digest.finalize().into();
+            let controls=NativeExtractionControl::default();
+            controls.record_dsd_fingerprint(&joined,expected);
+            let reference=controls.take_audio_fingerprint(&joined).unwrap();
+            assert_eq!(native_readback_fingerprint(&joined,&joined,&reference,&mut ||Ok(())).unwrap(),expected);
+            let input=File::open(&joined).unwrap();
+            let mut frames=sacd_rs::dsd_file::open_dsd_as_decoded_reader(input).unwrap();
+            assert_eq!(frames.next_dsd_frame().unwrap().unwrap().data,source_samples.to_vec());
+        }
+    }
+
+    #[test]
+    fn cd02_archive_identity_receipt_matches_copy_and_detects_mutation() {
+        let root=tempfile::tempdir().unwrap();
+        let dest=root.path().join("archive_member.mp3");
+        let good=b"unchanged archive member audio payload";
+        let controls=NativeExtractionControl::default();
+        let mut digest=Sha256::new();digest.update(good);
+        let expected:[u8;32]=digest.finalize().into();
+        controls.record_identity_fingerprint(&dest,expected);
+        fs::write(&dest,good).unwrap();
+        let receipt=controls.take_audio_fingerprint(&dest).unwrap();
+        assert_eq!(native_readback_fingerprint(&dest,&dest,&receipt,&mut ||Ok(())).unwrap(),expected);
+        fs::write(&dest,b"changed archive member audio payload").unwrap();
+        assert_ne!(native_readback_fingerprint(&dest,&dest,&receipt,&mut ||Ok(())).unwrap(),expected);
+    }
+
+    #[test]
+    fn r2d01_two_physical_cue_images_assign_the_boundary_to_the_selected_policy() {
+        let original=PresentationId::CueAlbum(1);
+        let one=PathBuf::from("A.wav");let two=PathBuf::from("B.wav");
+        let fixture=|number,image:PathBuf,start,end,total,index00|NativeCueSegment {
+            presentation:original,number,cue_path:PathBuf::from("Album.cue"),image,
+            start_sample:start,end_sample:end,index01_sample:start,index00_sample:index00,
+            pre_emphasis:false,hidden_track_published:false,appended_gap:None,
+            total_samples:total,sample_rate:48_000,extension:"wav".into(),
+            encoder:"pcm_s16le".into(),muxer:"wav".into(),sample_bits:Some(16),
+            channels:1,source_length:0,source_modified:None,cue_length:0,cue_modified:None,
+            source_bit_rate:None,packet_cut_samples:Vec::new(),packet_part_index:0,
+        };
+        let all=vec![fixture(1,one.clone(),0,48_000,48_000,None),
+            fixture(2,two.clone(),96_000,144_000,144_000,Some(0))];
+        for (choice,begin,extra) in [
+            (NativeCueBetweenGap::AppendPrevious,96_000u64,true),
+            (NativeCueBetweenGap::PrependNext,0u64,false),
+            (NativeCueBetweenGap::Drop,96_000u64,false),
+        ] {
+            let mut settings=NativeExtractSettings::default();
+            settings.between_gap=choice;
+            let mut selected=all.clone();
+            configure_cue_gap_segments(&all,&mut selected,&settings).unwrap();
+            assert_eq!(selected[1].start_sample,begin);
+            assert_eq!(selected[0].appended_gap.is_some(),extra);
+            assert_eq!(selected[0].appended_gap.as_ref().map(|gap|gap.image.clone()),
+                extra.then_some(two.clone()));
+            assert_eq!(selected[0].appended_gap.as_ref().map(|gap|gap.end_sample),
+                extra.then_some(96_000));
+        }
+        let mut unsupported=all.clone();
+        unsupported[1].sample_rate=44_100;
+        let mut settings=NativeExtractSettings::default();
+        settings.between_gap=NativeCueBetweenGap::AppendPrevious;
+        let mut selected=unsupported.clone();
+        assert!(configure_cue_gap_segments(&unsupported,&mut selected,&settings).is_err());
+    }
+
 }

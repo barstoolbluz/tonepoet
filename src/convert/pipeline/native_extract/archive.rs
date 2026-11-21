@@ -171,10 +171,12 @@ pub(super) async fn execute_inner(
             let controls_for_copy = Arc::clone(&controls);
             let copy_cancel = cancel.clone();
             let skip_cancel = item_cancel.clone();
-            tokio::task::spawn_blocking(move || -> Result<(),String> {
+            let verify = job.options.verify_after && native_is_audio_target(&target);
+            let captured = tokio::task::spawn_blocking(move || -> Result<Option<[u8;32]>,String> {
                 let mut input = File::open(&source).map_err(|e|format!("Open archived file: {e}"))?;
                 let mut output = OpenOptions::new().write(true).create_new(true)
                     .open(&target_file).map_err(|e|format!("Stage archived file: {e}"))?;
+                let mut digest = verify.then(Sha256::new);
                 let mut buffer = [0_u8; 256*1024];
                 loop {
                     if controls_for_copy.wait_blocking(&copy_cancel,&skip_cancel) {
@@ -183,10 +185,14 @@ pub(super) async fn execute_inner(
                     let read = input.read(&mut buffer).map_err(|e|format!("Read archived member: {e}"))?;
                     if read == 0 {break;}
                     output.write_all(&buffer[..read]).map_err(|e|format!("Stage archived member: {e}"))?;
+                    if let Some(digest)=digest.as_mut() {digest.update(&buffer[..read]);}
                 }
                 output.sync_all().map_err(|e|format!("Sync archived member: {e}"))?;
-                Ok(())
+                Ok(digest.map(|digest|digest.finalize().into()))
             }).await.map_err(|error|format!("Archived-file copy task: {error}"))??;
+            if let Some(digest) = captured {
+                controls.record_identity_fingerprint(&completed,digest);
+            }
             if fs::metadata(&completed).map_err(|error|format!("Copied file missing: {error}"))?.len()!=member.size {
                 return Err(format!("Archived member copy length mismatch: {}",member.relative_path.display()));
             }

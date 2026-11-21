@@ -122,6 +122,52 @@ fn members_for_source(source: &Path, combine: bool) -> Result<Vec<SplitCueAdmiss
     }
 }
 
+/// Rip logs may carry an EAC-style pre-emphasis verdict absent from CUE
+/// FLAGS. Only affirmative lines within a numbered track section count;
+/// arbitrary album-level mentions must not mark every output as emphasized.
+fn rip_log_preemphasis(cue: &Path) -> std::collections::BTreeSet<u32> {
+    use std::collections::BTreeSet;
+    let mut marked = BTreeSet::new();
+    let Some(folder) = cue.parent() else {return marked;};
+    let Ok(entries) = fs::read_dir(folder) else {return marked;};
+    let mut logs = Vec::new();
+    let mut cue_count = 0;
+    for entry in entries.flatten().take(128) {
+        let path=entry.path();
+        let Ok(meta)=fs::symlink_metadata(&path) else {continue;};
+        if meta.file_type().is_symlink() || !meta.is_file() {continue;}
+        match path.extension().and_then(|e|e.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+            "cue" => cue_count+=1,
+            "log" if meta.len()<=1024*1024 => logs.push(path),
+            _ => {},
+        }
+    }
+    logs.sort();
+    // A dedicated log wins. A sole album log belongs to this member only
+    // when no other CUE in its folder could own the same track numbers.
+    let same_stem = |path:&Path|path.file_stem().zip(cue.file_stem())
+        .is_some_and(|(a,b)|a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy()));
+    let selected = logs.iter().find(|path|same_stem(path))
+        .or_else(||(logs.len()==1 && cue_count==1).then(||&logs[0]));
+    let Some(log) = selected else {return marked;};
+    let Some(content)=crate::tui::preemphasis::metadata::read_eac_log_text(log) else {return marked;};
+    let mut track=None;
+    for line in content.lines() {
+        let lower=line.trim().to_ascii_lowercase();
+        if let Some(rest)=lower.strip_prefix("track ") {
+            track=rest.split_whitespace().next().and_then(|s|s.parse::<u32>().ok());
+        }
+        if lower.starts_with("pre-emphasis") || lower.starts_with("pre emphasis") {
+            let verdict=lower.split(|c| c==':' || c=='=').nth(1)
+                .unwrap_or("").split_whitespace().next().unwrap_or("");
+            if matches!(verdict,"yes"|"true"|"1"|"present") {
+                if let Some(number)=track {marked.insert(number);}
+            }
+        }
+    }
+    marked
+}
+
 fn sheet_title(member: &SplitCueAdmissionMember) -> String {
     member.sheet.title.clone().unwrap_or_else(||member.cue_path.file_stem()
         .map(|value|value.to_string_lossy().into_owned()).unwrap_or_else(||"CUE album".into()))
@@ -192,6 +238,7 @@ pub fn inspect(source: &Path, combine: bool,
         let mut segments = Vec::new();
         let mut authored = Vec::new();
         for member in &group {
+            let rip_preemphasis=rip_log_preemphasis(&member.cue_path);
             let (cue_length,cue_modified) = check_regular_snapshot(&member.cue_path)?;
             for image in &member.referenced_audio {
                 if !media_cache.contains_key(image) {
@@ -234,9 +281,21 @@ pub fn inspect(source: &Path, combine: bool,
                     album:Some(album_name.clone()),genre:member.sheet.genre.clone(),
                     year:member.sheet.date.clone(),performer:track.performer.clone(),
                     catalog:member.sheet.catalog.clone(),..Default::default() });
+                let index00_sample = track.index00_frames.and_then(|zero| {
+                    (zero <= index).then(||u64::try_from(
+                        u128::from(zero)*u128::from(*rate)/75).ok()).flatten()
+                });
+                let pre_emphasis = rip_preemphasis.contains(&track.number) ||
+                    track.directives.iter().any(|line| {
+                    let mut words=line.split_whitespace();
+                    words.next().is_some_and(|word|word.eq_ignore_ascii_case("FLAGS")) &&
+                        words.any(|word|word.eq_ignore_ascii_case("PRE"))
+                });
                 segments.push(NativeCueSegment {presentation:id,number,
                     cue_path:member.cue_path.clone(),image:image.clone(),start_sample:start,
-                    end_sample:end,total_samples:*samples,sample_rate:*rate,extension,encoder,muxer,
+                    end_sample:end,index00_sample,index01_sample:start,pre_emphasis,
+                    hidden_track_published:false,appended_gap:None,
+                    total_samples:*samples,sample_rate:*rate,extension,encoder,muxer,
                     sample_bits:depth,channels:u8::try_from(info.channels)
                         .map_err(|_|"Too many CUE audio channels")?,
                     source_length:*len,source_modified:*modified,
@@ -270,34 +329,8 @@ pub fn inspect(source: &Path, combine: bool,
             }, album_title:Some(album_name), album_artist, genre:album_genre,year:album_year });
         segments_by_program.push(segments);
     }
-    // Partition each compressed image once, over all admitted tracks, not
-    // merely the checked tracks of a later job. This lets selection/Skip
-    // retain exact source packet ownership with no re-encode or overlaps.
-    let mut by_image: BTreeMap<PathBuf, Vec<(usize,usize,u64,u64,u64)>> = BTreeMap::new();
-    for (pi, segments) in segments_by_program.iter().enumerate() {
-        for (ti, segment) in segments.iter().enumerate() {
-            if matches!(segment.encoder.as_str(),"libmp3lame"|"aac"|"libvorbis"|"libopus") {
-                by_image.entry(segment.image.clone()).or_default().push((pi,ti,
-                    segment.start_sample,segment.end_sample,segment.total_samples));
-            }
-        }
-    }
-    for (image, mut parts) in by_image {
-        parts.sort_by_key(|part|part.2);
-        let total = parts[0].4;
-        if parts.iter().any(|part|part.4 != total) ||
-            parts.windows(2).any(|pair|pair[0].3 != pair[1].2) ||
-            parts.last().is_some_and(|part|part.3 != total) {
-            return Err(format!("Lossy CUE image has overlapping or incomplete track partition: {}",
-                image.display()));
-        }
-        let cuts: Vec<_> = parts.iter().skip(1).map(|part|part.2).collect();
-        for (index,(pi,ti,_,_,_)) in parts.into_iter().enumerate() {
-            let segment = &mut segments_by_program[pi][ti];
-            segment.packet_cut_samples = cuts.clone();
-            segment.packet_part_index = index;
-        }
-    }
+    // The admitted geometry stays immutable. The job builder owns the gap
+    // policy and derives the complete packet partition before queueing.
     let name = if presentations.len() == 1 { presentations[0].label.clone() }
         else { source.file_name().unwrap_or_default().to_string_lossy().into_owned() };
     Ok(CueExtractPreview { contents:DiscContents {
@@ -398,4 +431,26 @@ mod tests {
         assert_eq!(separate.segments[0][0].start_sample,0);
         assert_eq!(separate.segments[0][1].end_sample,144_000);
     }
+
+    #[test]
+    fn r2d04_matched_rip_logs_do_not_cross_contaminate_and_decode_unicode() {
+        let dir=tempfile::tempdir().unwrap();
+        let cd1=dir.path().join("CD1.cue");
+        let cd2=dir.path().join("CD2.cue");
+        fs::write(&cd1,"FILE \"CD1.wav\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n").unwrap();
+        fs::write(&cd2,"FILE \"CD2.wav\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n").unwrap();
+        fs::write(dir.path().join("CD1.log"),"Track  1\n  Pre-emphasis : No\n").unwrap();
+        fs::write(dir.path().join("CD2.log"),"Track  1\n  Pre-emphasis : Yes\n").unwrap();
+        assert!(rip_log_preemphasis(&cd1).is_empty());
+        assert_eq!(rip_log_preemphasis(&cd2).into_iter().collect::<Vec<_>>(),vec![1]);
+        let unicode="Track  1\r\n  Pre-emphasis : Yes\r\n";
+        let mut utf16=vec![0xff,0xfe];
+        for word in unicode.encode_utf16() {utf16.extend_from_slice(&word.to_le_bytes());}
+        fs::write(dir.path().join("CD1.log"),utf16).unwrap();
+        assert_eq!(rip_log_preemphasis(&cd1).into_iter().collect::<Vec<_>>(),vec![1]);
+        fs::remove_file(dir.path().join("CD1.log")).unwrap();
+        // A sole unmatched album log cannot be assigned to either of two CUEs.
+        assert!(rip_log_preemphasis(&cd1).is_empty());
+    }
+
 }

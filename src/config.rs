@@ -20,19 +20,8 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
-/// Defaults saved only when Extract is pressed with its opt-in tick set.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct ExtractSavedOptions {
-    pub write_log: bool,
-    pub create_cue: bool,
-}
-
-impl Default for ExtractSavedOptions {
-    fn default() -> Self {
-        Self { write_log: true, create_cue: true }
-    }
-}
+/// All extraction options are persisted together when the user opts in.
+pub use crate::convert::pipeline::native_extract::NativeExtractSettings as ExtractSavedOptions;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TonepoetConfig {
@@ -2646,7 +2635,7 @@ mod theme_config_tests {
         let decoded: TonepoetConfig = toml::from_str(&encoded).expect("decode default config");
         assert!(decoded.extract_defaults.is_none());
         assert_eq!(ExtractSavedOptions::default(), ExtractSavedOptions {
-            write_log: true, create_cue: true,
+            write_log: true, create_cue: true, ..Default::default()
         });
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2656,7 +2645,8 @@ mod theme_config_tests {
         config.conversion.write_log_file = true;
         config.browsing.show_hidden = true;
         config.save().expect("save initial preferences");
-        let saved = ExtractSavedOptions { write_log: false, create_cue: false };
+        let saved = ExtractSavedOptions { write_log: false, create_cue: false,
+            verify_after: true, embed_cue: true, ..Default::default() };
         config.update(|latest| latest.extract_defaults = Some(saved.clone()))
             .expect("persist Extract preferences");
         let reloaded = TonepoetConfig::load().expect("reload Extract preferences");

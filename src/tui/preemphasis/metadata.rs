@@ -543,7 +543,7 @@ fn dedup_log_candidates(logs: &mut Vec<EacLogBridge>) {
     logs.dedup_by(|a, b| a.path == b.path);
 }
 
-fn read_eac_log_text(path: &Path) -> Option<String> {
+pub(crate) fn read_eac_log_text(path: &Path) -> Option<String> {
     let raw = fs::read(path).ok()?;
     if raw.starts_with(&[0xFF, 0xFE]) {
         let u16s: Vec<u16> = raw[2..]

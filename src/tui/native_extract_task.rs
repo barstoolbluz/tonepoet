@@ -484,15 +484,7 @@ fn refuse_ambiguous_recovery_replacement(
     let recorded = published.iter().collect::<HashSet<_>>();
     let mut planned = Vec::new();
     for program in &job.programs {
-        if job.file_per_program {
-            let audio = native_extract::proposed_destination_for_program(job, program);
-            if job.cue { planned.push(audio.with_extension("cue")); }
-            planned.push(audio);
-        } else {
-            for track in &program.tracks {
-                planned.push(native_extract::proposed_destination(job, program, track));
-            }
-        }
+        planned.extend(native_extract::native_program_media_paths(job,program));
     }
     if job.extraction_log {
         planned.extend(native_extract::native_log_targets(job)
@@ -526,17 +518,13 @@ fn remaining_native_job(
 ) -> Result<NativeExtractionJob, String> {
     let done = published.iter().cloned().collect::<HashSet<_>>();
     let original_job = job.clone();
+    // Also enforce companion durability for direct recovery callers, rather
+    // than relying on the helper having called pending_native_cues first.
+    let _ = pending_native_cues(&original_job,published,prepared_cues)?;
     if job.file_per_program {
         for program in &mut job.programs {
             let audio = native_extract::proposed_destination_for_program(&original_job, program);
             if done.contains(&audio) {
-                if original_job.cue && !done.contains(&audio.with_extension("cue"))
-                    && !prepared_cues.iter().any(|cue|cue.destination == audio.with_extension("cue")) {
-                    return Err(format!(
-                        "Published continuous audio {} has no durable CUE contents; review it before recovery",
-                        audio.display(),
-                    ));
-                }
                 program.tracks.clear();
             } else {
                 let original_program = program.clone();
@@ -562,6 +550,18 @@ fn remaining_native_job(
                 .any(|track|track.number==member.number)));
     }
     if job.format == crate::disc::DiscFormat::CueImage {
+        // A published hidden output belongs to its program, not to the
+        // global first-gap preference. Suppress only that exact output.
+        for program in &original_job.programs {
+            if let Some(hidden)=native_extract::native_cue_hidden_target(&original_job, program) {
+                if done.contains(&hidden) {
+                    if let Some(segment)=job.cue_segments.iter_mut().find(|s|
+                        s.presentation==program.id && s.number==1) {
+                        segment.hidden_track_published=true;
+                    }
+                }
+            }
+        }
         // A resumed CUE task owns only the still-pending track geometry;
         // keep the full input protection set, including unchecked images.
         job.cue_segments.retain(|segment|job.programs.iter().any(|program|
@@ -651,19 +651,40 @@ fn add_native_recovery_baseline(
     progress
 }
 
+/// The durable prepared-CUE record already stores an exact destination and
+/// UTF-8 text. Reuse it for chapter text too; no new journal schema or recovery
+/// transaction is necessary. A companion is replayed only if its audio is
+/// published, its destination is still absent, and its content was journaled.
 fn pending_native_cues(
     job: &NativeExtractionJob, published: &[PathBuf],
     prepared: &[DurableNativePreparedCue],
 ) -> Result<Vec<DurableNativePreparedCue>, String> {
-    if !job.file_per_program || !job.cue { return Ok(Vec::new()); }
     let mut pending = Vec::new();
+    let done = published.iter().cloned().collect::<HashSet<PathBuf>>();
     for program in &job.programs {
-        let audio = native_extract::proposed_destination_for_program(job, program);
-        let cue_path = audio.with_extension("cue");
-        if published.contains(&audio) && !published.contains(&cue_path) {
-            let cue = prepared.iter().find(|cue|cue.destination == cue_path)
-                .ok_or_else(||format!("No prepared CUE in recovery journal for {}",audio.display()))?;
-            pending.push(cue.clone());
+        let planned=native_extract::native_program_media_paths(job,program);
+        let media=if job.file_per_program {
+            vec![native_extract::proposed_destination_for_program(job,program)]
+        } else {
+            program.tracks.iter().map(|track|
+                native_extract::proposed_destination(job,program,track)).collect::<Vec<_>>()
+        };
+        for audio in media {
+            if !done.contains(&audio) {continue;}
+            for path in &planned {
+                let is_cue=path==&audio.with_extension("cue") &&
+                    path.extension().and_then(|ext|ext.to_str())==Some("cue");
+                let is_chapters=job.file_per_program && path.file_name()
+                    .is_some_and(|name|name.to_string_lossy().ends_with("chapters.txt"));
+                if !(is_cue||is_chapters) || done.contains(path) {continue;}
+                if pending.iter().any(|item: &DurableNativePreparedCue|
+                    item.destination==*path) {continue;}
+                let sidecar=prepared.iter().find(|item|item.destination==*path)
+                    .ok_or_else(||format!(
+                        "Published audio {} has no durable companion text for {}; review before recovery",
+                        audio.display(),path.display()))?;
+                pending.push(sidecar.clone());
+            }
         }
     }
     Ok(pending)
@@ -751,7 +772,7 @@ async fn run_native_extraction(
         // outstanding media/CUEs are handled, never a user-created file.
         let log_needed = original_job.extraction_log;
         // The detached helper publishes the log *after* all pending recovered
-        // CUEs. The media engine otherwise keeps its normal direct-call API.
+        // CUE and chapter companions. The media engine keeps its normal API.
         job.extraction_log = false;
         let total = job.programs.iter().map(|p| p.tracks.len()).sum::<usize>();
         let estimated_bytes_total = job.programs.iter().flat_map(|p| p.tracks.iter())
@@ -796,12 +817,11 @@ async fn run_native_extraction(
                     media_progress_tx.send_replace(add_native_recovery_baseline(snapshot, baseline));
                 }).await?
             };
-            // Sidecar-only recovery is legitimate: the audio is already
-            // complete and must not be decoded or replaced for a missing CUE
-            // or extraction log. All publications use the same checked path.
+            // Sidecar-only recovery is legitimate: already published audio
+            // is not decoded or replaced for a missing CUE, chapters or log. All publications use the same checked path.
             for cue in pending_cues {
                 let mut state = (*progress_tx.borrow()).clone();
-                state.current = format!("Publishing recovered CUE {}", cue.destination.display());
+                state.current = format!("Publishing recovered companion {}", cue.destination.display());
                 state.current_file = None;
                 progress_tx.send_replace(state);
                 if let Err(error) = native_extract::publish_native_recovery_sidecar(
@@ -818,7 +838,7 @@ async fn run_native_extraction(
                 }
                 journal_for_sidecars.record_native_published(&cue.destination)?;
                 let mut state = (*progress_tx.borrow()).clone();
-                state.current = "Published recovered CUE".into();
+                state.current = "Published recovered companion".into();
                 state.published += 1;
                 progress_tx.send_replace(state);
                 report.published.push(cue.destination);
@@ -1233,7 +1253,7 @@ mod tests {
             assume_decrypted: false, downmix: crate::convert::pipeline::types::DvdaDownmixPolicy::None,
             naming_template: "{track} - {title}".into(),
             program_subfolders: true, overwrite_policy: NativeOverwritePolicy::Replace,
-            extraction_log: false, program_log_paths: Vec::new(), round4_layout: false, file_per_program: false, cue: false,
+            extraction_log: false, options: crate::convert::pipeline::native_extract::NativeExtractSettings {create_cue:false, write_chapters:false, ..Default::default()}, program_log_paths: Vec::new(), round4_layout: false, file_per_program: false, cue: false,
             transfer_tags: false, sacd_dff: false, tag_source: NativeTagSource::DiscAndSidecar,
             tag_fields: 0x7f, tag_artwork: false,
         }
@@ -1466,6 +1486,59 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&cue).unwrap(), prepared[0].content);
         assert_eq!(std::fs::read(&audio).unwrap(), b"continuous PCM is already published");
         assert!(pending_native_cues(&job, &[audio, cue], &prepared).unwrap().is_empty());
+    }
+
+    #[test]
+    fn r2_recovery_finishes_chapters_without_reextracting_completed_audio() {
+        let temp=tempfile::tempdir().unwrap();
+        let mut job=recovery_fixture_job(&temp.path().join("dest"));
+        job.working_root=temp.path().join("scratch");
+        job.file_per_program=true;
+        job.options.write_chapters=true;
+        let audio=native_extract::proposed_destination_for_program(&job,&job.programs[0]);
+        let chapters=audio.with_file_name("chapters.txt");
+        std::fs::create_dir_all(audio.parent().unwrap()).unwrap();
+        std::fs::write(&audio,b"completed native DSD").unwrap();
+        assert!(pending_native_cues(&job,std::slice::from_ref(&audio),&[]).is_err());
+        let saved=vec![DurableNativePreparedCue {
+            destination:chapters.clone(),
+            content:"CHAPTER01=00:00:00.000\nCHAPTER01NAME=Track 1\n".into(),
+        }];
+        let pending=pending_native_cues(&job,std::slice::from_ref(&audio),&saved).unwrap();
+        assert_eq!(pending,saved);
+        assert!(remaining_native_job(job.clone(),std::slice::from_ref(&audio),&[],&saved)
+            .unwrap().programs.is_empty());
+        native_extract::publish_native_recovery_sidecar(&job,&chapters,&saved[0].content,
+            &CancellationToken::new(),&NativeExtractionControl::default()).unwrap();
+        assert!(pending_native_cues(&job,&[audio.clone(),chapters.clone()],&saved)
+            .unwrap().is_empty());
+        assert_eq!(std::fs::read(&audio).unwrap(),b"completed native DSD");
+        assert_eq!(std::fs::read_to_string(&chapters).unwrap(),saved[0].content);
+    }
+
+    #[test]
+    fn r2_recovery_completes_dff_track_cue_with_no_second_audio_pass() {
+        let temp=tempfile::tempdir().unwrap();
+        let mut job=recovery_fixture_job(&temp.path().join("dest"));
+        job.working_root=temp.path().join("scratch");
+        job.sacd_dff=true;
+        job.options.create_cue=true;
+        let audio=native_extract::proposed_destination(&job,&job.programs[0],
+            &job.programs[0].tracks[0]);
+        let cue=audio.with_extension("cue");
+        assert_eq!(audio.extension().and_then(|ext|ext.to_str()),Some("dff"));
+        let saved=vec![DurableNativePreparedCue {
+            destination:cue.clone(),
+            content:"FILE \"track.dff\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n".into(),
+        }];
+        std::fs::create_dir_all(audio.parent().unwrap()).unwrap();
+        std::fs::write(&audio,b"completed DFF").unwrap();
+        assert_eq!(pending_native_cues(&job,std::slice::from_ref(&audio),&saved)
+            .unwrap(),saved);
+        assert!(pending_native_cues(&job,std::slice::from_ref(&audio),&[]).is_err());
+        native_extract::publish_native_recovery_sidecar(&job,&cue,&saved[0].content,
+            &CancellationToken::new(),&NativeExtractionControl::default()).unwrap();
+        assert_eq!(std::fs::read(&audio).unwrap(),b"completed DFF");
     }
 
     #[test]
@@ -1875,4 +1948,42 @@ mod tests {
         assert_eq!(totals.bytes_done, 800);
         assert_eq!(totals.bytes_total, Some(1500));
     }
+
+    #[test]
+    fn r2d06_recovery_suppresses_only_durable_hidden_track_for_its_program() {
+        use crate::convert::pipeline::native_extract::NativeCueSegment;
+        let temp=tempfile::tempdir().unwrap();
+        let mut job=recovery_fixture_job(&temp.path().join("out"));
+        job.format=crate::disc::DiscFormat::CueImage;
+        job.overwrite_policy=native_extract::NativeOverwritePolicy::Fail;
+        job.programs[0].id=crate::disc::PresentationId::CueAlbum(1);
+        let mut second=job.programs[0].clone();
+        second.id=crate::disc::PresentationId::CueAlbum(2);
+        second.label="Second album".into();
+        job.programs.push(second);
+        for p in &job.programs {
+            job.cue_segments.push(NativeCueSegment {
+                presentation:p.id,number:1,
+                cue_path:temp.path().join("Album.cue"),image:temp.path().join("audio.wav"),
+                start_sample:4_000,end_sample:8_000,index00_sample:Some(0),
+                index01_sample:4_000,pre_emphasis:false,hidden_track_published:false,
+                appended_gap:None,total_samples:8_000,sample_rate:48_000,
+                extension:"wav".into(),encoder:"pcm_s16le".into(),muxer:"wav".into(),
+                sample_bits:Some(16),channels:2,source_length:0,source_modified:None,
+                cue_length:0,cue_modified:None,source_bit_rate:None,
+                packet_cut_samples:Vec::new(),packet_part_index:0,
+            });
+        }
+        let done=native_extract::native_cue_hidden_target(&job,&job.programs[0]).unwrap();
+        let pending=native_extract::native_cue_hidden_target(&job,&job.programs[1]).unwrap();
+        assert_ne!(done,pending);
+        std::fs::create_dir_all(done.parent().unwrap()).unwrap();
+        std::fs::write(&done,b"published hidden-track audio").unwrap();
+        let resumed=remaining_native_job(job,&[done.clone()],&[],&[]).unwrap();
+        assert!(native_extract::native_cue_hidden_target(&resumed,&resumed.programs[0]).is_none());
+        assert_eq!(native_extract::native_cue_hidden_target(&resumed,&resumed.programs[1]),Some(pending));
+        assert!(resumed.programs[0].tracks.iter().any(|t|t.number==1));
+        assert_eq!(std::fs::read(done).unwrap(),b"published hidden-track audio");
+    }
+
 }

@@ -290,6 +290,7 @@ pub struct DiscBrowserState {
     pub panel: Option<ExtractPanel>,
     /// Focused control in the Tags sheet (index into tag_sheet_controls).
     pub panel_cursor: usize,
+    pub option_parent_cursor: usize,
     pub tag_source_open: bool,
     pub tag_source_cursor: usize,
     /// A MusicBrainz match was accepted and committed through the existing
@@ -317,6 +318,7 @@ pub struct DiscBrowserState {
     pub program_subfolders: bool,
     pub overwrite_policy: crate::convert::pipeline::native_extract::NativeOverwritePolicy,
     pub extraction_log: bool,
+    pub extract_settings: crate::convert::pipeline::native_extract::NativeExtractSettings,
     /// Transient opt-in: save the extract choices only after a successful launch.
     pub save_extract_defaults: bool,
     pub destination: PathBuf,
@@ -356,11 +358,18 @@ pub enum ExtractFocus { Programs, Items, Output, Footer }
 pub enum DestinationFeedback { WillBeCreated, NotWritable, InvalidPath }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExtractPanel { Tags, Downmix, AssumeDecrypted, Diagnostics, Options, CueFiles, ConvertChoice, Keys }
+pub enum ExtractPanel { Tags, Downmix, AssumeDecrypted, Diagnostics, Options, Chapters, CueFiles, CopyFolder, ConvertChoice, Keys }
 
 /// Modal rows are one authority for keyboard order, mouse targets and drawing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExtractOptionControl { WriteLog, CueFiles, CreateCue, SaveNext, Done }
+pub enum ExtractOptionControl {
+    WriteLog, Verify, Chapters, CueFiles, CopyFolder, SaveNext,
+    WriteChapters, CreateCue, EmbedCue, KeepPreemphasis,
+    BetweenAppend, BetweenPrepend, BetweenDrop,
+    FirstPrepend, FirstOwn00, FirstDrop,
+    CopyArtwork, CopyArtFolders, CopyLog, CopyCue, CopyTxt, CopyNfo,
+    CopyMd, CopyPdf, CopyMd5, CopyOther, Done,
+}
 
 /// Shared Tags-sheet focus and mouse activation targets. No row-specific key
 /// shortcuts or hidden hot spots: all items use the same activation path.
@@ -442,6 +451,7 @@ impl DiscBrowserState {
             show_hidden: false,
             panel: None,
             panel_cursor: 0,
+            option_parent_cursor: 0,
             tag_source_open: false,
             tag_source_cursor: 0,
             tag_mb_available: false,
@@ -460,6 +470,7 @@ impl DiscBrowserState {
             program_subfolders: true,
             overwrite_policy: crate::convert::pipeline::native_extract::NativeOverwritePolicy::Fail,
             extraction_log: true,
+            extract_settings: Default::default(),
             save_extract_defaults: false,
             destination: source_path.parent().unwrap_or(Path::new(".")).join("Extracted"),
             wav_container: crate::convert::pipeline::native_extract::NativeWavContainer::Automatic,
@@ -1076,21 +1087,30 @@ impl DiscBrowserState {
             })
     }
 
-    /// Current native CUE publisher supports continuous WAV and chaptered
-    /// packet-copy streams that cannot carry embedded chapter navigation.
-    /// Unimplemented DFF/DSF and elementary-stream CUE variants are not offered.
+    /// The same control order drives drawing, keyboard focus and mouse hits.
+    /// Controls remain visible across sources, while worker applicability
+    /// determines whether each setting has an effect.
     pub fn option_controls(&self) -> Vec<ExtractOptionControl> {
         use ExtractOptionControl as C;
         match self.panel {
-            Some(ExtractPanel::Options) => {
-                let mut controls=vec![C::WriteLog];
-                if self.native_cue_applicable() {controls.push(C::CueFiles);}
-                controls.extend([C::SaveNext,C::Done]);
-                controls
-            }
-            Some(ExtractPanel::CueFiles) => vec![C::CreateCue,C::Done],
+            Some(ExtractPanel::Options) => vec![C::WriteLog,C::Verify,C::Chapters,
+                C::CueFiles,C::CopyFolder,C::SaveNext,C::Done],
+            Some(ExtractPanel::Chapters) => vec![C::WriteChapters,C::Done],
+            Some(ExtractPanel::CueFiles) => vec![C::CreateCue,C::EmbedCue,
+                C::KeepPreemphasis,C::BetweenAppend,C::BetweenPrepend,C::BetweenDrop,
+                C::FirstPrepend,C::FirstOwn00,C::FirstDrop,C::Done],
+            Some(ExtractPanel::CopyFolder) => vec![C::CopyArtwork,C::CopyArtFolders,
+                C::CopyLog,C::CopyCue,C::CopyTxt,C::CopyNfo,C::CopyMd,C::CopyPdf,
+                C::CopyMd5,C::CopyOther,C::Done],
             _ => Vec::new(),
         }
+    }
+
+    pub fn current_extract_settings(&self) -> crate::convert::pipeline::native_extract::NativeExtractSettings {
+        let mut settings = self.extract_settings.clone();
+        settings.write_log = self.extraction_log;
+        settings.create_cue = self.cue;
+        settings
     }
 
     pub fn native_cue_applicable(&self) -> bool {
@@ -1669,12 +1689,25 @@ impl DiscBrowserState {
         // program discriminator. A single checked area goes straight to Folder.
         let program_subfolders = programs.len() > 1 &&
             !native_template_has_program_token(&self.naming_template);
-        let cue_segments = if self.contents.format == DiscFormat::CueImage {
+        let mut cue_segments = if self.contents.format == DiscFormat::CueImage {
             self.cue_segments.iter().enumerate().filter(|(i,_)|
                 self.selected.get(*i) == Some(&true)).flat_map(|(i,segments)|
                 segments.iter().filter(move |s| self.items_checked[i].get(s.number as usize - 1)
                     == Some(&true)).cloned()).collect()
         } else { Vec::new() };
+        if self.contents.format == DiscFormat::CueImage {
+            // Admission guarantees original geometry. Settings may change
+            // until Extract, so derive the selected ownership at that point.
+            let all = self.cue_segments.iter().flatten().cloned().collect::<Vec<_>>();
+            // Invalid geometry will be rejected again by native admission.
+            if let Err(error) = configure_cue_gap_segments(
+                &all, &mut cue_segments, &self.current_extract_settings()) {
+                // Force validation to reject rather than fall back to a
+                // different gap policy for a malformed source.
+                cue_segments.clear();
+                let _ = error;
+            }
+        }
         let cue_input_paths = if self.contents.format == DiscFormat::CueImage {
             let mut paths = self.cue_segments.iter().flatten()
                 .flat_map(|segment|[segment.cue_path.clone(),segment.image.clone()])
@@ -1693,6 +1726,7 @@ impl DiscBrowserState {
             wav_container:self.wav_container, assume_decrypted:self.assume_decrypted,downmix:self.downmix,
             naming_template:self.naming_template.clone(), program_subfolders,
             overwrite_policy:self.overwrite_policy, extraction_log:self.extraction_log,
+            options: self.current_extract_settings(),
             program_log_paths:Vec::new(), round4_layout:true,
             file_per_program:self.file_per_program, cue:self.cue && self.native_cue_applicable(),
             transfer_tags:self.tags && self.native_tags_available(),

@@ -119,7 +119,7 @@ fn alac_duration_bsf(source: &Path, stream_index: u32) -> Option<String> {
 }
 
 fn copy_command(job: &NativeExtractionJob, program: &NativeProgramChoice,
-    target: &Path) -> Result<ToolCommand, String> {
+    target: &Path, producer_hash: Option<&Path>) -> Result<ToolCommand, String> {
     let stream = source_index(program)?;
     let carrier = file_stream_copy_format(job.format, &program.source_codec);
     let mut args: Vec<String> = ["-hide_banner", "-nostdin", "-loglevel", "error", "-xerror",
@@ -191,6 +191,16 @@ fn copy_command(job: &NativeExtractionJob, program: &NativeProgramChoice,
         args.extend(["-rf64".into(), "auto".into()]);
     }
     args.extend(["-f".into(), carrier.muxer.into(), utf8_path(target)?]);
+    if let Some(path) = producer_hash {
+        // Decode the selected source stream in the same FFmpeg process that
+        // writes the native copy; no second read of the completed output is
+        // permitted as a stand-in for producer-time evidence.
+        args.extend(["-map".into(), format!("0:{stream}"),
+            "-vn".into(), "-sn".into(), "-dn".into(),
+            "-c:a".into(), "pcm_f64le".into(),
+            "-f".into(), "hash".into(), "-hash".into(), "SHA256".into(),
+            utf8_path(path)?]);
+    }
     Ok(command(args))
 }
 
@@ -402,7 +412,7 @@ fn write_pcm_header(writer: &mut impl Write, rate: u32, channels: u16,
 fn write_pcm_chapter(raw: &Path, output: &Path, rate: u32, channels: u16,
     mask: u32, start: u64, samples: u64, spec: &ChapterPcm,
     job_cancel: &CancellationToken, item_cancel: &CancellationToken,
-    controls: &NativeExtractionControl,
+    controls: &NativeExtractionControl, verify_after: bool,
 ) -> Result<(), String> {
     if channels == 0 || rate == 0 || samples == 0 {
         return Err("Invalid rate, channels or sample count for Matroska chapter WAV".into());
@@ -415,10 +425,12 @@ fn write_pcm_chapter(raw: &Path, output: &Path, rate: u32, channels: u16,
         return Err("Chapter's sample range exceeds the decoded stream".into());
     }
     input.seek(SeekFrom::Start(offset)).map_err(|e|format!("Seek decoded chapter: {e}"))?;
+    let output_path=output;
     let mut output = OpenOptions::new().create_new(true).write(true).open(output)
         .map_err(|e|format!("Create private chapter WAV: {e}"))?;
     write_pcm_header(&mut output, rate, channels, mask, samples, spec)?;
     let mut remaining = length;
+    let mut digest=verify_after.then(Sha256::new);
     let mut buf = [0u8; 128 * 1024];
     while remaining > 0 {
         if controls.wait_blocking(job_cancel, item_cancel) {
@@ -427,12 +439,16 @@ fn write_pcm_chapter(raw: &Path, output: &Path, rate: u32, channels: u16,
         let n = usize::try_from(remaining.min(buf.len() as u64)).unwrap();
         input.read_exact(&mut buf[..n]).map_err(|e|format!("Read decoded chapter: {e}"))?;
         output.write_all(&buf[..n]).map_err(|e|format!("Write chapter WAV: {e}"))?;
+        if let Some(hash)=digest.as_mut() {hash.update(&buf[..n]);}
         remaining -= n as u64;
     }
     if length % 2 != 0 {
         output.write_all(&[0]).map_err(|e| format!("Pad odd WAV data chunk: {e}"))?;
     }
     output.sync_all().map_err(|e|format!("Synchronize chapter WAV: {e}"))?;
+    if let Some(hash)=digest {
+        controls.record_audio_fingerprint(output_path,hash.finalize().into(),spec.codec);
+    }
     Ok(())
 }
 
@@ -522,6 +538,26 @@ fn native_stream_cue(job: &NativeExtractionJob, program: &NativeProgramChoice,
     }
     if count == 0 {return Err("Selected Matroska chapters contain no audio for CUE".into());}
     Ok(rows.join("\n") + "\n")
+}
+
+/// Authored chapter markers on the copied audio clock. The input's time
+/// origin may differ from its first decoded audio packet, so use the same
+/// offset as native_stream_cue and never introduce synthetic silence.
+fn stream_chapter_starts(job:&NativeExtractionJob, program:&NativeProgramChoice,
+    chapters:&[EmbeddedChapterTrack],rate:u32) -> Result<Vec<(String,u64)>,String> {
+    let origin=stream_origin_samples(&job.source,source_index(program)?,rate)?;
+    let mut starts:Vec<(String,u64)>=Vec::new();
+    for chapter in chapters {
+        let end=i128::from(chapter.boundary.start_sample)
+            .checked_add(i128::from(chapter.boundary.samples))
+            .ok_or("Chapter sample range overflow")?;
+        if end<=origin {continue;}
+        let offset=(i128::from(chapter.boundary.start_sample)-origin).max(0) as u64;
+        if starts.last().is_some_and(|(_,last)| *last>=offset) {continue;}
+        starts.push((chapter.title.clone().unwrap_or_else(||
+            format!("Chapter {}",starts.len()+1)),offset));
+    }
+    Ok(starts)
 }
 
 fn check_source_unchanged(path: &Path, length: u64,
@@ -617,14 +653,20 @@ pub(super) async fn execute_inner(
             }
             let carrier = file_stream_copy_format(job.format, &program.source_codec);
             let complete = temp.path().join(format!("stream-{pi}.{}", carrier.extension));
+            let producer_hash = job.options.verify_after.then(||
+                temp.path().join(format!("stream-{pi}-audio.sha256")));
             controls.watch_file(complete.clone(), format!("Copying {}", program.label),
                 Some(expected), false);
             emit(format!("Copying unchanged {}", program.label), Some(complete.clone()),
                 Some(expected), done, skipped, &published, bytes_done, bytes_skipped, bytes_published);
             let result: Result<(), String> = async {
-                runner.run(copy_command(&job, program, &complete)?, &item)
+                runner.run(copy_command(&job, program, &complete, producer_hash.as_deref())?, &item)
                     .await.map_err(|e| format!("Native audio stream extraction: {e}"))?;
                 controls.wait_ready(&cancel, &item).await?;
+                if let Some(path) = producer_hash.as_deref() {
+                    controls.record_audio_fingerprint(&complete,
+                        native_audio_hash_receipt(path)?, "pcm_f64le");
+                }
                 let output = fs::metadata(&complete).map_err(|e| format!("Copied stream missing: {e}"))?;
                 if output.len() < 64 { return Err("Audio stream extraction produced no usable file".into()); }
                 // Native FLAC pictures and MP3 ID3 APIC cannot use the
@@ -644,19 +686,51 @@ pub(super) async fn execute_inner(
                 File::open(&complete).and_then(|f| f.sync_all())
                     .map_err(|e|format!("Sync copied Matroska stream: {e}"))?;
                 check_source_unchanged(&job.source, initial_length, initial_modified)?;
-                let cue_file = if job.cue && matroska_cue_for_program(&job, program) {
-                    let rate = presentation.format.sample_rate
-                        .ok_or("CUE needs a known source sample rate")?;
-                    let chapters = normalize_embedded_chapters(&raw_chapters, rate)?;
-                    let text = native_stream_cue(&job,program,&chapters,rate,
-                        source_index(program)?,&target)?;
-                    let staged = temp.path().join(format!("stream-{pi}.cue"));
-                    let mut output = OpenOptions::new().create_new(true).write(true).open(&staged)
-                        .map_err(|e|format!("Create private Matroska CUE: {e}"))?;
-                    output.write_all(text.as_bytes()).and_then(|()|output.sync_all())
-                        .map_err(|e|format!("Finish private Matroska CUE: {e}"))?;
-                    controls.record_prepared_cue(&target.with_extension("cue"),&text)?;
-                    Some(staged)
+                let need_cue=native_program_cue_applies(&job,program);
+                let need_embed=job.options.embed_cue &&
+                    matches!(carrier.extension,"flac"|"wv");
+                let need_chapters=native_program_chapters_apply(&job,program);
+                let authored=if chapter_count>0 && (need_cue || need_embed || need_chapters) {
+                    let rate=presentation.format.sample_rate
+                        .ok_or("Chaptered native audio needs a known sample rate")?;
+                    Some((normalize_embedded_chapters(&raw_chapters,rate)?,rate))
+                } else {None};
+                let cue_text=if need_cue || need_embed {
+                    let rate=presentation.format.sample_rate
+                        .ok_or("CUE needs a known audio sample rate")?;
+                    if let Some((chapters,_))=authored.as_ref() {
+                        Some(native_stream_cue(&job,program,chapters,rate,
+                            source_index(program)?,&target)?)
+                    } else {
+                        let title=program.tracks.first().map(|t|t.name.clone())
+                            .unwrap_or_else(||program.label.clone());
+                        let filename=target.file_name().and_then(|f|f.to_str())
+                            .ok_or("Invalid stream filename for CUE")?;
+                        Some(options::cue_text(filename,&[(title,0,false)],rate)?)
+                    }
+                } else {None};
+                if need_embed {
+                    if let Some(content)=cue_text.as_deref() {
+                        options::embed_cue(&complete,content)?;
+                    }
+                }
+                let cue_file=if need_cue {
+                    let text=cue_text.as_deref().ok_or("No authored CUE content")?;
+                    let stage=options::stage_text(temp.path(),
+                        &format!("stream-{pi}.cue"),text)?;
+                    controls.record_prepared_cue(&target.with_extension("cue"),text)?;
+                    Some(stage)
+                } else {None};
+                let chapters_file=if need_chapters {
+                    let (chapters,rate)=authored.as_ref()
+                        .ok_or("No authored chapter markers")?;
+                    let starts=stream_chapter_starts(&job,program,chapters,*rate)?;
+                    if starts.is_empty() {None} else {
+                        let content=options::chapter_text(&starts,*rate)?;
+                        controls.record_prepared_cue(&native_chapters_target(&job,&target),&content)?;
+                        Some(options::stage_text(temp.path(),
+                            &format!("stream-{pi}.chapters.txt"),&content)?)
+                    }
                 } else {None};
                 publish_finished_file_controlled(&job,&complete,&target,&cancel,&item,&controls)?;
                 // One completed private file per stream: bounded scratch usage.
@@ -674,6 +748,16 @@ pub(super) async fn execute_inner(
                     let _ = fs::remove_file(&staged);
                     published.push(cue_target);
                     emit(format!("Published CUE for {}",program.label),None,None,done,skipped,
+                        &published,bytes_done,bytes_skipped,bytes_published);
+                }
+                if let Some(staged)=chapters_file {
+                    let chapter_target=native_chapters_target(&job,&target);
+                    controls.set_attempted_output(chapter_target.clone());
+                    controls.wait_ready(&cancel,&item).await?;
+                    publish_finished_file_controlled(&job,&staged,&chapter_target,
+                        &cancel,&item,&controls)?;
+                    published.push(chapter_target);
+                    emit(format!("Published chapters for {}",program.label),None,None,done,skipped,
                         &published,bytes_done,bytes_skipped,bytes_published);
                 }
                 Ok(())
@@ -801,9 +885,10 @@ pub(super) async fn execute_inner(
                 let cancel_copy = cancel.clone(); let item_copy = item.clone();
                 let controls_copy = Arc::clone(&controls);
                 let chapter_spec = spec.clone();
+                let verify_after=job.options.verify_after;
                 tokio::task::spawn_blocking(move || write_pcm_chapter(&reader,&writer,
                     rate,u16::from(channels),channel_mask,start,frames,&chapter_spec,
-                    &cancel_copy,&item_copy,&controls_copy))
+                    &cancel_copy,&item_copy,&controls_copy,verify_after))
                     .await.map_err(|e|format!("Matroska chapter writer task: {e}"))??;
                 controls.wait_ready(&cancel,&item).await?;
                 if job.transfer_tags {
@@ -896,6 +981,45 @@ mod tests {
 
 
     #[test]
+    fn r2d02_matroska_ffmpeg_copy_produces_a_live_audio_reference() {
+        use std::process::Command;
+        if Command::new("ffmpeg").arg("-version").output().is_err() {return;}
+        let temp=tempfile::tempdir().unwrap();
+        let source=temp.path().join("source.mka");
+        let complete=temp.path().join("copied.flac");
+        let receipt=temp.path().join("live.sha256");
+        let fixture=Command::new("ffmpeg")
+            .args(["-hide_banner","-loglevel","error","-nostdin","-y",
+                "-f","lavfi","-i","sine=frequency=550:sample_rate=48000:duration=1.0",
+                "-c:a","flac","-f","matroska"])
+            .arg(&source).output().unwrap();
+        assert!(fixture.status.success(),"{}",String::from_utf8_lossy(&fixture.stderr));
+        let mut job=super::super::tests::fixture_job(temp.path(),temp.path());
+        job.format=DiscFormat::Matroska;
+        job.source=source;
+        job.file_per_program=true;
+        job.transfer_tags=false;
+        job.programs[0].id=PresentationId::MatroskaStream {
+            stream_index:0,audio_ordinal:1,chapter_count:0,
+        };
+        job.programs[0].source_codec="flac".into();
+        let copy=copy_command(&job,&job.programs[0],&complete,Some(&receipt)).unwrap();
+        let run=Command::new("ffmpeg").args(&copy.args).output().unwrap();
+        assert!(run.status.success(),"{}",String::from_utf8_lossy(&run.stderr));
+        let producer=native_audio_hash_receipt(&receipt).unwrap();
+        let decoded=native_readback_audio_hash(&complete,"pcm_f64le",None,&mut ||Ok(())).unwrap();
+        assert_eq!(producer,decoded,"copied output equals the live decoded source stream");
+        let altered=Command::new("ffmpeg")
+            .args(["-hide_banner","-loglevel","error","-nostdin","-y",
+                "-f","lavfi","-i","sine=frequency=990:sample_rate=48000:duration=1.0",
+                "-c:a","flac"])
+            .arg(&complete).output().unwrap();
+        assert!(altered.status.success());
+        let changed=native_readback_audio_hash(&complete,"pcm_f64le",None,&mut ||Ok(())).unwrap();
+        assert_ne!(producer,changed,"a post-extraction audio mutation must be detected");
+    }
+
+    #[test]
     fn sample_aligned_float64_wav_has_correct_header_and_payload() {
         let temp = tempfile::tempdir().unwrap();
         let raw = temp.path().join("stream.raw");
@@ -905,7 +1029,7 @@ mod tests {
         let wav = temp.path().join("chapter.wav");
         let spec = float64_spec();
         write_pcm_chapter(&raw,&wav,48000,2,0x3,5,7,&spec,&CancellationToken::new(),
-            &CancellationToken::new(),&NativeExtractionControl::default()).unwrap();
+            &CancellationToken::new(),&NativeExtractionControl::default(),false).unwrap();
         let content = fs::read(&wav).unwrap();
         assert_eq!(&content[..4], b"RIFF");
         assert_eq!(&content[8..12], b"WAVE");
@@ -967,32 +1091,32 @@ mod tests {
         program.id = PresentationId::MatroskaStream {
             stream_index: 3, audio_ordinal: 2, chapter_count: 2,
         };
-        let args = copy_command(&job,&program,&temp.path().join("copy.mka")).unwrap().args;
+        let args = copy_command(&job,&program,&temp.path().join("copy.mka"), None).unwrap().args;
         assert!(args.windows(2).any(|words|words == ["-map","0:3"]));
         assert!(args.windows(2).any(|words|words == ["-c:a","copy"]));
         assert!(!args.iter().any(|arg|arg == "-c:v"));
         program.source_codec = "ac3".into();
-        let args = copy_command(&job,&program,&temp.path().join("copy.ac3")).unwrap().args;
+        let args = copy_command(&job,&program,&temp.path().join("copy.ac3"), None).unwrap().args;
         assert!(args.windows(2).any(|words|words==["-f","ac3"]));
         assert!(args.windows(2).any(|words|words==["-map_chapters","-1"]));
         program.source_codec = "mp3".into();
-        let args = copy_command(&job,&program,&temp.path().join("copy.mp3")).unwrap().args;
+        let args = copy_command(&job,&program,&temp.path().join("copy.mp3"), None).unwrap().args;
         assert!(args.windows(2).any(|words|words==["-write_xing","0"]));
         assert!(!args.iter().any(|arg| arg == "-copyts"));
         program.source_codec = "alac".into();
-        let args = copy_command(&job,&program,&temp.path().join("copy.mka")).unwrap().args;
+        let args = copy_command(&job,&program,&temp.path().join("copy.mka"), None).unwrap().args;
         assert!(args.windows(2).any(|words|words==["-f","matroska"]));
         assert!(args.windows(2).any(|words|words==["-map_chapters","0"]));
         assert!(args.windows(2).any(|words|words==["-copyts","-i"]));
         assert!(!args.iter().any(|arg|arg=="-use_editlist"));
         // Only the PCM carrier uses the WAV muxer and automatic RF64.
         program.source_codec = "pcm_s16le".into();
-        let args = copy_command(&job,&program,&temp.path().join("copy.wav")).unwrap().args;
+        let args = copy_command(&job,&program,&temp.path().join("copy.wav"), None).unwrap().args;
         assert!(args.windows(2).any(|words| words == ["-c:a", "copy"]));
         assert!(args.windows(2).any(|words| words == ["-rf64", "auto"]));
         assert!(args.windows(2).any(|words| words == ["-f", "wav"]));
         program.source_codec = "flac".into();
-        let args = copy_command(&job,&program,&temp.path().join("copy.flac")).unwrap().args;
+        let args = copy_command(&job,&program,&temp.path().join("copy.flac"), None).unwrap().args;
         assert!(!args.iter().any(|arg| arg == "-rf64"));
     }
 
@@ -1541,7 +1665,7 @@ mod tests {
             valid_bits:24,sample_bytes:3,floating:false,lossy_codec:Some("aac".into())};
         write_pcm_chapter(&raw,&wav,48_000,1,4,0,1,&spec,
             &CancellationToken::new(),&CancellationToken::new(),
-            &NativeExtractionControl::default()).unwrap();
+            &NativeExtractionControl::default(),false).unwrap();
         let file = fs::read(&wav).unwrap();
         assert_eq!(wave_payload(&file), &[1u8,2,3]);
         assert_eq!(file.last(),Some(&0));
@@ -1819,7 +1943,7 @@ mod tests {
             assert!(!job.cue);
             validate_job(&job).unwrap();
             let cmd = copy_command(&job, &job.programs[0],
-                &temp.path().join("probe-only.mka")).unwrap();
+                &temp.path().join("probe-only.mka"), None).unwrap();
             assert!(cmd.args.windows(2).any(|args| args == ["-copyts", "-i"]));
             assert!(cmd.args.windows(2).any(|args| args[0] == "-bsf:a"
                 && args[1].contains("1500-PTS") && !args[1].contains("STARTPTS+")));
@@ -1877,7 +2001,7 @@ mod tests {
             assert!(!job.cue);
             validate_job(&job).unwrap();
             let arguments = copy_command(&job, &job.programs[0],
-                &temp.path().join("probe-only.mka")).unwrap().args;
+                &temp.path().join("probe-only.mka"), None).unwrap().args;
             assert!(arguments.windows(2).any(|args|
                 args[0] == "-bsf:a" && args[1].contains("NEXT_PTS")),
                 "the per-track Matroska duration must repair ALAC's final packet");
@@ -1959,7 +2083,7 @@ mod tests {
         let mut program = job.programs[0].clone();
         program.id = PresentationId::TransportStream { stream_index: 3, audio_ordinal: 2 };
         program.source_codec = "ac3".into();
-        let args = copy_command(&job, &program, &temp.path().join("stream.ac3")).unwrap().args;
+        let args = copy_command(&job, &program, &temp.path().join("stream.ac3"), None).unwrap().args;
         assert!(args.windows(2).any(|words| words == ["-map", "0:3"]));
         assert!(args.windows(2).any(|words| words == ["-c:a", "copy"]));
         assert!(args.windows(2).any(|words| words == ["-map_chapters", "-1"]));
@@ -1970,11 +2094,11 @@ mod tests {
         assert_eq!(file_stream_copy_format(DiscFormat::TransportFile, "pcm_dvd").extension, "wav");
         program.source_codec = "pcm_dvd".into();
         program.source_depth = Some(16);
-        let args = copy_command(&job, &program, &temp.path().join("stream.wav")).unwrap().args;
+        let args = copy_command(&job, &program, &temp.path().join("stream.wav"), None).unwrap().args;
         assert!(args.windows(2).any(|words| words == ["-c:a", "pcm_s16le"]));
         assert!(args.windows(2).any(|words| words == ["-rf64", "auto"]));
         program.source_depth = None;
-        assert!(copy_command(&job, &program, &temp.path().join("stream.wav")).is_err());
+        assert!(copy_command(&job, &program, &temp.path().join("stream.wav"), None).is_err());
     }
 
     #[tokio::test]
