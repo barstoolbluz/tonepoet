@@ -132,6 +132,8 @@ pub struct BrowseArtworkState {
     // asynchronous gallery scan finishes. A failed explicit file stays chosen.
     failed: HashMap<ArtworkSource, String>,
     viewer_decode_bounds: Option<(u32, u32)>,
+    /// RGB ground used for viewer alpha composition, not Info's cached pixels.
+    viewer_background: Option<[u8; 3]>,
     decode_rx: Option<Receiver<DecodeResult>>,
     decoded_source: Option<ArtworkSource>,
     decoded_embedded_path: Option<PathBuf>,
@@ -186,7 +188,7 @@ impl Default for BrowseArtworkState {
             context: None, generation: 0, scan_generation: 0, decode_generation: 0, changed_at: Instant::now(), scanned: None,
             scan_rx: None, sources: Vec::new(), cursor: 0,
             queued_gallery_offset: 0, failed: HashMap::new(), viewer_decode_bounds: None,
-            decode_rx: None, decoded_source: None, decoded_embedded_path: None, decoded: None,
+            viewer_background: None, decode_rx: None, decoded_source: None, decoded_embedded_path: None, decoded: None,
             preview_cache: None, memory_only_preview_cache: false,
             protocol: None, desired_area: Rect::default(),
             vertical_placement: ImageVerticalPlacement::Center, protocol_area: Rect::default(),
@@ -532,7 +534,8 @@ impl BrowseArtworkState {
     /// This is invoked before/after terminal draws, never within the renderer.
     /// Filesystem traversal and image decoding always run on worker threads.
     pub fn prepare(&mut self, picker: &mut Picker, picker_generation: usize,
-                   kitty_generation: usize, config: &BrowseArtworkConfig) -> bool {
+                   kitty_generation: usize, config: &BrowseArtworkConfig,
+                   background: Color) -> bool {
         // Post-draw preparation asks the event loop for one prompt, non-clearing
         // draw. The second pass paints background cells after the terminal has
         // received its new Sixel/Kitty/iTerm image command.
@@ -546,6 +549,25 @@ impl BrowseArtworkState {
         }
         let mut changed = post_render_repair;
         changed |= self.poll_workers();
+        let viewer_background = self.popup_open.then(|| {
+            let (r, g, b) = super::theme::rgb_tuple(background);
+            [r, g, b]
+        });
+        if self.viewer_background != viewer_background {
+            self.viewer_background = viewer_background;
+            if self.popup_open {
+                // A viewer decoded for the old theme has literal RGB ground
+                // pixels. Invalidate it before placing a protocol with a new
+                // theme, including a decode still running on a worker.
+                self.needs_background_restore = true;
+                self.generation = self.generation.wrapping_add(1);
+                self.decoded = None;
+                self.decoded_source = None;
+                self.decoded_embedded_path = None;
+                self.invalidate_protocol();
+                changed = true;
+            }
+        }
         if self.scan_rx.is_none() && self.scanned != self.context
             && self.context.is_some() && self.changed_at.elapsed() >= SELECTION_SETTLE
         {
@@ -615,7 +637,8 @@ impl BrowseArtworkState {
                                 })
                             }
                         }
-                        _ => decode_source_with_bounds(&source, bounds.0, bounds.1),
+                        _ => decode_source_with_bounds_and_background(
+                            &source, bounds.0, bounds.1, viewer_background),
                         // The viewer decodes only the pixels that can appear
                         // inside the actual terminal's current viewport.
                     };
@@ -1092,6 +1115,12 @@ fn decode_source_with_edge(source: &ArtworkSource, edge: u32) -> Result<DecodedA
 fn decode_source_with_bounds(source: &ArtworkSource, width: u32, height: u32)
     -> Result<DecodedArtwork, String>
 {
+    decode_source_with_bounds_and_background(source, width, height, None)
+}
+
+fn decode_source_with_bounds_and_background(
+    source: &ArtworkSource, width: u32, height: u32, background: Option<[u8; 3]>,
+) -> Result<DecodedArtwork, String> {
     match source {
         ArtworkSource::File(path) => {
             // Check both before and after opening; the source may change while
@@ -1111,7 +1140,7 @@ fn decode_source_with_bounds(source: &ArtworkSource, width: u32, height: u32)
                 return Err("Artwork exceeds 100 MiB encoded-size limit".into());
             }
             Ok(DecodedArtwork {
-                image: Arc::new(decode_image_reader(BufReader::new(file), width, height)?),
+                image: Arc::new(decode_image_reader(BufReader::new(file), width, height, background)?),
                 embedded_path: None, preview_stamps: None, preview_cache_hit: false,
             })
         }
@@ -1124,7 +1153,7 @@ fn decode_source_with_bounds(source: &ArtworkSource, width: u32, height: u32)
                 if !fs::symlink_metadata(path).is_ok_and(|md| md.is_file()) { continue; }
                 let bytes = super::probe::read_embedded_picture_bytes(path, PictureType::CoverFront)
                     .or_else(|_| super::probe::read_embedded_picture_bytes(path, PictureType::Other));
-                match bytes.and_then(|data| decode_image_bytes_with_bounds(data, width, height)) {
+                match bytes.and_then(|data| decode_image_bytes_with_bounds(data, width, height, background)) {
                     Ok(image) => return Ok(DecodedArtwork {
                         image: Arc::new(image), embedded_path: Some(path.clone()),
                         preview_stamps: None, preview_cache_hit: false,
@@ -1137,18 +1166,50 @@ fn decode_source_with_bounds(source: &ArtworkSource, width: u32, height: u32)
     }
 }
 
-fn decode_image_bytes_with_bounds(bytes: Vec<u8>, width: u32, height: u32)
-    -> Result<DynamicImage, String>
-{
+fn decode_image_bytes_with_bounds(
+    bytes: Vec<u8>, width: u32, height: u32, background: Option<[u8; 3]>,
+) -> Result<DynamicImage, String> {
     if bytes.len() as u64 > MAX_ENCODED_IMAGE_BYTES {
         return Err("Artwork exceeds 100 MiB encoded-size limit".into());
     }
-    decode_image_reader(Cursor::new(bytes), width, height)
+    decode_image_reader(Cursor::new(bytes), width, height, background)
 }
 
-fn decode_image_reader<R: std::io::BufRead + Seek>(reader: R, width: u32, height: u32)
-    -> Result<DynamicImage, String>
-{
+/// Composite before downsampling: Sixel does not carry PNG alpha and its
+/// palette quantizer otherwise uses hidden RGB values as visible edge ink.
+/// Opaque images retain their existing decoding and resizing path.
+fn composite_viewer_alpha(image: DynamicImage, background: [u8; 3]) -> DynamicImage {
+    if !image.color().has_alpha() { return image; }
+    // PNG encoders often retain an RGBA channel even for wholly opaque art.
+    // Preserve that image's original pixel format and resizing path.
+    if let DynamicImage::ImageRgba8(pixels) = &image {
+        if pixels.as_raw().chunks_exact(4).all(|pixel| pixel[3] == 255) {
+            return image;
+        }
+    }
+    let rgba = image.into_rgba8();
+    let (width, height) = rgba.dimensions();
+    let mut bytes = rgba.into_raw();
+    // Pack into the same allocation. The RGB write cursor always trails the
+    // next RGBA read; even large originals need no second full-frame buffer.
+    let mut output = 0;
+    for offset in (0..bytes.len()).step_by(4) {
+        let alpha = u32::from(bytes[offset + 3]);
+        for channel in 0..3 {
+            bytes[output + channel] = ((u32::from(bytes[offset + channel]) * alpha
+                + u32::from(background[channel]) * (255 - alpha) + 127) / 255) as u8;
+        }
+        output += 3;
+    }
+    bytes.truncate(output);
+    DynamicImage::ImageRgb8(image::RgbImage::from_raw(width, height, bytes)
+        .expect("valid RGBA geometry yields packed RGB pixels"))
+}
+
+fn decode_image_reader<R: std::io::BufRead + Seek>(
+    reader: R, width: u32, height: u32, background: Option<[u8; 3]>,
+) -> Result<DynamicImage, String> {
+
     let mut reader = ImageReader::new(reader)
         .with_guessed_format().map_err(|e| e.to_string())?;
     let mut limits = Limits::default();
@@ -1157,6 +1218,9 @@ fn decode_image_reader<R: std::io::BufRead + Seek>(reader: R, width: u32, height
     limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
     reader.limits(limits);
     let image = reader.decode().map_err(|e| e.to_string())?;
+    let image = if let Some(ground) = background {
+        composite_viewer_alpha(image, ground)
+    } else { image };
     let (width, height) = (width.max(1), height.max(1));
     if image.width() > width || image.height() > height {
         Ok(image.resize(width, height, image::imageops::FilterType::Triangle))
@@ -1166,6 +1230,62 @@ fn decode_image_reader<R: std::io::BufRead + Seek>(reader: R, width: u32, height
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn viewer_composites_transparent_png_before_resizing_without_white_or_edge_ink() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("transparent.png");
+        let background = [17, 31, 47];
+        let mut pixels = image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 0, 0]));
+        pixels.put_pixel(1, 1, image::Rgba([210, 70, 20, 255]));
+        pixels.put_pixel(2, 1, image::Rgba([210, 70, 20, 128]));
+        DynamicImage::ImageRgba8(pixels).save(&path).unwrap();
+
+        let source = ArtworkSource::File(path);
+        let decoded = decode_source_with_bounds_and_background(&source, 4, 4, Some(background))
+            .expect("PNG with transparent surroundings");
+        let rgb = decoded.image.to_rgb8();
+        assert!(matches!(decoded.image.as_ref(), DynamicImage::ImageRgb8(_)));
+        assert_eq!(rgb.get_pixel(0, 0).0, background, "fully transparent pixel");
+        assert_eq!(rgb.get_pixel(3, 3).0, background, "transparent centre/edge");
+        assert_eq!(rgb.get_pixel(1, 1).0, [210, 70, 20], "opaque artwork");
+        assert_eq!(rgb.get_pixel(2, 1).0, [114, 51, 33], "half-alpha edge");
+
+        let smaller = decode_source_with_bounds_and_background(&source, 2, 2, Some(background))
+            .expect("downsample pre-composited artwork");
+        assert_eq!((smaller.image.width(), smaller.image.height()), (2, 2));
+        assert!(matches!(smaller.image.as_ref(), DynamicImage::ImageRgb8(_)));
+    }
+
+    #[test]
+    fn viewer_background_change_invalidates_precomposited_pixels() {
+        let mut state = BrowseArtworkState::default();
+        let mut picker = Picker::new((8, 12));
+        state.popup_open = true;
+        state.viewer_background = Some([10, 20, 30]);
+        state.decoded = Some(Arc::new(DynamicImage::new_rgb8(4, 4)));
+        let before = state.generation;
+        assert!(state.prepare(&mut picker, 1, 0,
+            &BrowseArtworkConfig::default(), Color::Rgb(35, 45, 55)));
+        assert!(state.decoded.is_none());
+        assert_ne!(state.generation, before);
+        assert_eq!(state.viewer_background, Some([35, 45, 55]));
+    }
+
+    #[test]
+    fn opaque_viewer_inputs_preserve_existing_format_and_pixel_values() {
+        let input = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            2, 2, image::Rgb([150, 40, 10])));
+        let output = composite_viewer_alpha(input.clone(), [12, 23, 34]);
+        assert!(matches!(output, DynamicImage::ImageRgb8(_)));
+        assert_eq!(input.as_bytes(), output.as_bytes());
+
+        let opaque_rgba = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2, 2, image::Rgba([150, 40, 10, 255])));
+        let output = composite_viewer_alpha(opaque_rgba.clone(), [12, 23, 34]);
+        assert!(matches!(output, DynamicImage::ImageRgba8(_)));
+        assert_eq!(opaque_rgba.as_bytes(), output.as_bytes());
+    }
 
     #[test]
     fn test_app_constructors_keep_implicit_artwork_cache_in_memory() {
@@ -1374,17 +1494,17 @@ mod tests {
         let config = BrowseArtworkConfig::default();
         let background = Color::Rgb(26, 27, 38);
 
-        assert!(artwork.prepare(&mut picker, 0, 0, &config));
+        assert!(artwork.prepare(&mut picker, 0, 0, &config, Color::Rgb(0, 0, 0)));
         assert!(artwork.take_background_restore(), "first native placement must repaint");
         let first = artwork.background_restore_count();
         let first_ink = background_repaint_ink(background, first);
         assert!(!artwork.take_background_restore(), "restoration is consumed once");
-        assert!(!artwork.prepare(&mut picker, 0, 0, &config),
+        assert!(!artwork.prepare(&mut picker, 0, 0, &config, Color::Rgb(0, 0, 0)),
             "unchanged artwork must not rebuild on unrelated Browse redraws");
         assert!(!artwork.take_background_restore(),
             "unrelated redraws must not repaint thousands of blank cells");
 
-        assert!(artwork.prepare(&mut picker, 0, 1, &config),
+        assert!(artwork.prepare(&mut picker, 0, 1, &config, Color::Rgb(0, 0, 0)),
             "an explicit Kitty retransmit must rebuild its protocol");
         assert!(artwork.take_background_restore());
         let second = artwork.background_restore_count();
@@ -1429,11 +1549,11 @@ mod tests {
             state.set_desired_area(viewport, placement);
             let mut picker = Picker::new((8, 12));
             picker.protocol_type = protocol_type;
-            assert!(state.prepare(&mut picker, 0, 0, &config));
+            assert!(state.prepare(&mut picker, 0, 0, &config, Color::Rgb(0, 0, 0)));
             assert!(state.native_placement_awaiting_render);
             // Preparing alone must not schedule a second render. The native
             // protocol might be suppressed by an overlay or zero-size area.
-            assert!(!state.prepare(&mut picker, 0, 0, &config));
+            assert!(!state.prepare(&mut picker, 0, 0, &config, Color::Rgb(0, 0, 0)));
             assert!(state.needs_background_restore);
 
             let mut terminal = Terminal::new(TestBackend::new(64, 32)).unwrap();
@@ -1465,7 +1585,7 @@ mod tests {
             // the first pass. The post-draw prepare must request another frame
             // without invalidating/re-encoding the image protocol.
             let prepared_before = state.protocol_area;
-            assert!(state.prepare(&mut picker, 0, 0, &config));
+            assert!(state.prepare(&mut picker, 0, 0, &config, Color::Rgb(0, 0, 0)));
             assert_eq!(state.protocol_area, prepared_before);
             assert!(!state.post_native_repaint_redraw);
             assert!(state.needs_background_restore,
@@ -1515,7 +1635,7 @@ mod tests {
             assert!(first.diff(&second).iter().any(|(x, y, _)|
                 (*x, *y) == empty_cell),
                 "post-image repair must force a terminal write to the blank region");
-            assert!(!state.prepare(&mut picker, 0, 0, &config));
+            assert!(!state.prepare(&mut picker, 0, 0, &config, Color::Rgb(0, 0, 0)));
             assert!(!state.take_background_restore(),
                 "an unchanged image must not flood subsequent Browse redraws");
             terminal.draw(|frame| {
@@ -1545,7 +1665,7 @@ mod tests {
         let mut picker = Picker::new((8, 12));
         picker.protocol_type = ProtocolType::Sixel;
         let config = BrowseArtworkConfig::default();
-        assert!(state.prepare(&mut picker, 0, 0, &config));
+        assert!(state.prepare(&mut picker, 0, 0, &config, Color::Rgb(0, 0, 0)));
         assert!(state.take_background_restore());
         let mut terminal = Terminal::new(TestBackend::new(40, 25)).unwrap();
         terminal.draw(|frame| {
@@ -1579,7 +1699,7 @@ mod tests {
         let mut picker = Picker::new((8, 12));
         picker.protocol_type = ProtocolType::Kitty;
         let config = BrowseArtworkConfig::default();
-        assert!(state.prepare(&mut picker, 0, 0, &config));
+        assert!(state.prepare(&mut picker, 0, 0, &config, Color::Rgb(0, 0, 0)));
         let mut terminal = Terminal::new(TestBackend::new(40, 25)).unwrap();
         terminal.draw(|frame| {
             assert!(state.render_image(frame, area, config.allow_upscale,
@@ -1596,7 +1716,7 @@ mod tests {
         assert!(!state.native_placement_awaiting_render);
         assert!(!state.has_image());
         assert!(state.take_background_restore());
-        assert!(!state.prepare(&mut picker, 0, 0, &config));
+        assert!(!state.prepare(&mut picker, 0, 0, &config, Color::Rgb(0, 0, 0)));
         assert!(!state.take_background_restore());
     }
 
@@ -1616,7 +1736,7 @@ mod tests {
         state.scanned = state.context.clone(); // Suppress filesystem workers.
         state.decoded = Some(Arc::new(DynamicImage::new_rgb8(32, 24)));
         state.set_desired_area(area, ImageVerticalPlacement::Bottom);
-        assert!(state.prepare(&mut picker, 0, 0, &config));
+        assert!(state.prepare(&mut picker, 0, 0, &config, Color::Rgb(0, 0, 0)));
         let mut terminal = Terminal::new(TestBackend::new(40, 25)).unwrap();
         terminal.draw(|frame| {
             assert!(state.render_image(frame, area, config.allow_upscale,
@@ -1635,16 +1755,16 @@ mod tests {
         assert!(state.needs_background_restore);
         state.decoded = Some(Arc::new(DynamicImage::new_rgb8(40, 30)));
         state.set_desired_area(area, ImageVerticalPlacement::Bottom);
-        assert!(state.prepare(&mut picker, 0, 0, &config));
+        assert!(state.prepare(&mut picker, 0, 0, &config, Color::Rgb(0, 0, 0)));
         terminal.draw(|frame| {
             assert!(state.render_image(frame, area, config.allow_upscale,
                 ImageVerticalPlacement::Bottom, Color::Rgb(26, 27, 38)));
             assert!(state.take_background_restore());
         }).unwrap();
         assert!(state.post_native_repaint_redraw);
-        assert!(state.prepare(&mut picker, 0, 0, &config));
+        assert!(state.prepare(&mut picker, 0, 0, &config, Color::Rgb(0, 0, 0)));
         assert!(state.take_background_restore());
-        assert!(!state.prepare(&mut picker, 0, 0, &config),
+        assert!(!state.prepare(&mut picker, 0, 0, &config, Color::Rgb(0, 0, 0)),
             "unchanged replacement artwork must not schedule a third upload or repaint");
     }
 
@@ -1660,7 +1780,7 @@ mod tests {
         let mut picker = Picker::new((8, 12));
         picker.protocol_type = ProtocolType::Halfblocks;
         let config = BrowseArtworkConfig::default();
-        assert!(state.prepare(&mut picker, 0, 0, &config));
+        assert!(state.prepare(&mut picker, 0, 0, &config, Color::Rgb(0, 0, 0)));
         assert!(!state.native_placement_awaiting_render);
         assert!(!state.take_background_restore());
         let mut terminal = Terminal::new(TestBackend::new(40, 25)).unwrap();
@@ -1669,7 +1789,7 @@ mod tests {
                 ImageVerticalPlacement::Center, Color::Rgb(26, 27, 38)));
         }).unwrap();
         assert!(!state.post_native_repaint_redraw);
-        assert!(!state.prepare(&mut picker, 0, 0, &config));
+        assert!(!state.prepare(&mut picker, 0, 0, &config, Color::Rgb(0, 0, 0)));
         assert!(!state.take_background_restore());
     }
 
@@ -1687,7 +1807,7 @@ mod tests {
         picker.protocol_type = ProtocolType::Sixel;
         let config = BrowseArtworkConfig::default();
         state.set_desired_area(viewport, ImageVerticalPlacement::Center);
-        assert!(state.prepare(&mut picker, 0, 0, &config));
+        assert!(state.prepare(&mut picker, 0, 0, &config, Color::Rgb(0, 0, 0)));
         let mut terminal = Terminal::new(TestBackend::new(60, 30)).unwrap();
         terminal.draw(|frame| {
             assert!(state.render_image(frame, viewport, config.allow_upscale,
@@ -1716,7 +1836,7 @@ mod tests {
         assert!(state.repaint_image_after_menu,
             "replacement before redraw must preserve the pending restoration");
         assert!(state.protocol.is_none());
-        assert!(state.prepare(&mut picker, 0, 0, &config));
+        assert!(state.prepare(&mut picker, 0, 0, &config, Color::Rgb(0, 0, 0)));
         terminal.draw(|frame| {
             assert!(state.render_image(frame, viewport, config.allow_upscale,
                 ImageVerticalPlacement::Center, background));
@@ -1743,7 +1863,7 @@ mod tests {
         state.artwork_menu_opened();
         state.artwork_menu_finished(true);
         state.artwork_menu_opened();
-        assert!(state.prepare(&mut picker, 0, 0, &config));
+        assert!(state.prepare(&mut picker, 0, 0, &config, Color::Rgb(0, 0, 0)));
         terminal.draw(|frame| {
             assert!(state.render_image(frame, viewport, config.allow_upscale,
                 ImageVerticalPlacement::Center, background));
@@ -1756,7 +1876,7 @@ mod tests {
         assert!(state.repaint_image_after_menu,
             "dismissing the replacement menu must request another restoration");
         assert!(state.protocol.is_none());
-        assert!(state.prepare(&mut picker, 0, 0, &config));
+        assert!(state.prepare(&mut picker, 0, 0, &config, Color::Rgb(0, 0, 0)));
         terminal.draw(|frame| {
             assert!(state.render_image(frame, viewport, config.allow_upscale,
                 ImageVerticalPlacement::Center, background));
@@ -1776,7 +1896,7 @@ mod tests {
         // terminal protocol changes (for example on entering tmux).
         picker.protocol_type = ProtocolType::Halfblocks;
         state.invalidate_protocol();
-        assert!(state.prepare(&mut picker, 1, 0, &config));
+        assert!(state.prepare(&mut picker, 1, 0, &config, Color::Rgb(0, 0, 0)));
         assert_eq!(state.native_image_restore_count, 0);
         terminal.draw(|frame| {
             assert!(state.render_image(frame, viewport, config.allow_upscale,
@@ -1815,7 +1935,7 @@ mod tests {
         picker.protocol_type = ProtocolType::Sixel;
         let config = BrowseArtworkConfig::default();
         state.set_desired_area(viewport, ImageVerticalPlacement::Center);
-        assert!(state.prepare(&mut picker, 0, 0, &config));
+        assert!(state.prepare(&mut picker, 0, 0, &config, Color::Rgb(0, 0, 0)));
         let origin = (state.protocol_area.x, state.protocol_area.y);
         let mut terminal = Terminal::new(TestBackend::new(60, 30)).unwrap();
         terminal.draw(|frame| {
@@ -1834,7 +1954,7 @@ mod tests {
         assert!(state.take_background_restore(),
             "dismissal of a menu opened before decode must schedule restoration");
         assert!(!state.take_background_restore());
-        assert!(state.prepare(&mut picker, 0, 0, &config));
+        assert!(state.prepare(&mut picker, 0, 0, &config, Color::Rgb(0, 0, 0)));
         terminal.draw(|frame| {
             assert!(state.render_image(frame, viewport, config.allow_upscale,
                 ImageVerticalPlacement::Center, background));
@@ -2040,7 +2160,7 @@ mod tests {
         let mut picker = Picker::new((12, 24));
         let deadline = Instant::now() + Duration::from_secs(5);
         while !state.has_image() && Instant::now() < deadline {
-            state.prepare(&mut picker, 0, 0, &BrowseArtworkConfig::default());
+            state.prepare(&mut picker, 0, 0, &BrowseArtworkConfig::default(), Color::Rgb(0, 0, 0));
             thread::sleep(Duration::from_millis(5));
         }
         assert!(state.has_image(), "direct image should decode in a bounded worker");
@@ -2101,7 +2221,7 @@ mod tests {
         let mut load = |state: &mut BrowseArtworkState| {
             let deadline = Instant::now() + Duration::from_secs(5);
             while !state.has_image() && Instant::now() < deadline {
-                state.prepare(&mut picker, 0, 0, &BrowseArtworkConfig::default());
+                state.prepare(&mut picker, 0, 0, &BrowseArtworkConfig::default(), Color::Rgb(0, 0, 0));
                 thread::sleep(Duration::from_millis(5));
             }
             assert!(state.has_image(), "decode worker did not complete");
@@ -2282,7 +2402,7 @@ mod tests {
         let mut picker = Picker::new((12, 24));
         let deadline = Instant::now() + Duration::from_secs(5);
         while (state.count() != 3 || !state.has_image()) && Instant::now() < deadline {
-            state.prepare(&mut picker, 0, 0, &BrowseArtworkConfig::default());
+            state.prepare(&mut picker, 0, 0, &BrowseArtworkConfig::default(), Color::Rgb(0, 0, 0));
             thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(state.count(), 3, "only direct supported images are cycled");
@@ -2514,7 +2634,7 @@ mod tests {
         let mut picker = Picker::new((8, 12));
         picker.protocol_type = ProtocolType::Kitty;
         let config = BrowseArtworkConfig::default();
-        assert!(state.prepare(&mut picker, 0, 0, &config));
+        assert!(state.prepare(&mut picker, 0, 0, &config, Color::Rgb(0, 0, 0)));
         let mut terminal = Terminal::new(TestBackend::new(80, 32)).unwrap();
         let draw = |frame: &mut ratatui::Frame, artwork: &mut BrowseArtworkState| {
             assert!(artwork.render_image(frame, viewport, config.allow_upscale,

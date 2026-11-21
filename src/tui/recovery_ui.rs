@@ -307,160 +307,16 @@ impl RecoveryEntry {
         !self.resume_committed && !self.discard_committed
     }
 
-}
-
-/// Component-keyed claims avoid treating sibling paths (e.g. `album` and
-/// `album-old`) as overlapping. Construct once per durable-record refresh:
-/// Browse can then query only the rows it paints, without filesystem calls or
-/// scanning every claim for each entry.
-#[derive(Debug, Clone, Copy, Default)]
-struct BrowseClaimOwners {
-    exact: Option<usize>,
-    subtree: Option<usize>,
-}
-
-/// The durable claims already carry their admission scope. A claim on one
-/// file does not lock its siblings, and an exact directory claim does not
-/// lock every file below that directory.
-#[derive(Debug, Clone, Default)]
-struct BrowseLockIndex {
-    claims: BTreeMap<PathBuf, BrowseClaimOwners>,
-}
-
-impl BrowseLockIndex {
-    fn from_entries(entries: &[RecoveryEntry]) -> Self {
-        let mut claims: BTreeMap<PathBuf, BrowseClaimOwners> = BTreeMap::new();
-        // When jobs claim the same path, prefer the older job, consistent
-        // with Finish's existing shared-folder ordering.
-        let mut oldest_first: Vec<usize> = (0..entries.len()).collect();
-        oldest_first.sort_by(|&a, &b| {
-            entries[a].record.as_ref().map_or(0, |r| r.created_unix_ms)
-                .cmp(&entries[b].record.as_ref().map_or(0, |r| r.created_unix_ms))
-                .then_with(|| entries[a].journal_path.cmp(&entries[b].journal_path))
-        });
-        for index in oldest_first {
-            let entry = &entries[index];
-            // Completed extraction receipts retain their journals, not their
-            // claims. An Unreadable completion is different: lease retirement
-            // may have failed, so use only a still-published, verified lease.
-            let completed_native = !entry.is_live()
-                && entry.is_completed_clean()
-                && entry.record.as_ref().is_some_and(DurableFileTaskRecord::is_native_extraction);
-            if completed_native && !entry.is_unreadable() {
-                continue;
-            }
-            let verified_claims = if completed_native {
-                unretired_completed_native_claims(entry)
-            } else if entry.record.is_none() {
-                unreadable_journal_claims(entry)
-            } else {
-                Vec::new()
-            };
-            let path_claims = if completed_native {
-                verified_claims.as_slice()
-            } else {
-                entry.record.as_ref().map_or(
-                    verified_claims.as_slice(), |record| record.path_claims.as_slice())
-            };
-            for claim in path_claims {
-                // Admission retains both namespace and resolved I/O paths.
-                // Browse must agree regardless of how a parent was reached;
-                // its final component remains the named directory entry.
-                for path in [&claim.identity.original, &claim.identity.namespace_path,
-                    &claim.identity.resolved_io_path]
-                {
-                    if path.as_os_str().is_empty() { continue; }
-                    let owners = claims.entry(path.clone()).or_default();
-                    owners.exact.get_or_insert(index);
-                    if claim.scope == crate::concurrency::ClaimScope::Subtree {
-                        owners.subtree.get_or_insert(index);
-                    }
-                }
-                // Mutating a traversed symlink would rebind the admitted
-                // pathname, so the lease also owns that namespace object.
-                for path in &claim.identity.namespace_dependencies {
-                    claims.entry(path.clone()).or_default().exact.get_or_insert(index);
-                }
-            }
-        }
-        Self { claims }
+    /// A live worker, even a stalled one, is running rather than interrupted.
+    fn needs_review(&self) -> bool {
+        !self.is_live() && self.needs_attention()
     }
 
-    fn owner(&self, path: &Path) -> Option<usize> {
-        // Ancestors only lock children when admitted as Subtree claims.
-        // Path::ancestors borrows slices, so visible-row queries allocate
-        // nothing and never touch the filesystem.
-        for ancestor in path.ancestors() {
-            if let Some(owners) = self.claims.get(ancestor) {
-                let owner = if ancestor == path { owners.exact } else { owners.subtree };
-                if owner.is_some() { return owner; }
-            }
-        }
-        // A directory also cannot be renamed or deleted while one of its
-        // descendants is claimed, even if that claim has Exact scope.
-        self.claims.range(path.to_path_buf()..).next()
-            .filter(|(claimed, _)| claimed.starts_with(path))
-            .and_then(|(_, owners)| owners.exact)
-    }
-
-    fn owner_for_browse_path(
-        &self,
-        path: &Path,
-        browse_directory: &Path,
-        resolved_directory: Option<&Path>,
-    ) -> Option<usize> {
-        self.owner(path).or_else(|| {
-            // Recursive-search hits can be many levels below the current
-            // directory. Keep the *entire* relative suffix when translating
-            // a scanned directory alias, not just the hit's last component.
-            let relative = path.strip_prefix(browse_directory).ok()?;
-            if relative.as_os_str().is_empty() { return None; }
-            let resolved = resolved_directory?.join(relative);
-            (resolved != path).then(|| self.owner(&resolved)).flatten()
-        })
-    }
-}
-
-/// A damaged journal has no usable record, but its UUID can still identify a
-/// valid durable JournalOperation lease. Read its claims once at inventory
-/// refresh, never while drawing Browse. Unverified descriptors prove nothing.
-fn unreadable_journal_claims(entry: &RecoveryEntry) -> Vec<crate::concurrency::PathClaim> {
-    if entry.availability != RecoverySurfaceAvailability::Unreadable
-        || entry.record.is_some()
-        || entry.journal_path.extension().and_then(|ext| ext.to_str()) != Some("jsonl")
-        || entry.journal_path.parent()
-            != Some(super::file_task_runtime::file_task_journal_dir().as_path())
-    {
-        return Vec::new();
-    }
-    let Some(job_id) = entry.journal_path.file_stem().and_then(|stem| stem.to_str())
-        .and_then(|stem| uuid::Uuid::parse_str(stem).ok()) else {
-        return Vec::new();
-    };
-    let family = crate::concurrency::LeaseFamily::JournalOperation { job_id };
-    let Some(descriptor) = crate::concurrency::find_family_descriptor(&family).ok().flatten() else {
-        return Vec::new();
-    };
-    crate::concurrency::verified_descriptor_claims(&descriptor, &family).unwrap_or_default()
-}
-
-/// A completed native journal may be unreadable because releasing its
-/// reservation failed. Verify that exact retained descriptor before showing
-/// any lock. If it is absent or untrusted, the completion proves no claim.
-fn unretired_completed_native_claims(entry: &RecoveryEntry) -> Vec<crate::concurrency::PathClaim> {
-    let Some(record) = entry.record.as_ref() else { return Vec::new(); };
-    let Ok(job_id) = uuid::Uuid::parse_str(&record.job_id) else { return Vec::new(); };
-    let family = crate::concurrency::LeaseFamily::JournalOperation { job_id };
-    let descriptor = record.lease_descriptor.clone()
-        .or_else(|| crate::concurrency::find_family_descriptor(&family).ok().flatten());
-    let Some(descriptor) = descriptor else { return Vec::new(); };
-    crate::concurrency::verified_descriptor_claims(&descriptor, &family).unwrap_or_default()
 }
 
 #[derive(Debug, Clone)]
 pub struct RecoveryUiState {
     pub entries: Vec<RecoveryEntry>,
-    browse_lock_index: BrowseLockIndex,
     pub selected: usize,
     pub list_scroll: usize,
     pub surface: RecoverySurface,
@@ -490,7 +346,6 @@ impl Default for RecoveryUiState {
     fn default() -> Self {
         Self {
             entries: Vec::new(),
-            browse_lock_index: BrowseLockIndex::default(),
             selected: 0,
             list_scroll: 0,
             surface: RecoverySurface::Window,
@@ -517,7 +372,7 @@ impl RecoveryUiState {
     pub fn from_records(records: Vec<RecoverySurfaceRecord>, queued: &VecDeque<QueuedFileTransfer>) -> Self {
         let mut state = Self::default();
         state.replace_records(records, queued);
-        state.prompt_pending = state.entries.iter().any(RecoveryEntry::needs_attention);
+        state.prompt_pending = state.entries.iter().any(RecoveryEntry::needs_review);
         state
     }
 
@@ -559,7 +414,6 @@ impl RecoveryUiState {
                     .cmp(&a.record.as_ref().map_or(0, |r| r.created_unix_ms)))
                 .then_with(|| a.journal_path.cmp(&b.journal_path))
         });
-        self.browse_lock_index = BrowseLockIndex::from_entries(&self.entries);
         self.selected = selected_path
             .as_ref()
             .and_then(|path| {
@@ -582,7 +436,7 @@ impl RecoveryUiState {
             .collect::<BTreeSet<_>>();
         self.incomplete_sizes
             .retain(|path, _| current_incomplete.contains(path));
-        if !self.entries.iter().any(RecoveryEntry::needs_attention) && !self.prompt_shown {
+        if !self.entries.iter().any(RecoveryEntry::needs_review) && !self.prompt_shown {
             // The startup set was resolved by another process before the
             // prompt could be shown. Do not let a later unrelated recovery
             // resurrect a stale "session-start" prompt.
@@ -592,35 +446,6 @@ impl RecoveryUiState {
 
     fn selected_entry(&self) -> Option<&RecoveryEntry> {
         self.entries.get(self.selected)
-    }
-
-    /// All cached claims, including verified unreadable-journal leases, can
-    /// decorate Browse. A resolved directory alias is provided by the scan,
-    /// not looked up here or during painting.
-    pub(super) fn locked_browse_entry(
-        &self,
-        path: &Path,
-        browse_directory: &Path,
-        resolved_directory: Option<&Path>,
-    ) -> Option<&RecoveryEntry> {
-        self.browse_lock_index.owner_for_browse_path(path, browse_directory, resolved_directory)
-            .and_then(|index| self.entries.get(index))
-    }
-
-    fn open_browse_entry(
-        &mut self,
-        path: &Path,
-        browse_directory: &Path,
-        resolved_directory: Option<&Path>,
-    ) -> bool {
-        let Some(owner) = self.browse_lock_index.owner_for_browse_path(
-            path, browse_directory, resolved_directory) else {
-            return false;
-        };
-        self.selected = owner;
-        self.open_window();
-        self.small_job_tab = false;
-        true
     }
 
     fn consume_startup_prompt(&mut self) {
@@ -678,6 +503,14 @@ impl RecoveryUiState {
 
     pub(super) fn needs_attention_count(&self) -> usize {
         self.entries.iter().filter(|entry| entry.needs_attention()).count()
+    }
+
+    pub(super) fn review_count(&self) -> usize {
+        self.entries.iter().filter(|entry| entry.needs_review()).count()
+    }
+
+    pub(super) fn running_count(&self) -> usize {
+        self.entries.iter().filter(|entry| entry.is_live()).count()
     }
 
     fn open_refusal(&mut self, attempted: &Path) -> bool {
@@ -1226,19 +1059,6 @@ pub fn open_recovery_window(app: &mut AppState) {
     refresh_from_runtime(app);
     app.recovery_ui.open_window();
     app.recovery_ui.small_job_tab = false;
-    app.active_overlay = ActiveOverlay::FileRecovery;
-}
-
-/// Open directly on the current owner of a Browse path. Resolve the claim
-/// again after refreshing so a completed job can never be opened from a stale
-/// rendered pill or a reused list-row position.
-pub fn open_recovery_window_for_browse_path(app: &mut AppState, path: &Path) {
-    refresh_from_runtime(app);
-    let resolved_dir = app.browse.resolved_current_directory();
-    if !app.recovery_ui.open_browse_entry(path, &app.browse.current_dir, resolved_dir) {
-        app.set_status("This entry is no longer locked by an interrupted job");
-        return;
-    }
     app.active_overlay = ActiveOverlay::FileRecovery;
 }
 
@@ -1862,456 +1682,6 @@ mod tests {
         }
     }
 
-    fn entry_with_claim(
-        mut entry: RecoveryEntry,
-        path: &Path,
-        scope: crate::concurrency::ClaimScope,
-    ) -> RecoveryEntry {
-        use crate::concurrency::{ClaimMode, PathClaim};
-        let claim = PathClaim::resolve(path, ClaimMode::Write, scope)
-            .expect("test path should admit a durable path claim");
-        entry.record.as_mut().expect("readable test record")
-            .path_claims.push(claim);
-        entry
-    }
-
-    #[test]
-    fn browse_lock_index_distinguishes_exact_files_subtrees_and_siblings() {
-        use crate::concurrency::ClaimScope;
-        let tmp = tempfile::tempdir().unwrap();
-        let album = tmp.path().join("album");
-        std::fs::create_dir_all(&album).unwrap();
-        let track = album.join("track.flac");
-        let sibling = album.join("other.flac");
-        std::fs::write(&track, b"test").unwrap();
-        std::fs::write(&sibling, b"test").unwrap();
-        let exact = entry_with_claim(test_entry("track", "out/track", false, None),
-            &track, ClaimScope::Exact);
-        let exact_only = BrowseLockIndex::from_entries(&[exact]);
-        assert_eq!(exact_only.owner(&track), Some(0));
-        assert_eq!(exact_only.owner(&album), Some(0),
-            "a directory cannot be moved with a claimed child");
-        assert_eq!(exact_only.owner(&sibling), None,
-            "an exact claim does not cover a sibling");
-        assert_eq!(exact_only.owner(&album.join("track.flac.bak")), None,
-            "name prefixes are not pathname components");
-        assert_eq!(exact_only.owner(&tmp.path().join("album-old")), None);
-        assert_eq!(exact_only.owner(&track.join("deeper")), None,
-            "an exact claim never expands into a subtree");
-
-        let subtree = entry_with_claim(test_entry("album", "out/album", true, None),
-            &album, ClaimScope::Subtree);
-        let subtree_only = BrowseLockIndex::from_entries(&[subtree]);
-        assert_eq!(subtree_only.owner(&track), Some(0));
-        assert_eq!(subtree_only.owner(&sibling), Some(0));
-        assert_eq!(subtree_only.owner(tmp.path()), Some(0));
-        assert_eq!(subtree_only.owner(&tmp.path().join("album-old")), None);
-    }
-
-    #[test]
-    fn browse_lock_index_uses_durable_claims_and_clears_after_resolution() {
-        use crate::concurrency::ClaimScope;
-        let tmp = tempfile::tempdir().unwrap();
-        let album = tmp.path().join("album");
-        std::fs::create_dir_all(&album).unwrap();
-        let mut older = entry_with_claim(
-            test_entry("older", "out/a", true, None), &album, ClaimScope::Subtree);
-        older.record.as_mut().unwrap().created_unix_ms = 1;
-        let mut newer = entry_with_claim(
-            test_entry("newer", "out/b", true, None), &album, ClaimScope::Subtree);
-        newer.record.as_mut().unwrap().created_unix_ms = 2;
-        let entries = [newer, older].into_iter().map(|entry| RecoverySurfaceRecord {
-            journal_path: entry.journal_path,
-            record: entry.record,
-            version: entry.version,
-            availability: entry.availability,
-            diagnostic: None,
-        }).collect::<Vec<_>>();
-        let mut state = RecoveryUiState::from_records(entries, &VecDeque::new());
-        assert_eq!(state.locked_browse_entry(&album, &album, None).unwrap().journal_path,
-            PathBuf::from("recovery/older.jsonl"),
-            "the oldest of two claimed jobs should be shown first");
-        state.replace_records(Vec::new(), &VecDeque::new());
-        assert!(state.locked_browse_entry(&album, &album, None).is_none(),
-            "resolved records must immediately disappear from Browse's index");
-        state.replace_records(vec![RecoverySurfaceRecord {
-            journal_path: PathBuf::from("recovery/unreadable.jsonl"),
-            record: None,
-            version: None,
-            availability: RecoverySurfaceAvailability::Unreadable,
-            diagnostic: Some("unreadable".into()),
-        }], &VecDeque::new());
-        assert!(state.locked_browse_entry(&album, &album, None).is_none(),
-            "an unreadable record without a verified lease cannot identify locked paths");
-    }
-
-    #[test]
-    fn completed_native_receipt_is_dismissable_without_browse_claims() {
-        use crate::concurrency::ClaimScope;
-        let tmp = tempfile::tempdir().unwrap();
-        let output = tmp.path().join("track.flac");
-        std::fs::write(&output, b"audio").unwrap();
-        let mut completed = entry_with_claim(
-            test_entry("finished-extraction", "out/track", false, None),
-            &output, ClaimScope::Exact);
-        let record = completed.record.as_mut().unwrap();
-        record.job = serde_json::json!({"native_extraction": {}});
-        record.lifecycle = DurableFileTaskLifecycle::Completed;
-        assert!(completed.can_dismiss(), "a retained completed journal still offers Dismiss");
-        assert_eq!(BrowseLockIndex::from_entries(&[completed.clone()]).owner(&output), None,
-            "a retired native reservation must not decorate Browse");
-
-        let mut unreadable_completion = completed.clone();
-        unreadable_completion.availability = RecoverySurfaceAvailability::Unreadable;
-        assert_eq!(BrowseLockIndex::from_entries(&[unreadable_completion]).owner(&output), None,
-            "a non-live clean completion cannot prove a retained reservation");
-
-        let mut finishing = completed.clone();
-        finishing.availability = RecoverySurfaceAvailability::Live;
-        assert_eq!(BrowseLockIndex::from_entries(&[finishing]).owner(&output), Some(0),
-            "a live completion has not yet released its claim");
-
-        let mut interrupted = completed;
-        interrupted.record.as_mut().unwrap().lifecycle = DurableFileTaskLifecycle::AwaitingReconciliation;
-        assert!(!interrupted.can_dismiss());
-        assert_eq!(BrowseLockIndex::from_entries(&[interrupted]).owner(&output), Some(0),
-            "an interrupted extraction still reserves its output");
-    }
-
-    #[test]
-    fn unreadable_completed_extraction_keeps_verified_unretired_reservations() {
-        use crate::concurrency::{ClaimMode, ClaimScope, LeaseFamily, PathClaim, PersistentLease};
-        let _isolated = crate::concurrency::isolated_test_coordination_root();
-        let tmp = tempfile::tempdir().unwrap();
-        let claimed = tmp.path().join("output.flac");
-        let unrelated = tmp.path().join("other.flac");
-        std::fs::write(&claimed, b"audio").unwrap();
-        std::fs::write(&unrelated, b"audio").unwrap();
-
-        let id = uuid::Uuid::new_v4();
-        let family = LeaseFamily::JournalOperation { job_id: id };
-        let lease = PersistentLease::create(family.clone(),
-            &[PathClaim::resolve(&claimed, ClaimMode::Write, ClaimScope::Exact).unwrap()]).unwrap();
-        let descriptor = lease.descriptor_path().to_path_buf();
-        let mut entry = entry_with_claim(test_entry("finished", "out/output", false, None),
-            &claimed, ClaimScope::Exact);
-        let record = entry.record.as_mut().unwrap();
-        record.job = serde_json::json!({"native_extraction": {}});
-        record.job_id = id.to_string();
-        record.lease_descriptor = Some(descriptor.clone());
-        record.lifecycle = DurableFileTaskLifecycle::Completed;
-
-        // The journal is clean, but retirement failed. Recovery reports an
-        // unreadable entry with the record still intact and the lease intact.
-        entry.availability = RecoverySurfaceAvailability::Unreadable;
-        let index = BrowseLockIndex::from_entries(&[entry.clone()]);
-        assert_eq!(index.owner(&claimed), Some(0));
-        assert_eq!(index.owner(&unrelated), None);
-
-        // The ordinary completed inspection receipt is never itself proof
-        // of a reservation; it remains available for Dismiss instead.
-        entry.availability = RecoverySurfaceAvailability::Recoverable;
-        assert!(entry.can_dismiss());
-        assert_eq!(BrowseLockIndex::from_entries(&[entry.clone()]).owner(&claimed), None);
-
-        // Once the live owner exits, a published durable descriptor remains
-        // RecoveryReserved until successful retirement.
-        entry.availability = RecoverySurfaceAvailability::Unreadable;
-        drop(lease);
-        assert_eq!(BrowseLockIndex::from_entries(&[entry.clone()]).owner(&claimed), Some(0));
-        crate::concurrency::retire_descriptor_after_lifecycle_release(&descriptor, &family).unwrap();
-        assert_eq!(BrowseLockIndex::from_entries(&[entry.clone()]).owner(&claimed), None);
-        assert!(entry.record.is_some(), "lease retirement must not remove the inspection receipt");
-
-        // A missing or wrong-family descriptor must not restore stale claims.
-        let other_id = uuid::Uuid::new_v4();
-        let wrong_family = LeaseFamily::JournalOperation { job_id: other_id };
-        let wrong_lease = PersistentLease::create(wrong_family,
-            &[PathClaim::resolve(&unrelated, ClaimMode::Write, ClaimScope::Exact).unwrap()]).unwrap();
-        entry.record.as_mut().unwrap().lease_descriptor = Some(wrong_lease.descriptor_path().to_path_buf());
-        assert_eq!(BrowseLockIndex::from_entries(&[entry]).owner(&unrelated), None);
-    }
-
-    #[test]
-    fn unreadable_journal_uses_only_matching_durable_lease_claims() {
-        use crate::concurrency::{
-            ClaimMode, ClaimScope, LeaseFamily, PathClaim, PersistentLease,
-        };
-        let _isolated = crate::concurrency::isolated_test_coordination_root();
-        let tmp = tempfile::tempdir().unwrap();
-        let claimed = tmp.path().join("claimed.flac");
-        let sibling = tmp.path().join("other.flac");
-        std::fs::write(&claimed, b"audio").unwrap();
-        let id = uuid::Uuid::new_v4();
-        let family = LeaseFamily::JournalOperation { job_id: id };
-        let claim = PathClaim::resolve(&claimed, ClaimMode::Write, ClaimScope::Exact).unwrap();
-        let lease = PersistentLease::create(family.clone(), &[claim]).unwrap();
-        let descriptor = lease.descriptor_path().to_path_buf();
-        let unreadable = RecoverySurfaceRecord {
-            journal_path: crate::tui::file_task_runtime::file_task_journal_dir()
-                .join(format!("{id}.jsonl")),
-            record: None,
-            version: None,
-            availability: RecoverySurfaceAvailability::Unreadable,
-            diagnostic: Some("invalid journal content".into()),
-        };
-        let mut state = RecoveryUiState::from_records(vec![unreadable.clone()], &VecDeque::new());
-        assert!(state.locked_browse_entry(&claimed, &claimed, None).is_some(),
-            "a live descriptor remains authoritative despite its damaged journal");
-        assert!(state.locked_browse_entry(&sibling, &sibling, None).is_none());
-        assert!(state.open_browse_entry(&claimed, &claimed, None));
-        assert!(state.selected_entry().unwrap().is_unreadable(),
-            "Show job must select the corresponding unreadable review entry");
-        assert_eq!(state.selected_entry().unwrap().kind_label(), "operation",
-            "the unreadable journal must not receive an invented operation type");
-
-        let other_id = uuid::Uuid::new_v4();
-        state.replace_records(vec![RecoverySurfaceRecord {
-            journal_path: crate::tui::file_task_runtime::file_task_journal_dir()
-                .join(format!("{other_id}.jsonl")),
-            ..unreadable.clone()
-        }], &VecDeque::new());
-        assert!(state.locked_browse_entry(&claimed, &claimed, None).is_none(),
-            "a descriptor with the wrong job identity cannot claim this record");
-        state.replace_records(vec![unreadable.clone()], &VecDeque::new());
-
-        drop(lease);
-        state.replace_records(vec![unreadable.clone()], &VecDeque::new());
-        assert!(state.locked_browse_entry(&claimed, &claimed, None).is_some(),
-            "a recovery-reserved descriptor still blocks the file after owner exit");
-        crate::concurrency::retire_descriptor_after_lifecycle_release(&descriptor, &family).unwrap();
-        state.replace_records(vec![unreadable], &VecDeque::new());
-        assert!(state.locked_browse_entry(&claimed, &claimed, None).is_none(),
-            "releasing the lease clears Browse even when the journal remains unreadable");
-    }
-
-    #[test]
-    fn unreadable_verified_lease_draws_generic_lock_and_mouse_action() {
-        use crate::concurrency::{ClaimMode, ClaimScope, LeaseFamily, PathClaim, PersistentLease};
-        use ratatui::{backend::TestBackend, Terminal};
-        let _isolated = crate::concurrency::isolated_test_coordination_root();
-        let tmp = tempfile::tempdir().unwrap();
-        let claimed = tmp.path().join("claimed.flac");
-        std::fs::write(&claimed, b"audio").unwrap();
-        let id = uuid::Uuid::new_v4();
-        let _lease = PersistentLease::create(
-            LeaseFamily::JournalOperation { job_id: id },
-            &[PathClaim::resolve(&claimed, ClaimMode::Write, ClaimScope::Exact).unwrap()],
-        ).unwrap();
-        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
-        app.current_screen = crate::tui::app::AppScreen::Browse;
-        app.browse.current_dir = tmp.path().to_path_buf();
-        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
-            claimed.clone(), "claimed.flac".into(),
-            crate::tui::browse::EntryKind::OtherFile, 0, None)];
-        app.browse.selected_index = 0;
-        app.browse.explore_enabled = true;
-        app.browse.explore_collapsed = false;
-        app.browse.info_enabled = true;
-        app.browse.info_collapsed = false;
-        app.recovery_ui.replace_records(vec![RecoverySurfaceRecord {
-            journal_path: crate::tui::file_task_runtime::file_task_journal_dir()
-                .join(format!("{id}.jsonl")),
-            record: None,
-            version: None,
-            availability: RecoverySurfaceAvailability::Unreadable,
-            diagnostic: Some("invalid journal content".into()),
-        }], &VecDeque::new());
-        let theme = crate::tui::theme::theme_by_slug_or_default(
-            crate::tui::theme::default_theme_slug());
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal.draw(|frame| crate::tui::draw_browse::draw_browse_screen(
-            frame, Rect::new(0, 0, 80, 24), &mut app, theme)).unwrap();
-        let screen = (0..24).map(|y| (0..80).map(|x|
-            terminal.backend().buffer().get(x, y).symbol().to_owned())
-            .collect::<Vec<_>>().join("")).collect::<Vec<_>>().join("\n");
-        assert!(screen.contains("▲"), "missing list marker: {screen}");
-        assert!(screen.contains("Locked"), "missing Info lock row: {screen}");
-        assert!(screen.contains("▲ job") || screen.contains("▲ by an interrupted job"),
-            "an unreadable record must receive a generic, not invented, job kind: {screen}");
-        assert!(screen.contains("Show job"), "missing Info action: {screen}");
-        let hit = app.button_map.find_button_rect(&TuiButton::BrowseInfoShowJob)
-            .expect("unreadable lock must have a mouse-accessible action");
-        assert_eq!(app.button_map.find_button_at(hit.x, hit.y),
-            Some(TuiButton::BrowseInfoShowJob));
-        assert!(app.recovery_ui.open_browse_entry(&claimed, &claimed, None));
-        assert!(app.recovery_ui.selected_entry().unwrap().is_unreadable(),
-            "both action routes must select the unreadable review entry");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn browse_alias_lookup_preserves_exact_claim_and_final_symlink_semantics() {
-        use crate::concurrency::ClaimScope;
-        use std::os::unix::fs::symlink;
-        let tmp = tempfile::tempdir().unwrap();
-        let real = tmp.path().join("real");
-        let alias = tmp.path().join("alias");
-        std::fs::create_dir(&real).unwrap();
-        symlink(&real, &alias).unwrap();
-        let claimed = real.join("claimed.flac");
-        let other = real.join("other.flac");
-        std::fs::write(&claimed, b"audio").unwrap();
-        std::fs::write(&other, b"audio").unwrap();
-        symlink(&claimed, real.join("final-link.flac")).unwrap();
-
-        let job = entry_with_claim(test_entry("claimed", "dest/claimed", true, None),
-            &claimed, ClaimScope::Exact);
-        let index = BrowseLockIndex::from_entries(&[job.clone()]);
-        assert_eq!(index.owner(&claimed), Some(0));
-        assert_eq!(index.owner(&alias.join("claimed.flac")), None,
-            "the alias needs the directory identity gathered by scanning");
-        assert_eq!(index.owner_for_browse_path(&alias.join("claimed.flac"), &alias, Some(&real)), Some(0));
-        assert_eq!(index.owner_for_browse_path(&alias.join("other.flac"), &alias, Some(&real)), None);
-        assert_eq!(index.owner_for_browse_path(&alias.join("final-link.flac"), &alias, Some(&real)), None,
-            "a final symlink is a separate namespace object, not its referent");
-
-        let mut state = RecoveryUiState::from_records(vec![RecoverySurfaceRecord {
-            journal_path: job.journal_path,
-            record: job.record,
-            version: job.version,
-            availability: job.availability,
-            diagnostic: None,
-        }], &VecDeque::new());
-        assert!(state.open_browse_entry(&alias.join("claimed.flac"), &alias, Some(&real)));
-        assert_eq!(state.selected_entry().unwrap().journal_path, PathBuf::from("recovery/claimed.jsonl"));
-
-        let claim_via_alias = entry_with_claim(
-            test_entry("aliased", "dest/aliased", true, None),
-            &alias.join("claimed.flac"), ClaimScope::Exact);
-        assert_eq!(BrowseLockIndex::from_entries(&[claim_via_alias]).owner(&claimed), Some(0),
-            "the saved resolved claim path also identifies the original directory");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn recursive_search_hit_under_directory_alias_shows_lock_and_opens_owner() {
-        use crate::concurrency::ClaimScope;
-        use ratatui::{backend::TestBackend, Terminal};
-        use std::os::unix::fs::symlink;
-        let tmp = tempfile::tempdir().unwrap();
-        let real = tmp.path().join("real");
-        let alias = tmp.path().join("shortcut");
-        let nested = real.join("album").join("disc");
-        std::fs::create_dir_all(&nested).unwrap();
-        let claimed = nested.join("track.flac");
-        let sibling = nested.join("other.flac");
-        std::fs::write(&claimed, b"audio").unwrap();
-        std::fs::write(&sibling, b"audio").unwrap();
-        symlink(&real, &alias).unwrap();
-        symlink(&claimed, nested.join("final-link.flac")).unwrap();
-        let hit = alias.join("album").join("disc").join("track.flac");
-        let other_hit = alias.join("album").join("disc").join("other.flac");
-        let final_link = alias.join("album").join("disc").join("final-link.flac");
-
-        let entry = entry_with_claim(test_entry("recursive", "out/track", false, None),
-            &claimed, ClaimScope::Exact);
-        let index = BrowseLockIndex::from_entries(&[entry.clone()]);
-        assert_eq!(index.owner_for_browse_path(&hit, &alias, None), None,
-            "a path alias must not be inferred before the directory scan");
-        assert_eq!(index.owner_for_browse_path(&hit, &alias, Some(&real)), Some(0));
-        assert_eq!(index.owner_for_browse_path(&other_hit, &alias, Some(&real)), None);
-        assert_eq!(index.owner_for_browse_path(&final_link, &alias, Some(&real)), None,
-            "do not follow a search hit's final symlink");
-        assert_eq!(index.owner_for_browse_path(&hit, &tmp.path().join("short"), Some(&real)), None,
-            "a similarly prefixed directory is not the scan's alias");
-
-        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
-        app.current_screen = crate::tui::app::AppScreen::Browse;
-        app.browse.navigate_to(alias.clone());
-        if let Some(generation) = app.browse.pending_scan_generation() {
-            // In the runtime's asynchronous case, deliver the directory
-            // identity through the same scan-batch path used in production.
-            assert!(app.browse.apply_dir_scan_batch_if_current(
-                generation, &alias, Some(real.clone()), Vec::new(), Vec::new(), 0));
-        }
-        assert_eq!(app.browse.resolved_current_directory(), Some(real.as_path()));
-        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
-            hit.clone(), "track.flac".into(), crate::tui::browse::EntryKind::OtherFile, 0, None)];
-        app.browse.selected_index = 0;
-        app.browse.explore_enabled = true;
-        app.browse.explore_collapsed = false;
-        app.browse.info_enabled = true;
-        app.browse.info_collapsed = false;
-        app.recovery_ui.replace_records(vec![RecoverySurfaceRecord {
-            journal_path: entry.journal_path.clone(), record: entry.record,
-            version: entry.version, availability: entry.availability, diagnostic: None,
-        }], &VecDeque::new());
-
-        let theme = crate::tui::theme::theme_by_slug_or_default(
-            crate::tui::theme::default_theme_slug());
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal.draw(|frame| crate::tui::draw_browse::draw_browse_screen(
-            frame, Rect::new(0, 0, 80, 24), &mut app, theme)).unwrap();
-        let screen = (0..24).map(|y| (0..80).map(|x|
-            terminal.backend().buffer().get(x, y).symbol().to_owned())
-            .collect::<Vec<_>>().join("")).collect::<Vec<_>>().join("\n");
-        assert!(screen.contains("▲"), "missing recursive search lock marker: {screen}");
-        assert!(screen.contains("Show job"), "missing nested search owner action: {screen}");
-        assert!(app.button_map.find_button_rect(&TuiButton::BrowseInfoShowJob).is_some());
-        assert!(app.recovery_ui.open_browse_entry(
-            &hit, &app.browse.current_dir, app.browse.resolved_current_directory()));
-        assert_eq!(app.recovery_ui.selected_entry().unwrap().journal_path,
-            entry.journal_path);
-    }
-
-    #[test]
-    fn locked_browse_info_and_marker_have_a_clickable_show_job_at_eighty_columns() {
-        use crate::concurrency::ClaimScope;
-        use ratatui::{backend::TestBackend, Terminal};
-        let tmp = tempfile::tempdir().unwrap();
-        let folder = tmp.path().join("Claimed");
-        std::fs::create_dir(&folder).unwrap();
-        let entry = entry_with_claim(test_entry("move", "out/Claimed", true, None),
-            &folder, ClaimScope::Subtree);
-        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
-        app.current_screen = crate::tui::app::AppScreen::Browse;
-        app.browse.current_dir = tmp.path().to_path_buf();
-        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
-            folder.clone(), "Claimed".into(),
-            crate::tui::browse::EntryKind::Directory, 0, None)];
-        app.browse.selected_index = 0;
-        app.browse.explore_enabled = true;
-        app.browse.explore_collapsed = false;
-        app.browse.info_enabled = true;
-        app.browse.info_collapsed = false;
-        let surface = RecoverySurfaceRecord {
-            journal_path: entry.journal_path,
-            record: entry.record,
-            version: entry.version,
-            availability: entry.availability,
-            diagnostic: None,
-        };
-        app.recovery_ui.replace_records(vec![surface], &VecDeque::new());
-        let theme = crate::tui::theme::theme_by_slug_or_default(
-            crate::tui::theme::default_theme_slug());
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal.draw(|f| crate::tui::draw_browse::draw_browse_screen(
-            f, Rect::new(0, 0, 80, 24), &mut app, theme)).unwrap();
-        let screen = (0..24).map(|y| (0..80).map(|x|
-            terminal.backend().buffer().get(x, y).symbol().to_owned())
-            .collect::<Vec<_>>().join("")).collect::<Vec<_>>().join("\n");
-        for phrase in ["Locked", "▲ move", "Changes must wait.", "Show job", "▲"] {
-            assert!(screen.contains(phrase), "missing {phrase:?} in 80x24 Browse: {screen}");
-        }
-        let hit = app.button_map.find_button_rect(&TuiButton::BrowseInfoShowJob)
-            .expect("locked Browse entry should expose Show job button");
-        assert_eq!(app.button_map.find_button_at(hit.x, hit.y),
-            Some(TuiButton::BrowseInfoShowJob));
-        assert!(hit.width >= 8);
-
-        app.recovery_ui.replace_records(Vec::new(), &VecDeque::new());
-        app.button_map.clear();
-        terminal.draw(|f| crate::tui::draw_browse::draw_browse_screen(
-            f, Rect::new(0, 0, 80, 24), &mut app, theme)).unwrap();
-        let screen = (0..24).map(|y| (0..80).map(|x|
-            terminal.backend().buffer().get(x, y).symbol().to_owned())
-            .collect::<Vec<_>>().join("")).collect::<Vec<_>>().join("\n");
-        assert!(!screen.contains("Show job"));
-        assert!(!screen.contains("▲ move"));
-        assert!(app.button_map.find_button_rect(&TuiButton::BrowseInfoShowJob).is_none());
-    }
-
     #[test]
     fn path_overlap_is_symmetric_and_tree_aware() {
         assert!(paths_overlap(Path::new("/a/b"), Path::new("/a")));
@@ -2665,6 +2035,33 @@ mod tests {
         assert_eq!(main, area);
         assert!(popup.right() <= area.right());
         assert!(popup.bottom() <= area.bottom());
+    }
+
+    #[test]
+    fn live_recovery_is_running_not_a_startup_decision() {
+        let mut running = test_entry("running", "dest/running", false, None);
+        running.availability = RecoverySurfaceAvailability::Live;
+        let surface = RecoverySurfaceRecord {
+            journal_path: running.journal_path.clone(),
+            record: running.record.clone(),
+            version: running.version,
+            availability: running.availability,
+            diagnostic: None,
+        };
+        let state = RecoveryUiState::from_records(vec![surface], &VecDeque::new());
+        assert_eq!(state.running_count(), 1);
+        assert_eq!(state.review_count(), 0);
+        assert!(!state.prompt_pending, "live-only work is not a startup interruption");
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.recovery_ui = state;
+        let footer = app.file_task_footer_state().unwrap();
+        assert_eq!((footer.recovery_running, footer.recovery_unresolved), (1, 0));
+        assert!(!footer.startup_notice);
+
+        app.recovery_ui.entries.push(test_entry("review", "dest/review", false, None));
+        let footer = app.file_task_footer_state().unwrap();
+        assert_eq!((footer.recovery_running, footer.recovery_unresolved), (1, 1));
     }
 
     #[test]

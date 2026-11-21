@@ -88,7 +88,6 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
                     ("New ▾", "Browse toolbar: create a file or folder in the current directory"),
                     (":new-file [name]", "Create a file in the current directory"),
                     (":new-folder [name]", "Create a folder in the current directory"),
-                    ("Alt+G", "Show job for selected locked entry"),
                     ("Ctrl+P", "Filesystem Properties (files and folders)"),
                     ("Ctrl+Shift+P", "Paste filesystem clipboard"),
                     ("Alt+P", "Metadata editor (existing mapping)"),

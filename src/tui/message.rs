@@ -699,9 +699,6 @@ pub enum AppMessage {
         tab_id: crate::tui::browse::BrowseTabId,
         generation: u64,
         path: std::path::PathBuf,
-        /// Directory identity resolved once in the scan worker. Its final
-        /// children retain their namespace-object identity.
-        resolved_dir: Option<std::path::PathBuf>,
         dirs: Vec<crate::tui::browse::BrowseEntry>,
         files: Vec<crate::tui::browse::BrowseEntry>,
         discovered: usize,

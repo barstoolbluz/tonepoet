@@ -471,6 +471,7 @@ pub async fn run_app(
                 session.is_recovery_monitor());
         if !input_waiting_at_frame_start && (recovery_visible
             || app.recovery_ui.needs_attention_count() > 0
+            || app.recovery_ui.running_count() > 0
             || !app.recovery_ui.stop_and_undo_pending.is_empty())
             && last_recovery_inventory.elapsed() >= Duration::from_secs(2)
         {
@@ -9373,7 +9374,6 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             tab_id,
             generation,
             path,
-            resolved_dir,
             dirs,
             files,
             discovered,
@@ -9383,7 +9383,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 return;
             };
             if !browse.apply_dir_scan_batch_if_current(
-                generation, &path, resolved_dir, dirs, files, discovered)
+                generation, &path, dirs, files, discovered)
             {
                 log::debug!(
                     "discarded stale directory scan batch for tab {} generation {} path {}",

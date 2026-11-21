@@ -22,7 +22,6 @@ use super::inline_edit::{
     render_text_input_value_with_style,
 };
 use super::probe::MetadataField;
-use super::recovery_ui::{RecoveryEntry, RecoveryUiState};
 use super::text_input::TextInputState;
 
 /// Fixed column widths (inside the list border). Name is flexible.
@@ -399,7 +398,6 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
         f,
         list_area,
         &mut app.browse,
-        &app.recovery_ui,
         inline_edit.as_ref(),
         hover,
         navigation_focus_active,
@@ -448,7 +446,6 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
                 &app.browse,
                 &app.directory_accounting,
                 inline_edit.as_ref(),
-                Some(&app.recovery_ui),
                 app.browse_info_focus,
                 &mut app.button_map,
                 hover,
@@ -2530,7 +2527,6 @@ fn draw_browse_list(
     f: &mut Frame,
     area: Rect,
     browse: &mut BrowseState,
-    locks: &RecoveryUiState,
     inline_edit: Option<&BrowseInlineEditState>,
     hover: Option<super::button_map::TuiButton>,
     navigation_focus_active: bool,
@@ -2732,15 +2728,8 @@ fn draw_browse_list(
                 BrowseInlineEditTarget::Rename { path } if path == &entry.path => Some(&state.input),
                 _ => None,
             });
-            let locked = !browse.is_in_archive()
-                && !matches!(entry.kind, EntryKind::ParentDir)
-                && locks.locked_browse_entry(&entry.path, &browse.current_dir,
-                    browse.resolved_current_directory()).is_some();
             if let Some(input) = inline_rename_input {
-                let marker_in_name = locked
-                    && !column_layout.iter().any(|cell| cell.column == BrowseColumn::Date);
-                rename_cursor = Some((i - start, inline_cursor_col(input,
-                    name_w.saturating_sub(usize::from(marker_in_name) * 2))));
+                rename_cursor = Some((i - start, inline_cursor_col(input, name_w)));
             }
             lines.push(render_entry_line(
                 border_color,
@@ -2753,7 +2742,6 @@ fn draw_browse_list(
                 is_checked,
                 is_range_preview,
                 is_hovered,
-                locked,
                 theme));
         }
 
@@ -2953,7 +2941,6 @@ fn render_entry_line(
     is_checked: bool,
     is_range_preview: bool,
     is_hovered: bool,
-    locked: bool,
     theme: super::theme::Theme,
 ) -> Line<'static> {
     // Cursor indicator
@@ -2979,7 +2966,6 @@ fn render_entry_line(
     }
 
     let cached = cached_info_for_entry(browse, entry);
-    let date_column = columns.iter().any(|cell| cell.column == BrowseColumn::Date);
     let mut spans = Vec::with_capacity(9 + columns.len().saturating_mul(2));
     let mut inline_editor_span_range: Option<std::ops::Range<usize>> = None;
     spans.push(Span::styled("│", theme.border(border_color)));
@@ -2993,24 +2979,12 @@ fn render_entry_line(
         }
         if cell.column == BrowseColumn::Name {
             if let Some(input) = inline_rename_input {
-                let marker_width = usize::from(locked && !date_column) * 2;
                 let start = spans.len();
-                spans.extend(render_inline_value_with_embedded_cursor(input,
-                    cell.width.saturating_sub(marker_width), theme));
+                spans.extend(render_inline_value_with_embedded_cursor(input, cell.width, theme));
                 inline_editor_span_range = Some(start..spans.len());
-                if marker_width > 0 {
-                    spans.push(Span::styled("▲ ", Style::default().fg(theme.warning)));
-                }
             } else {
-                // Date is optional in configured columns. Without it, keep
-                // the lock glyph in the name cell, including narrow layouts.
-                let marker_width = usize::from(locked && !date_column) * 2;
-                let name_display = pad_or_truncate(&entry.name,
-                    cell.width.saturating_sub(marker_width), false);
+                let name_display = pad_or_truncate(&entry.name, cell.width, false);
                 spans.push(Span::styled(name_display, entry_name_style(entry, is_selected, theme)));
-                if marker_width > 0 {
-                    spans.push(Span::styled("▲ ", Style::default().fg(theme.warning)));
-                }
             }
         } else {
             let value = if cell.column == BrowseColumn::Size && browse.folder_size_sort
@@ -3021,15 +2995,8 @@ fn render_entry_line(
             } else {
                 entry_column_text(entry, cell.column, cached)
             };
-            if locked && cell.column == BrowseColumn::Date {
-                spans.push(Span::styled("▲ ", Style::default().fg(theme.warning)));
-                spans.push(Span::styled(pad_or_truncate(value.as_ref(),
-                    cell.width.saturating_sub(2), false),
-                    entry_column_style(entry, cell.column, cached, theme)));
-            } else {
-                let display = pad_or_truncate(value.as_ref(), cell.width, column_right_aligned(cell.column));
-                spans.push(Span::styled(display, entry_column_style(entry, cell.column, cached, theme)));
-            }
+            let display = pad_or_truncate(value.as_ref(), cell.width, column_right_aligned(cell.column));
+            spans.push(Span::styled(display, entry_column_style(entry, cell.column, cached, theme)));
         }
     }
 
@@ -3057,10 +3024,7 @@ fn render_entry_line(
             if !inline_editor_owns_style && !matches!(span.content.as_ref(), "│") {
                 span.style = span.style.bg(bg_color);
                 if is_selected {
-                    span.style = span
-                        .style
-                        .fg(if span.content == "▲ " { theme.warning }
-                            else { theme.text_bright })
+                    span.style = span.style.fg(theme.text_bright)
                         .add_modifier(Modifier::BOLD);
                 }
             }
@@ -3536,79 +3500,6 @@ fn info_pill_offset(spans: &[Span<'_>], caption: &str) -> Option<(usize, usize)>
     None
 }
 
-/// Render only verified claims, including unreadable records whose lease
-/// descriptor still proves the pathname reservation.
-fn append_browse_lock_info(
-    info: &mut InfoContent,
-    entry: &RecoveryEntry,
-    normal_height: usize,
-    blank_separator: bool,
-    content_width: usize,
-    hovered: bool,
-    theme: super::theme::Theme,
-) -> Option<usize> {
-    // Compact layouts have already been given the reduced content budget.
-    // Ordinary file views may still be longer; never push the lock action
-    // below the viewport in those cases.
-    info.lines.truncate(normal_height);
-    for pill in [&mut info.refresh_pill_row, &mut info.analyze_pill_row,
-        &mut info.edit_tags_pill_row, &mut info.audio_streams_pill_row] {
-        if pill.is_some_and(|row| row >= normal_height) { *pill = None; }
-    }
-    info.meta_field_rows.retain(|(_, row)| *row < normal_height);
-    if info.inline_cursor.is_some_and(|(row, _)| row >= normal_height) {
-        info.inline_cursor = None;
-    }
-    if blank_separator { info.lines.push(Vec::new()); }
-    let kind = match entry.kind_label() {
-        "extract" => "extraction",
-        "move" => "move",
-        "copy" => "copy",
-        _ => "job",
-    };
-    let article = if entry.is_live() { "a running" } else { "an interrupted" };
-    let locked_value = format!("▲ by {article} {kind}");
-    let full_label = "   Locked       ";
-    // A narrow Info pane cannot fit the exact reference wording beside
-    // its label. Show a complete, shorter fact rather than an ellipsis that
-    // cuts off the job kind or the word "interrupted".
-    let (label, value) = if content_width >=
-        super::display_width::width(full_label) + super::display_width::width(&locked_value) {
-        (full_label, locked_value)
-    } else {
-        let compact = format!("Locked {locked_value}");
-        if super::display_width::width(&compact) <= content_width {
-            ("", compact)
-        } else {
-            ("   Locked ", format!("▲ {kind}"))
-        }
-    };
-    info.lines.push(vec![
-        Span::styled(label, theme.muted()),
-        Span::styled(truncate_to(&value, content_width.saturating_sub(
-            super::display_width::width(label))),
-            Style::default().fg(theme.warning)),
-    ]);
-    let wait = if content_width >= 39 {
-        "   Delete, move and rename wait for it."
-    } else if content_width >= 23 {
-        "Delete/move/rename wait"
-    } else {
-        "   Changes must wait."
-    };
-    info.lines.push(vec![Span::styled(truncate_to(wait, content_width),
-        Style::default().fg(theme.text_muted))]);
-    let caption = " Show job… ";
-    let pad = content_width.saturating_sub(super::display_width::width(caption)) / 2;
-    info.lines.push(vec![
-        Span::raw(" ".repeat(pad)),
-        Span::styled(caption, Style::default()
-            .fg(theme.bg).bg(theme.cyan)
-            .add_modifier(if hovered { Modifier::BOLD } else { Modifier::empty() })),
-    ]);
-    Some(info.lines.len() - 1)
-}
-
 #[cfg(test)]
 fn draw_browse_info(
     f: &mut Frame,
@@ -3663,7 +3554,7 @@ fn draw_browse_info_with_artwork(
     suppress_image: bool,
 ) {
     draw_browse_info_with_artwork_cursor(f,area,browse,accounting,inline_edit,
-        None,info_focus,buttons,hover,theme,artwork,suppress_image,true);
+        info_focus,buttons,hover,theme,artwork,suppress_image,true);
 }
 
 fn draw_browse_info_with_artwork_cursor(
@@ -3672,7 +3563,6 @@ fn draw_browse_info_with_artwork_cursor(
     browse: &BrowseState,
     accounting: &crate::directory_accounting::AccountingService,
     inline_edit: Option<&BrowseInlineEditState>,
-    locks: Option<&RecoveryUiState>,
     info_focus: Option<BrowseInfoFocus>,
     buttons: &mut ButtonRenderMap,
     hover: Option<super::button_map::TuiButton>,
@@ -3711,18 +3601,7 @@ fn draw_browse_info_with_artwork_cursor(
     ));
 
     let content_height = (area.height as usize).saturating_sub(2);
-    let selected_lock = if browse.is_in_archive() { None } else {
-        browse.selected_entry()
-            .filter(|entry| !matches!(entry.kind, EntryKind::ParentDir))
-            .and_then(|entry| locks
-                .and_then(|state| state.locked_browse_entry(&entry.path, &browse.current_dir,
-                    browse.resolved_current_directory())))
-    };
-    // Leave the lock explanation and button in view, even on short panes.
-    let lock_rows = if selected_lock.is_some() && content_height >= 3 {
-        if content_height >= 11 { 4 } else { 3 }
-    } else { 0 };
-    let normal_height = content_height.saturating_sub(lock_rows);
+    let normal_height = content_height;
     let artwork_context = ArtworkContext::from_browse(browse);
     let has_album_context = artwork_context.is_some();
     if let Some((state, _)) = artwork.as_mut() {
@@ -3781,7 +3660,6 @@ fn draw_browse_info_with_artwork_cursor(
             matches!(c.kind, FolderClassificationKind::Album | FolderClassificationKind::Disc |
                 FolderClassificationKind::MultiDisc)))
     });
-    // Select the metadata layout using the space left after the lock facts.
     // Artwork is never allowed to compete with action or information rows.
     let compact_media = media_selection && (normal_height <= MEDIA_COMPACT_MAX_CONTENT_ROWS
         || info.lines.len() > normal_height);
@@ -3794,14 +3672,9 @@ fn draw_browse_info_with_artwork_cursor(
     } else { info };
     // Never reinterpret a compact layout as a four-row header: its rows are
     // reindexed and its hitboxes already refer to that compact ordering.
-    let mut info = if compact_media || compact_directory { info } else {
+    let info = if compact_media || compact_directory { info } else {
         wrap_full_info_title(info, content_width, theme)
     };
-    let locked_pill_row = if let Some(entry) = selected_lock.filter(|_| lock_rows > 0) {
-        append_browse_lock_info(&mut info, entry, normal_height,
-            lock_rows == 4, content_width,
-            hover == Some(TuiButton::BrowseInfoShowJob), theme)
-    } else { None };
     let artwork_height = if has_album_context {
         artwork.as_ref().map_or(0, |(_, config)| bounded_info_artwork_height(
             &info, content_height,
@@ -3858,13 +3731,6 @@ fn draw_browse_info_with_artwork_cursor(
     // Register clickable metadata fields in the info pane. Only for
     // lines that fit within the visible content area.
     let info_y_start = area.y + 1; // below top border
-    if let Some(row) = locked_pill_row.filter(|row| *row < text_height) {
-        if let Some((left, width)) = info_pill_offset(&info.lines[row], " Show job… ") {
-            buttons.record_button(TuiButton::BrowseInfoShowJob,
-                Rect::new(area.x + 1 + left as u16,
-                    info_y_start + row as u16, width as u16, 1));
-        }
-    }
     for (field, line_idx) in &info.meta_field_rows {
         if *line_idx >= start_row && *line_idx - start_row < text_height {
             buttons.record_button(
@@ -6027,7 +5893,6 @@ mod browse_list_render_allocation_tests {
                 false,
                 false,
                 false,
-                false,
                 theme,
             );
             assert_eq!(line.width(), width, "{name}");
@@ -6037,39 +5902,6 @@ mod browse_list_render_allocation_tests {
                 "{name}"
             );
         }
-    }
-
-    #[test]
-    fn lock_marker_appears_before_date_or_in_name_when_date_is_hidden() {
-        let browse = BrowseState::new();
-        let theme = crate::tui::theme::theme_by_slug_or_default(
-            crate::tui::theme::default_theme_slug());
-        let entry = BrowseEntry::new(PathBuf::from("/tmp/album"),
-            "album".into(), EntryKind::Directory, 0, None);
-        let width = 50usize;
-        let with_date = [
-            BrowseColumnCell { column: BrowseColumn::Name, width: 28 },
-            BrowseColumnCell { column: BrowseColumn::Date, width: COL_DATE_W },
-        ];
-        let line = render_entry_line(theme.border_dim, width, &with_date, &browse,
-            &entry, None, true, false, false, false, true, theme);
-        assert_eq!(line.width(), width);
-        assert_eq!(line.spans.iter().filter(|span| span.content == "▲ ").count(), 1);
-        assert_eq!(line.spans.iter().find(|span| span.content == "▲ ")
-            .unwrap().style.fg, Some(theme.warning));
-        let no_date = [BrowseColumnCell { column: BrowseColumn::Name, width: width - 8 }];
-        let line = render_entry_line(theme.border_dim, width, &no_date, &browse,
-            &entry, None, false, false, false, false, true, theme);
-        assert_eq!(line.width(), width);
-        assert_eq!(line.spans.iter().filter(|span| span.content == "▲ ").count(), 1);
-        let line = render_entry_line(theme.border_dim, width, &no_date, &browse,
-            &entry, None, false, false, false, false, false, theme);
-        assert!(!line.spans.iter().any(|span| span.content == "▲ "));
-        let input = TextInputState::new_selected("album".into());
-        let line = render_entry_line(theme.border_dim, width, &no_date, &browse,
-            &entry, Some(&input), true, false, false, false, true, theme);
-        assert_eq!(line.width(), width);
-        assert_eq!(line.spans.iter().filter(|span| span.content == "▲ ").count(), 1);
     }
 
     #[test]
@@ -6094,7 +5926,6 @@ mod browse_list_render_allocation_tests {
             &entry,
             Some(&input),
             true,
-            false,
             false,
             false,
             false,
