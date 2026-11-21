@@ -9373,6 +9373,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             tab_id,
             generation,
             path,
+            resolved_dir,
             dirs,
             files,
             discovered,
@@ -9381,7 +9382,9 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 log::debug!("discarded directory batch for closed Browse tab {}", tab_id);
                 return;
             };
-            if !browse.apply_dir_scan_batch_if_current(generation, &path, dirs, files, discovered) {
+            if !browse.apply_dir_scan_batch_if_current(
+                generation, &path, resolved_dir, dirs, files, discovered)
+            {
                 log::debug!(
                     "discarded stale directory scan batch for tab {} generation {} path {}",
                     tab_id,

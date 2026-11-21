@@ -295,6 +295,32 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
         return;
     }
 
+    // A locked entry's Info action also has a keyboard-only path. Keep it
+    // after editors and dropdowns so those controls retain their own input.
+    // Search results are navigable entries; the search text field is not.
+    if app.current_screen == AppScreen::Browse
+        && matches!((key.code, key.modifiers),
+            (KeyCode::Char('g'), KeyModifiers::ALT))
+        && !app.browse.options_menu.is_open()
+        && app.browse.path_input.is_none()
+        && app.browse.filter_input.is_none()
+        && (!app.browse.search.active
+            || app.browse.search.focus == super::browse::SearchFocus::Results)
+    {
+        if let Some(path) = app.browse.selected_entry()
+            .filter(|entry| !app.browse.is_in_archive()
+                && !matches!(entry.kind, super::browse::EntryKind::ParentDir))
+            .map(|entry| entry.path.clone())
+        {
+            // This is an explicit user action, not a render-time lookup.
+            // Refresh on demand so a newly interrupted job is discoverable.
+            super::recovery_ui::open_recovery_window_for_browse_path(app, &path);
+        } else {
+            app.set_status("Select a physical Browse entry to show its job");
+        }
+        return;
+    }
+
     // Browse Info focus owns metadata interaction and must preempt global
     // printable shortcuts (1-5, ':', '?') so typing edits the focused field.
     // Ctrl+Q remains application-global and is deliberately allowed through.
@@ -74541,6 +74567,16 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
             TuiButton::BrowseInfoRefresh => {
                 activate_browse_info_refresh(app, tx);
+            }
+            TuiButton::BrowseInfoShowJob => {
+                if let Some(path) = app.browse.selected_entry()
+                    .filter(|entry| !app.browse.is_in_archive()
+                        && !matches!(entry.kind, super::browse::EntryKind::ParentDir))
+                    .map(|entry| entry.path.clone())
+                {
+                    clear_browse_info_focus(app);
+                    super::recovery_ui::open_recovery_window_for_browse_path(app, &path);
+                }
             }
             TuiButton::BrowseInfoAnalyze => {
                 clear_browse_info_focus(app);

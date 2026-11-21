@@ -2646,6 +2646,10 @@ pub struct BrowseTabInfo {
 pub struct BrowseState {
     pub current_dir: PathBuf,
 
+    /// Backing path of the navigation directory, captured by its scan.
+    /// Pairing it with the lexical directory rejects stale scan identities.
+    resolved_current_dir: Option<(PathBuf, PathBuf)>,
+
     // ── Scan results (refreshed only by scan(), i.e. on cd) ─────────
     /// ParentDir entry, if `current_dir` has a parent. Always passed
     /// through view filtering unchanged.
@@ -3874,6 +3878,7 @@ impl BrowseState {
 
         let mut state = Self {
             current_dir: start_dir.clone(),
+            resolved_current_dir: None,
             parent_entry: None,
             all_dirs: Vec::new(),
             all_files: Vec::new(),
@@ -5359,6 +5364,7 @@ impl BrowseState {
         self.clear_dir_stats_work_queue();
         self.clear_folder_classification_work_queue();
         self.current_dir_identity = None;
+        self.resolved_current_dir = None;
         self.filesystem_space_cache = None;
         self.filesystem_space_pending = None;
 
@@ -5378,6 +5384,13 @@ impl BrowseState {
     /// Whether we're currently browsing inside an archive.
     pub fn is_in_archive(&self) -> bool {
         self.archive.is_some()
+    }
+
+    /// Pure in-memory lookup; never canonicalize paths in the paint loop.
+    pub(super) fn resolved_current_directory(&self) -> Option<&Path> {
+        self.resolved_current_dir.as_ref()
+            .filter(|(lexical, _)| lexical == &self.current_dir)
+            .map(|(_, resolved)| resolved.as_path())
     }
 
     /// Filesystem-free identity for the current navigation location inside an
@@ -5439,6 +5452,7 @@ impl BrowseState {
         &mut self,
         generation: u64,
         path: &Path,
+        resolved_dir: Option<PathBuf>,
         dirs: Vec<BrowseEntry>,
         files: Vec<BrowseEntry>,
         discovered: usize,
@@ -5446,6 +5460,7 @@ impl BrowseState {
         if !self.is_current_dir_scan(generation, path) {
             return false;
         }
+        self.resolved_current_dir = resolved_dir.map(|resolved| (path.to_path_buf(), resolved));
         self.append_stream_batch_to_view(&dirs, &files);
         self.publish_scanned_batch(dirs, files, discovered);
         true
@@ -6010,6 +6025,10 @@ impl BrowseState {
     /// Stores ALL entries (including hidden) — view-layer filters apply later.
     /// Slow; only call on cd or explicit refresh.
     fn scan(&mut self) {
+        // Synchronous scans are used by non-runtime callers only; production
+        // obtains this identity in the blocking directory-scan worker.
+        self.resolved_current_dir = fs::canonicalize(&self.current_dir).ok()
+            .map(|resolved| (self.current_dir.clone(), resolved));
         self.parent_entry = None;
         self.all_dirs.clear();
         self.all_files.clear();
@@ -12560,6 +12579,10 @@ fn scan_directory_entries_blocking(
 ), String> {
     use std::sync::atomic::Ordering;
 
+    // One resolution per directory scan, independent of folder size and
+    // displayed entry count. Never follow an individual entry's last link.
+    let resolved_dir = batch_sink.and_then(|_| fs::canonicalize(dir).ok());
+
     let parent_entry = dir.parent().map(|parent| {
         BrowseEntry::new(
             parent.to_path_buf(),
@@ -12598,6 +12621,7 @@ fn scan_directory_entries_blocking(
             tab_id,
             generation,
             path: dir.to_path_buf(),
+            resolved_dir: resolved_dir.clone(),
             dirs: std::mem::take(batch_dirs),
             files: std::mem::take(batch_files),
             discovered,
@@ -15694,11 +15718,11 @@ mod tests {
             let (handle, _cancel) = ScanHandle::new(70);
             browse.scan_pending = Some(handle);
             assert!(browse.apply_dir_scan_batch_if_current(70, &root,
-                vec![gamma.clone(), beta.clone()], vec![], 2));
+                None, vec![gamma.clone(), beta.clone()], vec![], 2));
             browse.selected_index = browse.entries.iter().position(|entry| entry.path == beta.path)
                 .expect("beta appears in first batch");
             assert!(browse.apply_dir_scan_batch_if_current(70, &root,
-                vec![alpha.clone()], vec![], 3));
+                None, vec![alpha.clone()], vec![], 3));
             assert_eq!(browse.selected_entry().unwrap().path, beta.path);
             // The streaming view is in discovery order; cache completions
             // arrive before the terminal authoritative sort.
@@ -16054,12 +16078,14 @@ mod tests {
         assert!(state.apply_dir_scan_batch_if_current(
             17,
             &root,
+            Some(root.clone()),
             vec![child.clone()],
             vec![file.clone()],
             2,
         ));
         assert_eq!(state.scan_discovered_count, 2);
         assert_eq!(state.entries.len(), 2);
+        assert_eq!(state.resolved_current_directory(), Some(root.as_path()));
         assert!(state.entries.iter().any(|entry| entry.path == child.path));
         assert!(state.entries.iter().any(|entry| entry.path == file.path));
         assert!(
@@ -16079,6 +16105,7 @@ mod tests {
         assert!(!state.apply_dir_scan_batch_if_current(
             16,
             &root,
+            None,
             Vec::new(),
             vec![test_file_entry(root.join("stale.txt"), "stale.txt")],
             3,
@@ -16092,10 +16119,35 @@ mod tests {
             before
         );
         assert_eq!(state.scan_discovered_count, 2);
+        assert_eq!(state.resolved_current_directory(), Some(root.as_path()),
+            "a superseded batch must not replace the directory's resolved identity");
 
         assert!(state.finish_dir_scan_if_current(17, &root));
         assert!(state.scan_pending.is_none());
         assert_eq!(state.scan_discovered_count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_caches_symlinked_directory_identity_without_following_child_links() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        let shortcut = tmp.path().join("shortcut");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("track.flac"), b"track").unwrap();
+        symlink(&real, &shortcut).unwrap();
+        let mut browse = BrowseState::new_with_config_at(
+            &crate::config::BrowsingConfig::default(), shortcut.clone());
+        browse.scan();
+        assert_eq!(browse.resolved_current_directory(), Some(real.as_path()));
+        assert!(browse.all_files.iter().any(|entry| entry.path == shortcut.join("track.flac")),
+            "the listing must preserve the user's directory spelling");
+
+        // A direct navigation mutation without a new scan cannot reuse the
+        // prior directory's cached resolved identity while painting.
+        browse.current_dir = tmp.path().to_path_buf();
+        assert_eq!(browse.resolved_current_directory(), None);
     }
 
     #[test]
@@ -16122,6 +16174,7 @@ mod tests {
         assert!(streamed.apply_dir_scan_batch_if_current(
             23,
             &root,
+            None,
             vec![dirs[0].clone()],
             vec![files[0].clone()],
             2,
@@ -16129,6 +16182,7 @@ mod tests {
         assert!(streamed.apply_dir_scan_batch_if_current(
             23,
             &root,
+            None,
             vec![dirs[1].clone()],
             vec![files[1].clone(), files[2].clone()],
             5,
@@ -16183,6 +16237,7 @@ mod tests {
         while let Ok(message) = rx.try_recv() {
             if let crate::tui::message::AppMessage::DirScanBatch {
                 generation,
+                resolved_dir,
                 dirs,
                 files,
                 discovered,
@@ -16190,6 +16245,8 @@ mod tests {
             } = message
             {
                 assert_eq!(generation, 91);
+                assert_eq!(resolved_dir.as_deref(), Some(td.path()),
+                    "directory identity must be captured by the blocking scan");
                 batches += 1;
                 published += dirs.len() + files.len();
                 assert!(discovered >= last_discovered);

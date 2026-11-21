@@ -736,7 +736,8 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
         ActiveOverlay::DiscBrowser(ref state) => {
             let scratch = crate::tui::disc_browser_actions::native_working_root(
                 state, app.config.conversion.scratch_directory.as_deref());
-            crate::tui::disc_extract_render::draw(f, state, &scratch, &mut app.button_map, theme);
+            crate::tui::disc_extract_render::draw_with_hover(
+                f, state, &scratch, &mut app.button_map, theme, app.hover_target);
         }
         ActiveOverlay::FormatSettings {
             ref kind,

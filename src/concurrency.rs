@@ -2414,6 +2414,31 @@ pub fn descriptor_availability(path: &Path) -> Result<(LeaseFamily, ClaimAvailab
     }
 }
 
+/// Inspect an existing descriptor's published claims without adopting its
+/// lease or altering its lifecycle. The descriptor's pathname, family and
+/// contents are validated by the same bounded reader used for admission.
+/// Intended for recovering Browse lock attribution when a journal is unreadable.
+pub fn verified_descriptor_claims(
+    path: &Path,
+    expected_family: &LeaseFamily,
+) -> Result<Vec<PathClaim>, String> {
+    let mut file = open_existing_descriptor(path)
+        .map_err(|error| format!("open persistent lease {}: {error}", path.display()))?;
+    let lock_contended = match file.try_lock_exclusive() {
+        Ok(()) => false,
+        Err(error) if is_lock_contended(&error) => true,
+        Err(error) => return Err(format!("probe persistent lease {}: {error}", path.display())),
+    };
+    let descriptor = read_descriptor_from(&mut file, path)?;
+    let availability = classify_availability(&descriptor.family, lock_contended);
+    if &descriptor.family != expected_family ||
+        !matches!(availability, ClaimAvailability::Live | ClaimAvailability::RecoveryReserved)
+    {
+        return Err(format!("persistent lease identity or availability changed: {}", path.display()));
+    }
+    Ok(descriptor.claims)
+}
+
 #[cfg(test)]
 pub(crate) fn wait_for_close_driven_lifecycle_release(
     path: &Path,

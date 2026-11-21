@@ -352,6 +352,19 @@ pub fn draw(
     buttons: &mut ButtonRenderMap,
     theme: Theme,
 ) {
+    draw_with_hover(frame, state, scratch, buttons, theme, None);
+}
+
+/// Render the active Extract window with its mouse hover target. The ordinary
+/// entrypoint remains for drawing noninteractive parent windows and tests.
+pub fn draw_with_hover(
+    frame: &mut ratatui::Frame,
+    state: &DiscBrowserState,
+    scratch: &Path,
+    buttons: &mut ButtonRenderMap,
+    theme: Theme,
+    hover: Option<TuiButton>,
+) {
     let area=frame.size();
     if area.width<64 || area.height<20 {
         frame.render_widget(Paragraph::new("Make the terminal at least 64×20 to extract.")
@@ -464,7 +477,7 @@ pub fn draw(
         match state.focus {
             ExtractFocus::Programs=>draw_programs(frame,state,chunks[2],buttons,theme),
             ExtractFocus::Items=>draw_items(frame,state,chunks[2],buttons,theme,false),
-            ExtractFocus::Output | ExtractFocus::Footer=>draw_output(frame,state,chunks[2],buttons,theme,false),
+            ExtractFocus::Output | ExtractFocus::Footer=>draw_output_with_hover(frame,state,chunks[2],buttons,theme,false,hover),
         }
     } else {
         let longest = state.contents.presentations.iter().enumerate().map(|(i, p)| {
@@ -520,7 +533,7 @@ pub fn draw(
         }
         frame.render_widget(Paragraph::new(Line::from(line))
             .style(Style::default().bg(colors.band)),chunks[4]);
-    } else { draw_output(frame,state,chunks[4],buttons,theme,wide); }
+    } else { draw_output_with_hover(frame,state,chunks[4],buttons,theme,wide,hover); }
     draw_results(frame,state,scratch,chunks[7],problems.first().map(String::as_str),theme);
     fill(frame,chunks[5],colors.base);
     draw_footer(frame,state,chunks[9],buttons,small,problems.is_empty(),theme);
@@ -534,7 +547,7 @@ pub fn draw(
             draw_native_overwrite_menu(frame,buttons,anchor,popup,state,theme);
         }
     }
-    if let Some(panel)=state.panel { draw_panel(frame,state,panel,popup,buttons,theme); }
+    if let Some(panel)=state.panel { draw_panel(frame,state,panel,popup,buttons,theme,hover); }
 }
 
 fn short_genre(text: &str) -> (String, usize) {
@@ -1228,10 +1241,11 @@ fn draw_native_toggle(frame:&mut ratatui::Frame, buttons:&mut ButtonRenderMap,
 }
 
 fn draw_native_pill(frame:&mut ratatui::Frame, buttons:&mut ButtonRenderMap,
-    rect:Rect, label:&str, target:TuiButton, focused:bool,theme:Theme) {
+    rect:Rect, label:&str, target:TuiButton, focused:bool,hovered:bool,theme:Theme) {
     if rect.width==0 {return;}
-    let bg=if focused {theme.pill_active_bg}else{theme.pill_preset_bg};
-    let fg=readable_word(if focused {theme.pill_active_fg}else{theme.pill_preset_fg},bg);
+    let bg=if focused {theme.pill_active_bg}
+        else if hovered {theme.pill_neutral_hover_bg}else{theme.pill_neutral_bg};
+    let fg=readable_word(if focused {theme.pill_active_fg}else{theme.value},bg);
     frame.render_widget(Paragraph::new(clip_end(label,rect.width)).style(Style::default()
         .bg(bg).fg(fg)),rect);
     buttons.record_button(target,rect);
@@ -1307,8 +1321,14 @@ fn draw_native_overwrite_menu(frame:&mut ratatui::Frame, buttons:&mut ButtonRend
     }
 }
 
+#[cfg(test)]
 fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
     buttons:&mut ButtonRenderMap,theme:Theme,wide:bool) {
+    draw_output_with_hover(frame,s,r,buttons,theme,wide,None);
+}
+
+fn draw_output_with_hover(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
+    buttons:&mut ButtonRenderMap,theme:Theme,wide:bool,hover:Option<TuiButton>) {
     let rows=s.output_rows();
     let colors=extract_colors(theme);
     let bg=if s.focus==ExtractFocus::Output {colors.focused}else{colors.band};
@@ -1432,7 +1452,8 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
                             Rect::new(x+1,field.y,button_x-x-1,1));
                     }
                     draw_native_pill(frame,buttons,Rect::new(button_x,field.y,ew,1),edit,
-                        TuiButton::DiscBrowserTagsEdit,focused,theme);
+                        TuiButton::DiscBrowserTagsEdit,focused,
+                        hover==Some(TuiButton::DiscBrowserTagsEdit),theme);
                 }
             }
             "Log" => {
@@ -1485,7 +1506,8 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
                 buttons.record_button(TuiButton::DiscBrowserFolderField,input);
                 if field.width>=pw+3 {
                     draw_native_pill(frame,buttons,Rect::new(field.x+input_width+2,field.y,pw,1),
-                        pill,TuiButton::DiscBrowserFolderBrowse,false,theme);
+                        pill,TuiButton::DiscBrowserFolderBrowse,false,
+                        hover==Some(TuiButton::DiscBrowserFolderBrowse),theme);
                 }
             }
             "Naming" => {
@@ -1505,10 +1527,12 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
                 if show_pills {
                     let first=Rect::new(field.x+input_width+1,field.y,load_width,1);
                     draw_native_pill(frame,buttons,first,load,
-                        TuiButton::DiscBrowserNamingLoad,false,theme);
+                        TuiButton::DiscBrowserNamingLoad,false,
+                        hover==Some(TuiButton::DiscBrowserNamingLoad),theme);
                     let second=Rect::new(first.x+load_width+1,field.y,custom_width,1);
                     draw_native_pill(frame,buttons,second,custom,
-                        TuiButton::DiscBrowserNamingCustom,false,theme);
+                        TuiButton::DiscBrowserNamingCustom,false,
+                        hover==Some(TuiButton::DiscBrowserNamingCustom),theme);
                 }
             }
             "Downmix" | "Assume decrypted" => {
@@ -1727,8 +1751,14 @@ fn draw_footer(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,buttons:&mut
 /// A real, modal Tags sheet: every displayed control has a matching mouse
 /// target and exactly the same action as Space/Enter. The scroll is derived
 /// from the active control; no filesystem work occurs during repaint.
+#[cfg(test)]
 fn draw_tags_sheet(frame:&mut ratatui::Frame, s:&DiscBrowserState, popup:Rect,
     buttons:&mut ButtonRenderMap, theme:Theme) {
+    draw_tags_sheet_with_hover(frame,s,popup,buttons,theme,None);
+}
+
+fn draw_tags_sheet_with_hover(frame:&mut ratatui::Frame, s:&DiscBrowserState, popup:Rect,
+    buttons:&mut ButtonRenderMap, theme:Theme,hover:Option<TuiButton>) {
     let width=popup.width.saturating_sub(2).min(82);
     let height=popup.height.saturating_sub(2).min(27);
     if width<12 || height<7 { return; }
@@ -1841,8 +1871,11 @@ fn draw_tags_sheet(frame:&mut ratatui::Frame, s:&DiscBrowserState, popup:Rect,
                 end-=width;
                 let action_rect=Rect::new(end,rect.y,width,1);
                 let focused=!s.tag_source_open && s.panel_cursor==action_index;
-                let bg=if focused {theme.pill_active_bg}else{theme.pill_preset_bg};
-                let fg=if focused {theme.pill_active_fg}else{theme.pill_preset_fg};
+                let bg=if focused {theme.pill_active_bg}
+                    else if hover==Some(TuiButton::DiscBrowserTagSheetControl(action_index)) {
+                        theme.pill_neutral_hover_bg
+                    } else {theme.pill_neutral_bg};
+                let fg=if focused {theme.pill_active_fg}else{theme.value};
                 frame.render_widget(Paragraph::new(text).style(Style::default()
                     .fg(readable_word(fg,bg)).bg(bg)),action_rect);
                 buttons.record_button(TuiButton::DiscBrowserTagSheetControl(action_index),action_rect);
@@ -1856,8 +1889,11 @@ fn draw_tags_sheet(frame:&mut ratatui::Frame, s:&DiscBrowserState, popup:Rect,
             let width=(text.chars().count() as u16).min(rect.width);
             let action=Rect::new(rect.x+rect.width-width,rect.y,width,1);
             let focused=!s.tag_source_open && *index==Some(s.panel_cursor);
-            let bg=if focused {theme.pill_active_bg}else{theme.pill_preset_bg};
-            let fg=if focused {theme.pill_active_fg}else{theme.pill_preset_fg};
+            let bg=if focused {theme.pill_active_bg}
+                else if index.is_some_and(|i| hover==Some(TuiButton::DiscBrowserTagSheetControl(i))) {
+                    theme.pill_neutral_hover_bg
+                } else {theme.pill_neutral_bg};
+            let fg=if focused {theme.pill_active_fg}else{theme.value};
             if action.x>rect.x {
                 frame.render_widget(Paragraph::new(clip_end(label,action.x-rect.x))
                     .style(Style::default().fg(readable_word(theme.warning,theme.surface))
@@ -1899,9 +1935,12 @@ fn draw_tags_sheet(frame:&mut ratatui::Frame, s:&DiscBrowserState, popup:Rect,
         let rect=Rect::new(x,footer.y,width,1);
         let focused=s.panel_cursor==index;
         let bg=if focused {theme.pill_active_bg}
-            else if control==TagSheetControl::Done {theme.chip_go}else{theme.pill_preset_bg};
+            else if control==TagSheetControl::Done {theme.chip_go}
+            else if hover==Some(TuiButton::DiscBrowserTagSheetControl(index)) {
+                theme.pill_neutral_hover_bg
+            } else {theme.pill_neutral_bg};
         let fg=if focused {theme.pill_active_fg}
-            else if control==TagSheetControl::Done {theme.panel_bg}else{theme.pill_preset_fg};
+            else if control==TagSheetControl::Done {theme.panel_bg}else{theme.value};
         frame.render_widget(Paragraph::new(text).style(Style::default()
             .fg(readable_word(fg,bg)).bg(bg)),rect);
         buttons.record_button(TuiButton::DiscBrowserTagSheetControl(index),rect);
@@ -1910,9 +1949,9 @@ fn draw_tags_sheet(frame:&mut ratatui::Frame, s:&DiscBrowserState, popup:Rect,
 }
 
 fn draw_panel(frame:&mut ratatui::Frame,s:&DiscBrowserState,panel:ExtractPanel,popup:Rect,
-    buttons:&mut ButtonRenderMap,theme:Theme) {
+    buttons:&mut ButtonRenderMap,theme:Theme,hover:Option<TuiButton>) {
     if panel == ExtractPanel::Tags {
-        draw_tags_sheet(frame,s,popup,buttons,theme);
+        draw_tags_sheet_with_hover(frame,s,popup,buttons,theme,hover);
         return;
     }
     let max_w=popup.width.saturating_sub(8).min(75);
@@ -2841,12 +2880,56 @@ mod extract_r3_render_tests {
                             .expect("unfocused pill still visible");
                         if other != control {
                             assert_eq!(terminal.backend().buffer().get(other_rect.x,other_rect.y).bg,
-                                theme.pill_preset_bg,"unfocused action must retain button styling");
+                                theme.pill_neutral_bg,"unfocused action must retain button styling");
                         }
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn neutral_extract_buttons_hover_without_changing_their_hit_regions() {
+        let theme = crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        let mut state = sacd_state(false, false);
+        state.tags = true;
+        let area = Rect::new(2, 2, 150, 10);
+        let mut terminal = Terminal::new(TestBackend::new(154, 22)).unwrap();
+        let mut buttons = ButtonRenderMap::new();
+        terminal.draw(|frame| draw_output_with_hover(frame, &state, area,
+            &mut buttons, theme, true, Some(TuiButton::DiscBrowserNamingLoad))).unwrap();
+        let hovered = buttons.button_rect(TuiButton::DiscBrowserNamingLoad)
+            .expect("Load preset visible");
+        assert_eq!(buttons.find_button_at(hovered.x, hovered.y),
+            Some(TuiButton::DiscBrowserNamingLoad));
+        assert_eq!(terminal.backend().buffer().get(hovered.x, hovered.y).bg,
+            theme.pill_neutral_hover_bg);
+        let other = buttons.button_rect(TuiButton::DiscBrowserNamingCustom)
+            .expect("Custom visible");
+        assert_eq!(terminal.backend().buffer().get(other.x, other.y).bg,
+            theme.pill_neutral_bg);
+
+        state.panel = Some(ExtractPanel::Tags);
+        let controls = state.tag_sheet_controls();
+        let all = controls.iter().position(|c| *c == TagSheetControl::All).unwrap();
+        let none = controls.iter().position(|c| *c == TagSheetControl::None).unwrap();
+        state.panel_cursor = all;
+        let popup = Rect::new(6, 5, 116, 33);
+        let mut sheet_terminal = Terminal::new(TestBackend::new(132, 44)).unwrap();
+        buttons.clear();
+        sheet_terminal.draw(|frame| draw_tags_sheet_with_hover(frame, &state,
+            popup, &mut buttons, theme,
+            Some(TuiButton::DiscBrowserTagSheetControl(none)))).unwrap();
+        let hovered = buttons.button_rect(TuiButton::DiscBrowserTagSheetControl(none))
+            .expect("None pill visible");
+        assert_eq!(buttons.find_button_at(hovered.x, hovered.y),
+            Some(TuiButton::DiscBrowserTagSheetControl(none)));
+        assert_eq!(sheet_terminal.backend().buffer().get(hovered.x, hovered.y).bg,
+            theme.pill_neutral_hover_bg);
+        let focused = buttons.button_rect(TuiButton::DiscBrowserTagSheetControl(all))
+            .expect("All pill visible");
+        assert_eq!(sheet_terminal.backend().buffer().get(focused.x, focused.y).bg,
+            theme.pill_active_bg);
     }
 
     #[test]

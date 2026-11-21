@@ -367,6 +367,8 @@ pub enum TuiButton {
     // Browse info pane: foreground recursive accounting on demand.
     BrowseInfoArtworkArea,
     BrowseInfoRefresh,
+    // Browse info pane: Show job for the selected claimed path.
+    BrowseInfoShowJob,
     // Browse info pane: analyze pill (click → run audio analysis).
     BrowseInfoAnalyze,
     // Browse info pane: edit tags pill (click → open metadata editor).
@@ -842,6 +844,7 @@ impl TuiButton {
             | Self::BrowseInfoMeta(_)
             | Self::BrowseInfoArtworkArea
             | Self::BrowseInfoRefresh
+            | Self::BrowseInfoShowJob
             | Self::BrowseInfoAnalyze
             | Self::BrowseInfoEditTags
             | Self::BrowseInfoAudioStreams
