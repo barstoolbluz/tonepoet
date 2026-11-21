@@ -1258,6 +1258,28 @@ mod tests {
     }
 
     #[test]
+    fn first_viewer_background_setup_preserves_later_decoded_pixels() {
+        let mut state = BrowseArtworkState::default();
+        state.popup_open = true;
+        state.set_desired_area(Rect::new(0, 0, 24, 12), ImageVerticalPlacement::Center);
+        let mut picker = Picker::new((8, 12));
+        let config = BrowseArtworkConfig::default();
+        let background = Color::Rgb(26, 27, 38);
+
+        // A real viewer prepares the background before its decode worker returns.
+        assert!(state.prepare(&mut picker, 0, 0, &config, background));
+        assert_eq!(state.viewer_background, Some([26, 27, 38]));
+        assert!(state.decoded.is_none());
+
+        state.decoded = Some(Arc::new(DynamicImage::new_rgb8(24, 24)));
+        let generation = state.generation;
+        assert!(state.prepare(&mut picker, 0, 0, &config, background));
+        assert_eq!(state.generation, generation);
+        assert!(state.decoded.is_some());
+        assert!(state.protocol.is_some());
+    }
+
+    #[test]
     fn viewer_background_change_invalidates_precomposited_pixels() {
         let mut state = BrowseArtworkState::default();
         let mut picker = Picker::new((8, 12));
@@ -1541,6 +1563,8 @@ mod tests {
             let mut state = BrowseArtworkState::default();
             state.decoded = Some(Arc::new(DynamicImage::new_rgb8(40, 30)));
             state.popup_open = popup;
+            // These pixels model a decode completed for the current viewer ground.
+            state.viewer_background = popup.then_some([0, 0, 0]);
             let placement = if popup {
                 ImageVerticalPlacement::Center
             } else {
@@ -1660,6 +1684,7 @@ mod tests {
         let mut state = BrowseArtworkState::default();
         state.open_file_popup(PathBuf::from("/pictures/cover.png"));
         state.scanned = state.context.clone(); // No filesystem worker in this state test.
+        state.viewer_background = Some([0, 0, 0]);
         state.decoded = Some(Arc::new(DynamicImage::new_rgb8(24, 24)));
         state.set_desired_area(Rect::new(2, 2, 20, 15), ImageVerticalPlacement::Center);
         let mut picker = Picker::new((8, 12));
@@ -1801,6 +1826,7 @@ mod tests {
         let mut state = BrowseArtworkState::default();
         state.decoded = Some(Arc::new(DynamicImage::new_rgb8(24, 24)));
         state.popup_open = true;
+        state.viewer_background = Some([0, 0, 0]);
         let viewport = Rect::new(3, 2, 45, 24);
         let background = Color::Rgb(26, 27, 38);
         let mut picker = Picker::new((8, 12));
@@ -1928,6 +1954,8 @@ mod tests {
         assert!(state.protocol.is_none());
 
         // Model the asynchronous decode completing before the menu closes.
+        // The worker received this ground when the popup was prepared.
+        state.viewer_background = Some([0, 0, 0]);
         state.decoded = Some(Arc::new(DynamicImage::new_rgb8(160, 96)));
         let viewport = Rect::new(3, 2, 45, 24);
         let background = Color::Rgb(26, 27, 38);
@@ -2583,6 +2611,8 @@ mod tests {
         app.browse.artwork_config.allow_upscale = true;
         app.browse_artwork.open_file_popup(PathBuf::from("/image/front.png"));
         app.browse_artwork.scanned = app.browse_artwork.context.clone();
+        let (r, g, b) = crate::tui::theme::rgb_tuple(app.theme.bg);
+        app.browse_artwork.viewer_background = Some([r, g, b]);
         app.browse_artwork.decoded = Some(Arc::new(DynamicImage::new_rgb8(24, 24)));
         app.browse_artwork.enter_fullscreen();
         app.image_picker = Picker::new((8, 12));
