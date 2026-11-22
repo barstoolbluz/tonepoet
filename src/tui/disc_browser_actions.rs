@@ -562,6 +562,17 @@ fn activate_native_option(state:&mut DiscBrowserState,control:ExtractOptionContr
     }
 }
 
+/// Open the existing Extract key-help sheet without discarding the active
+/// Options popup or its keyboard focus.
+fn open_extract_option_help(state:&mut DiscBrowserState) {
+    if let Some(panel @ (ExtractPanel::Options | ExtractPanel::Chapters |
+        ExtractPanel::CueFiles | ExtractPanel::CopyFolder))=state.panel {
+        state.option_help_return=Some((panel,state.panel_cursor));
+        state.panel=Some(ExtractPanel::Keys);
+        state.panel_cursor=0;
+    }
+}
+
 /// The native-radio keys move only within the currently focused group.
 fn cycle_extract_radio(state:&mut DiscBrowserState,forward:bool) {
     use ExtractOptionControl as C;
@@ -648,6 +659,15 @@ pub fn handle_disc_browser_button_click_with_shift(
     // precedence over the extraction window below it. Other panels remain
     // modal but read-only, as before.
     if let ActiveOverlay::DiscBrowser(state) = &app.active_overlay {
+        // Mouse dismissal follows the exact Esc return path, restoring the
+        // popup and focused control without changing global key-help sheets.
+        if state.panel==Some(ExtractPanel::Keys) && state.option_help_return.is_some() {
+            if *button==TuiButton::DiscBrowserOptionOutside {
+                handle_disc_browser_key(app,KeyEvent::new(KeyCode::Esc,
+                    crossterm::event::KeyModifiers::NONE),tx);
+            }
+            return true;
+        }
         if matches!(state.panel,Some(ExtractPanel::Options | ExtractPanel::Chapters | ExtractPanel::CueFiles | ExtractPanel::CopyFolder)) {
             if let ActiveOverlay::DiscBrowser(state)=&mut app.active_overlay {
                 match button {
@@ -659,6 +679,11 @@ pub fn handle_disc_browser_button_click_with_shift(
                     }
                     TuiButton::DiscBrowserOptionOutside => {
                         activate_native_option(state,ExtractOptionControl::Done);
+                    }
+                    TuiButton::DiscBrowserHint(index)
+                        if native_hint_key(state,*index)
+                            .is_some_and(|key|key.code==KeyCode::Char('?')) => {
+                        open_extract_option_help(state);
                     }
                     _ => {}, // passive area and previous-frame targets are inert
                 }
@@ -1801,6 +1826,7 @@ pub fn handle_disc_browser_key(
             let len=state.option_controls().len();
             match key.code {
                 KeyCode::Esc => activate_native_option(state,ExtractOptionControl::Done),
+                KeyCode::Char('?') => open_extract_option_help(state),
                 KeyCode::Up | KeyCode::BackTab => state.panel_cursor=state.panel_cursor.saturating_sub(1),
                 KeyCode::Down | KeyCode::Tab => state.panel_cursor=(state.panel_cursor+1).min(len.saturating_sub(1)),
                 KeyCode::Char('[') | KeyCode::Left => cycle_extract_radio(state,false),
@@ -1849,6 +1875,12 @@ pub fn handle_disc_browser_key(
             return;
         }
         match (panel, key.code) {
+            (ExtractPanel::Keys, KeyCode::Esc) if state.option_help_return.is_some() => {
+                let (previous,cursor)=state.option_help_return.take()
+                    .expect("checked return context");
+                state.panel=Some(previous);
+                state.panel_cursor=cursor;
+            }
             (_, KeyCode::Esc) => { state.panel = None; state.panel_cursor = 0; }
             (ExtractPanel::Downmix | ExtractPanel::AssumeDecrypted, KeyCode::Char('[')) => cycle_native_option(state, -1),
             (ExtractPanel::Downmix | ExtractPanel::AssumeDecrypted, KeyCode::Char(']')) => cycle_native_option(state, 1),
@@ -1868,7 +1900,11 @@ pub fn handle_disc_browser_key(
     use NativeKeyAction as A;
     match action {
         Some(A::Close) => { state.probe_cancel.cancel(); app.active_overlay = ActiveOverlay::None; }
-        Some(A::Help) => { state.panel = Some(ExtractPanel::Keys); state.panel_cursor = 0; }
+        Some(A::Help) => {
+            state.option_help_return=None;
+            state.panel=Some(ExtractPanel::Keys);
+            state.panel_cursor=0;
+        }
         Some(A::NextFocus | A::PreviousFocus) => {
             let backwards = action == Some(A::PreviousFocus);
             state.focus = match (state.focus, backwards) {
@@ -4248,4 +4284,117 @@ mod tests {
         assert_eq!(state.panel,None);
     }
 
+
+    #[test]
+    fn r4f_option_help_keyboard_and_mouse_return_to_exact_popup_context() {
+        use crossterm::event::{KeyModifiers as M,MouseButton,MouseEvent,MouseEventKind};
+        use ratatui::{backend::TestBackend,Terminal};
+        use crate::tui::button_map::ButtonRenderMap;
+        let source=PathBuf::from("disc.iso");
+        let (tx,_rx)=tokio::sync::mpsc::channel(8);
+        for (width,height) in [(64,20),(154,40)] {
+            for panel in [ExtractPanel::Options,ExtractPanel::Chapters,
+                ExtractPanel::CueFiles,ExtractPanel::CopyFolder] {
+                let mut state=DiscBrowserState::new(
+                    selectable_disc_contents(source.clone(),FolderDiscMarkerKind::Sacd),
+                    source.clone());
+                state.panel=Some(panel);
+                state.panel_cursor=0;
+                state.option_parent_cursor=3;
+                let before=match panel {
+                    ExtractPanel::Options=>state.extraction_log,
+                    ExtractPanel::Chapters=>state.extract_settings.write_chapters,
+                    ExtractPanel::CueFiles=>state.cue,
+                    ExtractPanel::CopyFolder=>state.extract_settings.copy_folder.artwork,
+                    _=>unreachable!(),
+                };
+                let mut app=AppState::new_for_test(TonepoetConfig::default());
+                app.active_overlay=ActiveOverlay::DiscBrowser(Box::new(state));
+                let press=|app:&mut AppState,key|handle_disc_browser_key(app,
+                    KeyEvent::new(key,M::NONE),&tx);
+                press(&mut app,KeyCode::Char('?'));
+                assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
+                    if s.panel==Some(ExtractPanel::Keys) &&
+                        s.option_help_return==Some((panel,0))));
+                press(&mut app,KeyCode::Esc);
+                assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
+                    if s.panel==Some(panel) && s.panel_cursor==0 &&
+                        s.option_parent_cursor==3 && s.option_help_return.is_none()));
+
+                // The real painted hint and the ordinary mouse dispatcher
+                // must take the exact same action as pressing '?'.
+                let mut terminal=Terminal::new(TestBackend::new(width,height)).unwrap();
+                let mut buttons=ButtonRenderMap::new();
+                terminal.draw(|frame| {
+                    let ActiveOverlay::DiscBrowser(s)=&app.active_overlay else {panic!("no overlay")};
+                    crate::tui::disc_extract_render::draw(frame,s,Path::new("/tmp"),
+                        &mut buttons,app.theme);
+                }).unwrap();
+                let hint_index=match &app.active_overlay {
+                    ActiveOverlay::DiscBrowser(s)=>native_visible_hints(s).iter()
+                        .position(|binding|binding.action==NativeKeyAction::Help).unwrap(),
+                    _=>unreachable!(),
+                };
+                let target=TuiButton::DiscBrowserHint(hint_index);
+                let rect=buttons.button_rect(target).expect("help hint must be clickable");
+                assert_eq!(rect.width,10);
+                assert_eq!(buttons.find_button_at(rect.x+2,rect.y),Some(target));
+                app.button_map=buttons;
+                crate::tui::keybindings::handle_mouse(&mut app,MouseEvent {
+                    kind:MouseEventKind::Down(MouseButton::Left),
+                    column:rect.x+2,row:rect.y,modifiers:M::NONE,
+                },&tx);
+                assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
+                    if s.panel==Some(ExtractPanel::Keys) &&
+                        s.option_help_return==Some((panel,0))));
+                // The return path must also work without touching the keyboard.
+                let mut help_buttons=ButtonRenderMap::new();
+                terminal.draw(|frame| {
+                    let ActiveOverlay::DiscBrowser(s)=&app.active_overlay else {panic!("no overlay")};
+                    crate::tui::disc_extract_render::draw(frame,s,Path::new("/tmp"),
+                        &mut help_buttons,app.theme);
+                }).unwrap();
+                let dismiss=TuiButton::DiscBrowserOptionOutside;
+                let done=help_buttons.button_rect(dismiss)
+                    .expect("Options-originated Keys help must paint a Done button");
+                assert_eq!(terminal.backend().buffer().get(done.x+1,done.y).symbol(),"D");
+                assert_eq!(help_buttons.find_button_at(done.x+1,done.y),Some(dismiss));
+                app.button_map=help_buttons;
+                crate::tui::keybindings::handle_mouse(&mut app,MouseEvent {
+                    kind:MouseEventKind::Down(MouseButton::Left),
+                    column:done.x+1,row:done.y,modifiers:M::NONE,
+                },&tx);
+                assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
+                    if s.panel==Some(panel) && s.panel_cursor==0 &&
+                        s.option_parent_cursor==3 && s.option_help_return.is_none()));
+
+                // Click the restored control, not a keyboard shortcut.
+                let mut resumed_buttons=ButtonRenderMap::new();
+                terminal.draw(|frame| {
+                    let ActiveOverlay::DiscBrowser(s)=&app.active_overlay else {panic!("no overlay")};
+                    crate::tui::disc_extract_render::draw(frame,s,Path::new("/tmp"),
+                        &mut resumed_buttons,app.theme);
+                }).unwrap();
+                let control=TuiButton::DiscBrowserOptionControl(0);
+                let control_rect=resumed_buttons.button_rect(control)
+                    .expect("restored popup must paint its first control");
+                assert_eq!(resumed_buttons.find_button_at(control_rect.x,control_rect.y),
+                    Some(control));
+                app.button_map=resumed_buttons;
+                crate::tui::keybindings::handle_mouse(&mut app,MouseEvent {
+                    kind:MouseEventKind::Down(MouseButton::Left),
+                    column:control_rect.x,row:control_rect.y,modifiers:M::NONE,
+                },&tx);
+                let ActiveOverlay::DiscBrowser(s)=&app.active_overlay else {panic!("no overlay")};
+                let after=match panel {
+                    ExtractPanel::Options=>s.extraction_log,
+                    ExtractPanel::Chapters=>s.extract_settings.write_chapters,
+                    ExtractPanel::CueFiles=>s.cue,
+                    ExtractPanel::CopyFolder=>s.extract_settings.copy_folder.artwork,
+                    _=>unreachable!(),
+                };
+                assert_ne!(before,after,"{panel:?} did not resume mouse editing");
+            }
+        }
+    }
 }
