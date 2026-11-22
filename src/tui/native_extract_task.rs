@@ -1251,7 +1251,7 @@ mod tests {
             working_root: destination.join("private-work"),
             wav_container: NativeWavContainer::Automatic,
             assume_decrypted: false, downmix: crate::convert::pipeline::types::DvdaDownmixPolicy::None,
-            naming_template: "{track} - {title}".into(),
+            naming_template: "{track} - {title}".into(), capitalize_naming: false,
             program_subfolders: true, overwrite_policy: NativeOverwritePolicy::Replace,
             extraction_log: false, options: crate::convert::pipeline::native_extract::NativeExtractSettings {create_cue:false, write_chapters:false, ..Default::default()}, program_log_paths: Vec::new(), round4_layout: false, file_per_program: false, cue: false,
             transfer_tags: false, sacd_dff: false, tag_source: NativeTagSource::DiscAndSidecar,

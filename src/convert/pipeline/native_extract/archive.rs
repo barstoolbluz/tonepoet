@@ -45,9 +45,12 @@ pub(super) fn proposed_archive_destination(
     // member's own catalog only for this naming call; no other source changes.
     let mut identity=job.disc_identity.clone();
     identity.catalog=named_track.tags.catalog.clone();
-    let stem = render_naming_template_for_extension(
+    let mut stem = render_naming_template_for_extension(
         &job.naming_template, &named_program, &named_track, extension, &identity,
     );
+    if job.capitalize_naming {
+        stem = crate::convert::renaming::capitalize_naming_path(&stem, Some(extension));
+    }
     job.destination.join(parent).join(with_native_extension(stem, extension))
 }
 

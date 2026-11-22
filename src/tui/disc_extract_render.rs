@@ -1474,7 +1474,7 @@ fn draw_output_with_hover(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
             "Naming" => {
                 let editing=s.editing_destination && s.editing_template;
                 let value=s.naming_template.as_str();
-                let load=" Load preset ▾ ";
+                let load=" Load template ▾ ";
                 let custom=" Custom… ";
                 let load_width=load.chars().count() as u16;
                 let custom_width=custom.chars().count() as u16;
@@ -1570,12 +1570,13 @@ fn draw_output_with_hover(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
                 // Neither a collision nor an invalid token may replace the
                 // highlighted item's live destination path. The separate
                 // result caption communicates the warning/blocker.
-                let preview=if let Some(path)=s.native_preview_path_for_template(template) {
-                    format!("→ {}",compact_folder_path(&path,naming.width.saturating_sub(2)))
-                } else { "→ Select a playable track to preview its path".into() };
+                let preview=s.native_preview_path_for_template(template)
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Select a playable track to preview its path".into());
                 let color=if invalid.is_some() {theme.warning} else {colors.soft};
-                frame.render_widget(Paragraph::new(preview).style(Style::default()
-                    .bg(bg).fg(color)),Rect::new(naming.x,naming.y+1,naming.width,1));
+                super::template_builder::draw_full_path_preview(frame,buttons,
+                    Rect::new(naming.x,naming.y+1,naming.width,1),
+                    &preview,s.naming_preview_page,Style::default().bg(bg).fg(color));
             }
         }
     }
@@ -3185,6 +3186,106 @@ mod extract_r3_render_tests {
     }
 
     #[test]
+    fn corrective_native_result_pages_match_the_worker_and_leave_controls_reachable() {
+        use crate::tui::app::{TemplateBuilderFocus,TemplateBuilderState,TemplateTarget};
+        let theme=crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        let mut state=sacd_state(false,false);
+        state.destination=std::path::PathBuf::from("/home/user/Music/Extracted/A Carefully Organized Listening Library");
+        state.contents.album_artist=Some("pink floyd and the very long ensemble name".into());
+        state.contents.album_title=Some("wish you were here and other remarkable recordings".into());
+        state.contents.year=Some("1975".into());
+        state.contents.presentations[0].tracks[0].title=Some(
+            "shine on you crazy diamond parts one through nine and a long bonus title".into());
+        state.naming_template=
+            "%ALBUM_ARTIST% - %ALBUM% (%YEAR%)/%TRACKNUMBER% - %TITLE%".into();
+        state.focus=ExtractFocus::Output;
+        state.output_cursor=state.output_rows().iter().position(|row| *row=="Naming").unwrap();
+        for (width,height) in [(80u16,24u16),(100,30)] {
+            for capitalize in [false,true] {
+                state.capitalize_naming=capitalize;
+                let expected=state.native_preview_path_for_template_case(
+                    &state.naming_template,capitalize).unwrap().to_string_lossy().into_owned();
+                assert!(expected.starts_with("/home/user/Music/Extracted/"));
+                assert!(expected.ends_with(".dsf"));
+                let area=Rect::new(2,2,width-4,16);
+                let preview_width=area.width-4;
+                let pages=crate::tui::template_builder::path_preview_window(&expected,preview_width,0).total;
+                assert!(pages>1);
+                let mut terminal=Terminal::new(TestBackend::new(width,height)).unwrap();
+                let mut reconstructed=String::new();
+                for page in 0..pages {
+                    state.naming_preview_page=page;
+                    let mut buttons=ButtonRenderMap::new();
+                    terminal.draw(|frame|draw_output_with_hover(
+                        frame,&state,area,&mut buttons,theme,false,None)).unwrap();
+                    let prev=buttons.button_rect(TuiButton::NamingPreviewPrevious)
+                        .expect("read-only preview navigation remains in output area");
+                    let next=buttons.button_rect(TuiButton::NamingPreviewNext).unwrap();
+                    assert_eq!(prev.y,next.y);
+                    assert!(next.x<area.x+area.width);
+                    let view=crate::tui::template_builder::path_preview_window(&expected,preview_width,page);
+                    reconstructed.push_str(&view.visible);
+                    let row=(area.x..area.x+area.width)
+                        .map(|x|terminal.backend().buffer().get(x,prev.y).symbol().to_owned())
+                        .collect::<Vec<_>>().join("");
+                    assert!(row.contains(&format!("→ {}",view.visible)),
+                        "{width}x{height} page {page}: {row}");
+                }
+                assert_eq!(reconstructed,expected,
+                    "every resolved folder and filename component must be inspectable");
+                let mut builder=TemplateBuilderState::new(TemplateTarget::Filename,
+                    &state.naming_template,TemplateBuilderFocus::TemplateInput);
+                builder.return_to_extract=Some(Box::new(state.clone()));
+                builder.capitalize=capitalize;
+                let mut buttons=ButtonRenderMap::new();
+                terminal.draw(|frame|crate::tui::template_builder::draw_template_builder(
+                    frame,&builder,&mut buttons,theme)).unwrap();
+                let popup=crate::tui::template_builder::builder_popup(Rect::new(0,0,width,height),&builder).unwrap();
+                let preview_width=popup.width-2;
+                let pages=crate::tui::template_builder::path_preview_window(&expected,preview_width,0).total;
+                let mut all=String::new();
+                for page in 0..pages {
+                    builder.preview_page=page;
+                    buttons.clear();
+                    terminal.draw(|frame|crate::tui::template_builder::draw_template_builder(
+                        frame,&builder,&mut buttons,theme)).unwrap();
+                    let view=crate::tui::template_builder::path_preview_window(&expected,preview_width,page);
+                    all.push_str(&view.visible);
+                    let nav=buttons.button_rect(TuiButton::NamingPreviewNext).unwrap();
+                    let row=(popup.x+1..popup.x+popup.width-1)
+                        .map(|x|terminal.backend().buffer().get(x,nav.y).symbol().to_owned())
+                        .collect::<Vec<_>>().join("");
+                    assert!(row.contains(&format!("→ {}",view.visible)),
+                        "Custom preview page {page}: {row}");
+                    for btn in [TuiButton::TemplateBuilderApply,TuiButton::TemplateBuilderSave,
+                        TuiButton::TemplateBuilderClear,TuiButton::TemplateBuilderDelete] {
+                        let rect=buttons.button_rect(btn).expect("Custom footer still visible");
+                        assert_eq!(buttons.find_button_at(rect.x,rect.y),Some(btn));
+                    }
+                }
+                assert_eq!(all,expected,"Custom must page the full native worker path");
+                let mut buttons=ButtonRenderMap::new();
+                // Exercise the actual responsive Extract dialog, not only an
+                // isolated output panel: the 80-column layout uses tabs.
+                state.naming_preview_page = 0;
+                terminal.draw(|frame|draw(frame,&state,Path::new("/tmp"),&mut buttons,theme)).unwrap();
+                let preview_arrow=buttons.button_rect(TuiButton::NamingPreviewNext)
+                    .expect("full Extract dialog must expose naming path navigation");
+                let visible_row=(0..width)
+                    .map(|x|terminal.backend().buffer().get(x,preview_arrow.y).symbol().to_owned())
+                    .collect::<Vec<_>>().join("");
+                assert!(visible_row.contains("→ ") && visible_row.contains(&expected.chars().take(8).collect::<String>()),
+                    "full dialog must display its path preview at {width}x{height}: {visible_row}");
+                for btn in [TuiButton::DiscBrowserConvert,TuiButton::DiscBrowserOptions,
+                    TuiButton::DiscBrowserClose] {
+                    let rect=buttons.button_rect(btn).expect("Extract footer must stay reachable");
+                    assert_eq!(buttons.find_button_at(rect.x,rect.y),Some(btn));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn r27_naming_preview_uses_worker_path_and_both_shared_controls_have_hitboxes() {
         let theme = crate::tui::theme::theme_by_slug_or_default("tokyo-night");
         let mut state = sacd_state(false, false);
@@ -3334,7 +3435,7 @@ mod extract_r3_render_tests {
         terminal.draw(|frame| draw_output_with_hover(frame, &state, area,
             &mut buttons, theme, true, Some(TuiButton::DiscBrowserNamingLoad))).unwrap();
         let hovered = buttons.button_rect(TuiButton::DiscBrowserNamingLoad)
-            .expect("Load preset visible");
+            .expect("Load template visible");
         assert_eq!(buttons.find_button_at(hovered.x, hovered.y),
             Some(TuiButton::DiscBrowserNamingLoad));
         assert_eq!(terminal.backend().buffer().get(hovered.x, hovered.y).bg,

@@ -418,6 +418,9 @@ pub enum TuiButton {
     DiscBrowserNaming,
     DiscBrowserNamingLoad,
     DiscBrowserNamingCustom,
+    /// Read-only naming result: page through the complete generated path.
+    NamingPreviewPrevious,
+    NamingPreviewNext,
     DiscBrowserOverwrite,
     DiscBrowserExtract,
     DiscBrowserOptions,
@@ -456,6 +459,7 @@ pub enum TuiButton {
     TemplateLoadFilenameButton,
     // Template builder overlay: clickable elements.
     TemplateBuilderInput,
+    TemplateBuilderCapitalization,
     TemplateBuilderToken(usize),
     TemplateBuilderSavedItem(usize),
     TemplateBuilderApply,
@@ -618,6 +622,8 @@ impl TuiButton {
             | Self::DiscBrowserNaming
             | Self::DiscBrowserNamingLoad
             | Self::DiscBrowserNamingCustom
+            | Self::NamingPreviewPrevious
+            | Self::NamingPreviewNext
             | Self::DiscBrowserOverwrite
             | Self::DiscBrowserExtract
             | Self::DiscBrowserOptions
@@ -643,6 +649,7 @@ impl TuiButton {
             | Self::ActionsConfigPreview
             | Self::ActionsConfigModal
             | Self::TemplateBuilderInput
+            | Self::TemplateBuilderCapitalization
             | Self::TemplateBuilderToken(_)
             | Self::BulkRenameTemplateInput
             | Self::TemplateBuilderSavedItem(_)

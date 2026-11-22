@@ -420,6 +420,63 @@ pub enum CaseTransform {
     Lower,
 }
 
+/// Internal Convert request marker. The editor and saved templates keep the
+/// pattern and toggle separate. The planner removes this marker before token
+/// substitution. Its position also distinguishes an automatic disc-folder
+/// prefix from components authored in the filename template.
+const NAMING_CAPITALIZATION_MARKER: &str = "\u{001e}tonepoet-title-case\u{001e}";
+
+pub(crate) fn encode_naming_capitalization(template: &str, enabled: bool) -> String {
+    if enabled && !template.contains(NAMING_CAPITALIZATION_MARKER) {
+        format!("{NAMING_CAPITALIZATION_MARKER}{template}")
+    } else {
+        template.to_owned()
+    }
+}
+
+/// Return the unmodified planner prefix, the authored pattern, and its flag.
+/// For ordinary templates the prefix is empty and the flag is false.
+pub(crate) fn decode_naming_capitalization(template: &str) -> (&str, &str, bool) {
+    match template.split_once(NAMING_CAPITALIZATION_MARKER) {
+        Some((prefix, authored)) => (prefix, authored, true),
+        None => ("", template, false),
+    }
+}
+
+/// The standard filename and album-folder separator divides independently
+/// named sections. Restart the existing title-case rules after it, so a
+/// track-number prefix does not turn a title's first word into a stopword.
+fn capitalize_naming_component(value: &str) -> String {
+    value.split(" - ").map(capitalize_title_unlogged).collect::<Vec<_>>().join(" - ")
+}
+
+/// Capitalize each *rendered* path component, after tag expansion has
+/// sanitized metadata. Keep any recognized explicit audio extension verbatim.
+/// Automatically appended extensions never enter this function. Callers apply
+/// this only to the template result, never to the user's destination root or
+/// automatically selected program folders.
+pub(crate) fn capitalize_naming_path(value: &str, extension: Option<&str>) -> String {
+    let mut parts: Vec<&str> = value.split('/').collect();
+    let leaf = parts.pop().unwrap_or_default();
+    let mut result = parts.into_iter()
+        .map(capitalize_naming_component)
+        .collect::<Vec<_>>();
+    let suffix = leaf.rsplit_once('.').and_then(|(stem, ext)| {
+        let matches_native = extension.is_some_and(|expected| ext.eq_ignore_ascii_case(expected));
+        // An explicitly authored extension need not be among today's output
+        // formats. Recognize a compact extension token rather than imposing
+        // a hard-coded list that could change its spelling on new formats.
+        let explicit_extension = !ext.is_empty() && ext.chars().count() <= 32
+            && ext.chars().all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-');
+        (matches_native || explicit_extension).then_some((stem, ext))
+    });
+    result.push(match suffix {
+        Some((stem, ext)) => format!("{}.{}", capitalize_naming_component(stem), ext),
+        None => capitalize_naming_component(leaf),
+    });
+    result.join("/")
+}
+
 /// Apply a Unicode-preserving case-only transform. Title case delegates to the
 /// same punctuation-aware naming logic used by metadata fix-caps; upper/lower
 /// use Rust's full Unicode mappings and therefore never transliterate or drop
@@ -434,11 +491,20 @@ pub fn transform_case(value: &str, transform: CaseTransform) -> String {
 
 pub fn capitalize_title(title: &str) -> String {
     log::info!("capitalize_title input: '{}'", title);
+    let result = capitalize_title_unlogged(title);
+    log::info!("capitalize_title output: '{}'", result);
+    result
+}
 
+// Live naming previews reuse the same rules without logging on each redraw.
+// Compile this invariant expression once rather than once per component.
+fn capitalize_title_unlogged(title: &str) -> String {
     // Parenthetical sections are independent title-case sections, but the
     // original punctuation and spacing are retained byte-for-byte. A case-only
     // transform must never silently insert, remove, or reorder tokens.
-    let re = Regex::new(r"(\([^)]*\))").expect("parenthetical regex is valid");
+    static PARENTHESES: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = PARENTHESES.get_or_init(||
+        Regex::new(r"(\([^)]*\))").expect("parenthetical regex is valid"));
     let mut result = String::with_capacity(title.len());
     let mut last_end = 0;
     for cap in re.find_iter(title) {
@@ -456,7 +522,6 @@ pub fn capitalize_title(title: &str) -> String {
     }
     result.push_str(&capitalize_section(&title[last_end..]));
 
-    log::info!("capitalize_title output: '{}'", result);
     result
 }
 
@@ -832,6 +897,32 @@ pub fn apply_all_tags(folder_path: &Path) -> Result<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn naming_capitalization_scopes_components_and_preserves_extensions() {
+        let path = "pink floyd/the dark side of the moon/01 - rock and roll.dsf";
+        assert_eq!(capitalize_naming_path(path, Some("dsf")),
+            "Pink Floyd/The Dark Side of the Moon/01 - Rock and Roll.dsf");
+        assert_eq!(capitalize_naming_path("the wall/another brick in the wall.FLAC", None),
+            "The Wall/Another Brick in the Wall.FLAC");
+        assert_eq!(capitalize_naming_path("the wall/a test.DXD_2", None),
+            "The Wall/A Test.DXD_2");
+        assert_eq!(capitalize_naming_path("the wall/another brick in the wall", None),
+            "The Wall/Another Brick in the Wall");
+    }
+
+    #[test]
+    fn naming_case_carrier_is_idempotent_and_isolated_from_plain_templates() {
+        let plain = "%TRACKNN% - %TITLE%.%EXT%";
+        assert_eq!(encode_naming_capitalization(plain, false), plain);
+        assert_eq!(decode_naming_capitalization(plain), ("", plain, false));
+        let enabled = encode_naming_capitalization(plain, true);
+        assert_eq!(decode_naming_capitalization(&enabled), ("", plain, true));
+        assert_eq!(encode_naming_capitalization(&enabled, true), enabled);
+        let with_disc_folder = format!("%DISC_FOLDER%/{enabled}");
+        assert_eq!(decode_naming_capitalization(&with_disc_folder),
+            ("%DISC_FOLDER%/", plain, true));
+    }
 
     #[test]
     fn test_extract_artist_album() {

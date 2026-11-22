@@ -317,6 +317,9 @@ pub struct DiscBrowserState {
     pub destination_feedback: Option<DestinationFeedback>,
     pub editing_template: bool,
     pub naming_template: String,
+    pub capitalize_naming: bool,
+    /// Read-only naming result page; no effect on the job or its destination.
+    pub naming_preview_page: usize,
     pub program_subfolders: bool,
     pub overwrite_policy: crate::convert::pipeline::native_extract::NativeOverwritePolicy,
     pub extraction_log: bool,
@@ -470,6 +473,8 @@ impl DiscBrowserState {
             destination_feedback: None,
             editing_template: false,
             naming_template: "%TRACKNUMBER% - %TITLE%".into(),
+            capitalize_naming: false,
+            naming_preview_page: 0,
             program_subfolders: true,
             overwrite_policy: crate::convert::pipeline::native_extract::NativeOverwritePolicy::Fail,
             extraction_log: true,
@@ -1366,8 +1371,14 @@ impl DiscBrowserState {
     /// implicit-folder rule for that draft, not the last committed template;
     /// live preview, collision checks, and publication must agree.
     fn native_job_for_template(&self, template: &str) -> crate::convert::pipeline::native_extract::NativeExtractionJob {
+        self.native_job_for_template_case(template, self.capitalize_naming)
+    }
+
+    fn native_job_for_template_case(&self, template: &str, capitalize: bool)
+        -> crate::convert::pipeline::native_extract::NativeExtractionJob {
         let mut job = self.native_job(PathBuf::new());
         job.naming_template = template.to_owned();
+        job.capitalize_naming = capitalize;
         job.program_subfolders = job.programs.len() > 1 &&
             !crate::convert::pipeline::native_extract::native_template_has_program_token(template);
         job
@@ -1456,12 +1467,17 @@ impl DiscBrowserState {
     }
 
     pub fn native_preview_path_for_template(&self, template: &str) -> Option<PathBuf> {
+        self.native_preview_path_for_template_case(template, self.capitalize_naming)
+    }
+
+    pub fn native_preview_path_for_template_case(&self, template: &str, capitalize: bool)
+        -> Option<PathBuf> {
         use crate::convert::pipeline::native_extract::{proposed_destination,
             proposed_destination_for_program};
         if !self.is_extractable(self.cursor) { return None; }
         let authored = self.contents.presentations.get(self.cursor)?;
         let program = self.native_program_choice(self.cursor,authored,Some(self.item_cursor))?;
-        let mut job = self.native_job_for_template(template);
+        let mut job = self.native_job_for_template_case(template, capitalize);
         // The highlighted preview can describe an unchecked track. That
         // segment is absent from the publication plan, but it still decides
         // the track's original carrier extension.
@@ -1727,7 +1743,7 @@ impl DiscBrowserState {
             archive_length:self.archive_length, archive_modified:self.archive_modified,
             archive_password:self.archive_password.clone(), destination:self.destination.clone(), working_root,
             wav_container:self.wav_container, assume_decrypted:self.assume_decrypted,downmix:self.downmix,
-            naming_template:self.naming_template.clone(), program_subfolders,
+            naming_template:self.naming_template.clone(), capitalize_naming:self.capitalize_naming, program_subfolders,
             overwrite_policy:self.overwrite_policy, extraction_log:self.extraction_log,
             options: self.current_extract_settings(),
             program_log_paths:Vec::new(), round4_layout:true,

@@ -133,8 +133,10 @@ fn fallback_options(output_opts: &OutputOptionsState, config: &TonepoetConfig) -
     options.target_bit_depth = (!format.bit_depth.selected_value().is_source())
         .then_some(format.bit_depth.selected_value().to_backend_depth());
     options.dither_type = Some(*format.dither.selected_value());
-    options.naming_template = Some(output_opts.filename_template.clone());
-    options.folder_template = Some(output_opts.folder_template.clone());
+    options.naming_template = Some(crate::convert::renaming::encode_naming_capitalization(
+            &output_opts.filename_template, output_opts.filename_template_capitalize));
+    options.folder_template = Some(crate::convert::renaming::encode_naming_capitalization(
+            &output_opts.folder_template, output_opts.folder_template_capitalize));
     options.output_dir = output_opts.dest_path.clone();
     options.merge_to_single = matches!(*output_opts.merge.selected_value(), MergeMode::SingleImage);
     options.preserve_metadata = true;
@@ -152,11 +154,11 @@ fn fallback_options(output_opts: &OutputOptionsState, config: &TonepoetConfig) -
     if let Some(settings) = options.pipeline_settings.as_mut() {
         settings.force_encode = *output_opts.force_encode.selected_value();
     }
-    // Keep the raw user template here. The conversion/request construction
-    // boundary is responsible for applying `create_disc_subfolders` through
-    // `ConversionOptions::effective_naming_template`, so every entrypoint uses
-    // one canonical projection.
-    options.naming_template = Some(output_opts.filename_template.clone());
+    // Preserve the authored template with its optional capitalization marker.
+    // `ConversionOptions::effective_naming_template` adds any automatic
+    // disc-folder prefix exactly once at the request boundary.
+    options.naming_template = Some(crate::convert::renaming::encode_naming_capitalization(
+            &output_opts.filename_template, output_opts.filename_template_capitalize));
     options
 }
 
@@ -270,11 +272,12 @@ pub fn try_pills_to_options(
         dither_type,
         calculate_replaygain,
         replaygain_mode,
-        // Store the raw editable template. `create_disc_subfolders` is applied
-        // exactly once by `ConversionOptions::effective_naming_template` when
-        // building the real PipelineRequest/NamingPolicy.
-        naming_template: Some(output_opts.filename_template.clone()),
-        folder_template: Some(output_opts.folder_template.clone()),
+        // Store the authored template with its case marker; the request
+        // projection adds automatic disc folders exactly once.
+        naming_template: Some(crate::convert::renaming::encode_naming_capitalization(
+            &output_opts.filename_template, output_opts.filename_template_capitalize)),
+        folder_template: Some(crate::convert::renaming::encode_naming_capitalization(
+            &output_opts.folder_template, output_opts.folder_template_capitalize)),
         output_dir: output_opts.dest_path.clone(),
         merge_to_single: matches!(merge, MergeMode::SingleImage),
         preserve_metadata: true,

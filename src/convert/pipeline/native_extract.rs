@@ -416,6 +416,8 @@ pub struct NativeExtractionJob {
     pub downmix: DvdaDownmixPolicy,
     #[serde(default = "default_naming_template")]
     pub naming_template: String,
+    #[serde(default)]
+    pub capitalize_naming: bool,
     #[serde(default = "default_yes")]
     pub program_subfolders: bool,
     #[serde(default = "default_overwrite_policy")]
@@ -1511,6 +1513,7 @@ pub(crate) fn render_native_extraction_log_with_outcome(
     lines.push("Settings".to_owned());
     lines.push(format!("Folder: {}", quoted(&job.destination.to_string_lossy())));
     lines.push(format!("Naming: {}", quoted(&job.naming_template)));
+    lines.push(format!("Naming capitalization: {}", yes_no(job.capitalize_naming)));
     lines.push(format!("Separate folders by {unit}: {}", yes_no(job.program_subfolders)));
     lines.push(format!("Files: {}", if job.file_per_program {
         format!("one per {unit}")
@@ -2124,7 +2127,13 @@ pub(crate) fn proposed_destination_for_program(job: &NativeExtractionJob, progra
         sanitize_component(&program.label)
     } else { render_naming_template_for_extension(&job.naming_template, program, &virtual_track,
         extraction_extension(job, program), &job.disc_identity) };
+    if job.capitalize_naming {
+        stem = crate::convert::renaming::capitalize_naming_path(
+            &stem, Some(extraction_extension(job,program)));
+    }
     if prefix_implicit_program_name(job) {
+        // The program label is an automatic routing prefix, not authored by
+        // the naming template; leave its spelling untouched.
         stem = if legacy {sanitize_component(&format!("{} - {stem}",program.label))}
             else {prefix_flat_native_name(&program.label,stem)};
     }
@@ -2584,7 +2593,7 @@ fn render_naming_template_for_extension(template: &str, program: &NativeProgramC
         if token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             let value = native_naming_value(token,program,track,extension,identity,&album,&title_extra)
                 .unwrap_or_default();
-            // Keep Convert's metadata naming rules for shared presets. Empty
+            // Keep Convert's metadata naming rules for shared templates. Empty
             // values stay empty so the existing conditional pass can drop
             // missing qualifiers rather than rendering "untitled".
             tokens.insert(token.to_owned(), if value.trim().is_empty() {
@@ -2651,9 +2660,13 @@ pub(crate) fn proposed_destination(job: &NativeExtractionJob, program: &NativePr
     let legacy = legacy_naming_template(&job.naming_template);
     let mut stem = render_naming_template_for_extension(&job.naming_template, program, track,
         extension, &job.disc_identity);
+    if job.capitalize_naming {
+        stem = crate::convert::renaming::capitalize_naming_path(&stem, Some(extension));
+    }
     if prefix_implicit_program_name(job) {
         // The default can be reused across unrelated authored streams. Prefix
-        // the stream identity when flattening, without guessing unique names.
+        // the stream identity when flattening, without changing the automatic
+        // stream label's spelling or the authored subfolder structure.
         stem = if legacy {sanitize_component(&format!("{} - {stem}",program.label))}
             else {prefix_flat_native_name(&program.label,stem)};
     }
@@ -3244,7 +3257,7 @@ mod tests {
             }],
             destination: destination.to_path_buf(), working_root: scratch.to_path_buf(),
             wav_container: NativeWavContainer::Automatic, assume_decrypted: false,
-            downmix: DvdaDownmixPolicy::None, naming_template: default_naming_template(),
+            downmix: DvdaDownmixPolicy::None, naming_template: default_naming_template(), capitalize_naming: false,
             program_subfolders: true, overwrite_policy: NativeOverwritePolicy::Fail,
             extraction_log: false, options: NativeExtractSettings {create_cue:false, write_chapters:false, ..Default::default()}, program_log_paths: Vec::new(), round4_layout: false, file_per_program: false, cue: false,
             transfer_tags: false, sacd_dff: false, tag_source: default_tag_source(),
@@ -4070,6 +4083,33 @@ mod tests {
     }
 
     #[test]
+    fn naming_case_changes_authored_folder_and_stem_not_root_or_extension() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = fixture_job(&temp.path().join("my lower-case output"), temp.path());
+        job.programs[0].tags.artist = Some("pink floyd".into());
+        job.programs[0].tracks[0].tags.title = Some("the dark side of the moon".into());
+        job.naming_template = "%ARTIST%/%TRACKNN% - %TITLE%.%EXTENSION%".into();
+        let original = proposed_destination(&job, &job.programs[0], &job.programs[0].tracks[0]);
+        assert_eq!(original, job.destination.join(
+            "Stereo/pink floyd/01 - the dark side of the moon.dsf"));
+        job.capitalize_naming = true;
+        let capitalized = proposed_destination(&job, &job.programs[0], &job.programs[0].tracks[0]);
+        assert_eq!(capitalized, job.destination.join(
+            "Stereo/Pink Floyd/01 - The Dark Side of the Moon.dsf"));
+        assert!(capitalized.starts_with(&job.destination));
+
+        // A slash originating in metadata must not become another folder.
+        job.programs[0].tags.artist = Some("pink/floyd".into());
+        let escaped = proposed_destination(&job, &job.programs[0], &job.programs[0].tracks[0]);
+        assert_eq!(escaped, capitalized);
+
+        // A template-authored explicit extension is not title-cased.
+        job.naming_template = "%ARTIST%/%TRACKNN% - %TITLE%.DSF".into();
+        assert_eq!(proposed_destination(&job, &job.programs[0], &job.programs[0].tracks[0]),
+            job.destination.join("Stereo/Pink Floyd/01 - The Dark Side of the Moon.DSF"));
+    }
+
+    #[test]
     fn r28_convert_preset_disc_number_and_conditional_title_extra_match_convert() {
         let temp = tempfile::tempdir().unwrap();
         let mut job = fixture_job(&temp.path().join("output"), temp.path());
@@ -4439,7 +4479,7 @@ mod tests {
             wav_container: NativeWavContainer::Automatic,
             assume_decrypted: false,
             downmix: DvdaDownmixPolicy::None,
-            naming_template:default_naming_template(),program_subfolders:true,
+            naming_template:default_naming_template(), capitalize_naming: false,program_subfolders:true,
             overwrite_policy:NativeOverwritePolicy::Fail,extraction_log:false, options: NativeExtractSettings {create_cue:false, write_chapters:false, ..Default::default()}, program_log_paths: Vec::new(), round4_layout: false,
             file_per_program:false,cue:false,
             transfer_tags:false,sacd_dff: false, tag_source:default_tag_source(),tag_fields:default_tag_fields(),tag_artwork:false,
@@ -4800,7 +4840,7 @@ mod tests {
                 source_channels:Some(2), source_rate:Some(2822400), angle:1,source_layout:None, is_lossless:true, tags:NativeTagValues::default(), authored_tags: None }],
             destination:"/tmp/dest".into(),working_root:"/tmp".into(),
             wav_container:NativeWavContainer::Automatic,assume_decrypted:false,downmix:DvdaDownmixPolicy::None,
-            naming_template:default_naming_template(),program_subfolders:true,
+            naming_template:default_naming_template(), capitalize_naming: false,program_subfolders:true,
             overwrite_policy:NativeOverwritePolicy::Fail,extraction_log:false, options: NativeExtractSettings {create_cue:false, write_chapters:false, ..Default::default()}, program_log_paths: Vec::new(), round4_layout: false,file_per_program:false,cue:false,
             transfer_tags:false,sacd_dff: false, tag_source:default_tag_source(),tag_fields:default_tag_fields(),tag_artwork:false };
         assert!(validate_job(&job).unwrap_err().contains("duplicate"));

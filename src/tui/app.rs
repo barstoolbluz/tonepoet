@@ -8250,6 +8250,8 @@ pub struct OutputOptionsState {
     pub dest_path: Option<PathBuf>,
     pub folder_template: String,
     pub filename_template: String,
+    pub folder_template_capitalize: bool,
+    pub filename_template_capitalize: bool,
     pub merge: PillState<MergeMode>,
     pub companion_extensions: String,
     pub companion_folders: String,
@@ -8293,6 +8295,8 @@ impl OutputOptionsState {
             dest_path: None,
             folder_template: "%ARTIST%/%ALBUM% (%YEAR%)".to_string(),
             filename_template: "%TRACKNN% - %TITLE%.%EXT%".to_string(),
+            folder_template_capitalize: false,
+            filename_template_capitalize: false,
             merge,
             companion_extensions: crate::convert::formats::default_companion_extensions().join(", "),
             companion_folders: String::new(),
@@ -9024,13 +9028,14 @@ pub enum ActiveOverlay {
     /// Template picker overlay for loading saved templates.
     TemplatePicker {
         target: TemplateTarget,
-        templates: Vec<String>,
+        templates: Vec<super::template_builder::NamingTemplate>,
         selected: usize,
         scroll: usize,
         /// Precomputed preview of the selected template.
         preview: String,
         /// Current field value (for "active" badge).
         active_template: Option<String>,
+        active_capitalization: bool,
         /// Return to the extract form, not Convert, when opened from Naming.
         return_to_extract: Option<Box<crate::tui::disc_browser::DiscBrowserState>>,
     },
@@ -9084,6 +9089,7 @@ pub enum TemplateTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TemplateBuilderFocus {
     TemplateInput,
+    Capitalization,
     SavedList,
     TokenGrid,
 }
@@ -9093,14 +9099,20 @@ pub enum TemplateBuilderFocus {
 pub struct TemplateBuilderState {
     /// The editable template line.
     pub template_input: crate::tui::text_input::TextInputState,
+    pub capitalize: bool,
+    /// Read-only rendered-path page. The editable template caret is separate.
+    pub preview_page: usize,
+    /// Convert's selected container extension, captured when the editor opens.
+    /// Native extraction obtains its extension from the extraction planner.
+    pub output_extension: String,
     /// Whether this builds a folder or filename template.
     pub target: TemplateTarget,
     /// Which section has keyboard focus.
     pub focus: TemplateBuilderFocus,
     /// Cursor position in the token/separator grid.
     pub grid_cursor: usize,
-    /// Saved template strings loaded from disk.
-    pub saved_templates: Vec<String>,
+    /// Saved naming patterns with their capitalization choices.
+    pub saved_templates: Vec<super::template_builder::NamingTemplate>,
     /// Selected index in the saved templates list.
     pub saved_selected: usize,
     /// Scroll offset for the saved templates list.

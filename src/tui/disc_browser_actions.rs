@@ -496,11 +496,12 @@ fn open_native_naming_picker(app: &mut AppState) {
     focus_native_row(&mut state,"Naming");
     let templates=super::template_builder::list_templates(TemplateTarget::Filename);
     let preview=templates.first().map(|template|
-        super::template_builder::render_template_preview(template)).unwrap_or_default();
+        super::template_builder::preview_for_context(template, Some(&state))).unwrap_or_default();
     let active_template=Some(state.naming_template.clone());
+    let active_capitalization=state.capitalize_naming;
     app.active_overlay=ActiveOverlay::TemplatePicker {
         target:TemplateTarget::Filename,templates,selected:0,scroll:0,preview,
-        active_template,return_to_extract:Some(state),
+        active_template,active_capitalization,return_to_extract:Some(state),
     };
 }
 
@@ -516,6 +517,7 @@ fn open_native_naming_builder(app: &mut AppState) {
     let mut builder=TemplateBuilderState::new(TemplateTarget::Filename,
         &state.naming_template,TemplateBuilderFocus::TemplateInput);
     builder.disc_format=Some(state.contents.format);
+    builder.capitalize=state.capitalize_naming;
     builder.return_to_extract=Some(state);
     app.active_overlay=ActiveOverlay::TemplateBuilder(Box::new(builder));
 }
@@ -931,6 +933,14 @@ pub fn handle_disc_browser_button_click_with_shift(
         }
         TuiButton::DiscBrowserNamingCustom => {
             open_native_naming_builder(app);
+            true
+        }
+        TuiButton::NamingPreviewPrevious | TuiButton::NamingPreviewNext => {
+            let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { return false; };
+            focus_native_row(state, "Naming");
+            state.naming_preview_page = if matches!(button, TuiButton::NamingPreviewPrevious) {
+                state.naming_preview_page.saturating_sub(1)
+            } else { state.naming_preview_page.saturating_add(1) };
             true
         }
         TuiButton::DiscBrowserExtract => {
@@ -1409,7 +1419,7 @@ fn native_key_bindings(state: &DiscBrowserState) -> Vec<NativeKeyBinding> {
                 "Keep DST" =>
                     add(KeyCode::Char(' '), M::NONE, "Space toggle", A::Space),
                 "Naming" => {
-                    add(KeyCode::Char('l'),M::NONE,"l presets",A::NamingLoad);
+                    add(KeyCode::Char('l'),M::NONE,"l templates",A::NamingLoad);
                     add(KeyCode::Char('b'),M::NONE,"b builder",A::NamingCustom);
                 },
                 _ => {}
@@ -1700,6 +1710,7 @@ fn commit_native_text_edit(state:&mut DiscBrowserState) -> bool {
     if state.editing_template {
         if value.is_empty() {return false;}
         state.naming_template=value;
+        state.naming_preview_page = 0;
     } else {
         let path=expand_native_home(&value);
         if !path.is_absolute() || path.components().any(|component|
@@ -1709,6 +1720,7 @@ fn commit_native_text_edit(state:&mut DiscBrowserState) -> bool {
             return false;
         }
         state.destination=path;
+        state.naming_preview_page = 0;
     }
     cancel_native_text_edit(state);
     true
@@ -1777,6 +1789,17 @@ pub fn handle_disc_browser_key(
             state.maximized = !state.maximized;
         }
         return;
+    }
+    if let ActiveOverlay::DiscBrowser(state)=&mut app.active_overlay {
+        if state.panel.is_none() && !state.overwrite_open && !state.editing_destination
+            && state.focus==ExtractFocus::Output && state.current_output_row()=="Naming"
+            && key.modifiers==KeyModifiers::ALT
+            && matches!(key.code, KeyCode::Left | KeyCode::Right) {
+            state.naming_preview_page = if key.code == KeyCode::Left {
+                state.naming_preview_page.saturating_sub(1)
+            } else { state.naming_preview_page.saturating_add(1) };
+            return;
+        }
     }
     if let ActiveOverlay::DiscBrowser(state)=&app.active_overlay {
         if state.panel.is_none() && !state.overwrite_open && !state.editing_destination
@@ -2729,7 +2752,7 @@ mod tests {
         assert!(matches!(&app.active_overlay,ActiveOverlay::TemplatePicker{
             return_to_extract:Some(_),..}));
         if let ActiveOverlay::TemplatePicker{templates,selected,..}=&mut app.active_overlay {
-            *templates=vec!["%TRACKNN% - %TITLE%".into()];
+            *templates=vec![super::super::template_builder::NamingTemplate::plain("%TRACKNN% - %TITLE%")];
             *selected=0;
         }
         crate::tui::keybindings::handle_key(&mut app,KeyEvent::new(KeyCode::Enter,M::NONE),&tx);
@@ -2741,6 +2764,68 @@ mod tests {
         crate::tui::keybindings::handle_key(&mut app,KeyEvent::new(KeyCode::Esc,M::NONE),&tx);
         assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
             if s.naming_template=="%TRACKNN% - %TITLE%"));
+    }
+
+    #[test]
+    fn naming_custom_capitalization_keyboard_toggle_commits_to_extract_job() {
+        use crate::tui::app::TemplateBuilderFocus;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers as M};
+        let contents = selectable_disc_contents(
+            PathBuf::from("disc.iso"), FolderDiscMarkerKind::Sacd);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::DiscBrowser(Box::new(
+            DiscBrowserState::new(contents, PathBuf::from("disc.iso"))));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        handle_disc_browser_button_click(
+            &mut app, &TuiButton::DiscBrowserNamingCustom, 1, &tx);
+        crate::tui::keybindings::handle_key(
+            &mut app, KeyEvent::new(KeyCode::Tab, M::NONE), &tx);
+        assert!(matches!(&app.active_overlay, ActiveOverlay::TemplateBuilder(builder)
+            if builder.focus == TemplateBuilderFocus::Capitalization && !builder.capitalize));
+        crate::tui::keybindings::handle_key(
+            &mut app, KeyEvent::new(KeyCode::Char(' '), M::NONE), &tx);
+        assert!(matches!(&app.active_overlay, ActiveOverlay::TemplateBuilder(builder)
+            if builder.capitalize));
+        crate::tui::keybindings::handle_key(
+            &mut app, KeyEvent::new(KeyCode::BackTab, M::NONE), &tx);
+        crate::tui::keybindings::handle_key(
+            &mut app, KeyEvent::new(KeyCode::Enter, M::NONE), &tx);
+        let ActiveOverlay::DiscBrowser(browser) = &app.active_overlay else {
+            panic!("naming builder must restore Extract on apply");
+        };
+        assert!(browser.capitalize_naming);
+        assert!(browser.native_job(PathBuf::new()).capitalize_naming);
+    }
+
+    #[test]
+    fn naming_result_keyboard_and_mouse_pages_do_not_change_template_or_focus() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers as M};
+        let contents=selectable_disc_contents(
+            PathBuf::from("disc.iso"),FolderDiscMarkerKind::Sacd);
+        let mut state=DiscBrowserState::new(contents,PathBuf::from("disc.iso"));
+        state.naming_template="%ALBUM_ARTIST%/%TRACKNUMBER% - %TITLE%".into();
+        focus_native_row(&mut state,"Naming");
+        let mut app=AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay=ActiveOverlay::DiscBrowser(Box::new(state));
+        let (tx,_rx)=tokio::sync::mpsc::channel(8);
+        handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Right,M::ALT),&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(browser)
+            if browser.naming_preview_page==1 && browser.current_output_row()=="Naming"
+                && browser.naming_template=="%ALBUM_ARTIST%/%TRACKNUMBER% - %TITLE%"));
+        handle_disc_browser_button_click(&mut app,&TuiButton::NamingPreviewPrevious,1,&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(browser)
+            if browser.naming_preview_page==0));
+        handle_disc_browser_button_click(&mut app,&TuiButton::DiscBrowserNamingCustom,1,&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::TemplateBuilder(_)));
+        crate::tui::keybindings::handle_key(
+            &mut app,KeyEvent::new(KeyCode::Right,M::ALT),&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::TemplateBuilder(builder)
+            if builder.preview_page==1
+                && builder.template_input.text=="%ALBUM_ARTIST%/%TRACKNUMBER% - %TITLE%"));
+        crate::tui::keybindings::handle_key(
+            &mut app,KeyEvent::new(KeyCode::Left,M::ALT),&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::TemplateBuilder(builder)
+            if builder.preview_page==0));
     }
 
     #[test]
@@ -2760,12 +2845,12 @@ mod tests {
         handle_disc_browser_button_click(&mut app,&TuiButton::DiscBrowserNamingLoad,1,&tx);
         let saved="%DISC%/%ALBUM% {%TITLE_EXTRA%}/%TRACKNN% - %TITLE%.%EXTENSION%";
         if let ActiveOverlay::TemplatePicker{templates,selected,..}=&mut app.active_overlay {
-            *templates=vec![saved.into()];
+            *templates=vec![super::super::template_builder::NamingTemplate::plain(saved)];
             *selected=0;
-        } else {panic!("shared Convert preset picker not opened");}
+        } else {panic!("shared naming template picker not opened");}
         crate::tui::keybindings::handle_key(&mut app,KeyEvent::new(KeyCode::Enter,M::NONE),&tx);
         let ActiveOverlay::DiscBrowser(loaded)=&app.active_overlay else {
-            panic!("preset picker did not return to Extract");
+            panic!("template picker did not return to Extract");
         };
         assert_eq!(loaded.naming_template,saved);
         assert_eq!(loaded.native_preview_path().unwrap(),PathBuf::from(
@@ -2774,7 +2859,7 @@ mod tests {
 
         handle_disc_browser_button_click(&mut app,&TuiButton::DiscBrowserNamingCustom,1,&tx);
         if let ActiveOverlay::TemplateBuilder(builder)=&mut app.active_overlay {
-            builder.saved_templates=(0..4).map(|n|format!("%ARTIST% - {n}")).collect();
+            builder.saved_templates=(0..4).map(|n|super::super::template_builder::NamingTemplate::plain(format!("%ARTIST% - {n}"))).collect();
             builder.template_input=crate::tui::text_input::TextInputState::new(
                 "%DISC%/%TRACKNN% - %TITLE%".into());
         } else {panic!("shared Convert builder not opened");}
@@ -2786,7 +2871,7 @@ mod tests {
                 frame,builder,&mut app.button_map,theme)).unwrap();
         }
         let apply=app.button_map.button_rect(TuiButton::TemplateBuilderApply)
-            .expect("Apply must be mouse-visible at 80x24 with four saved presets");
+            .expect("Apply must be mouse-visible at 80x24 with four saved templates");
         assert!(apply.y<24);
         crate::tui::keybindings::handle_mouse(&mut app, MouseEvent {
             kind:MouseEventKind::Down(MouseButton::Left),

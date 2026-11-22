@@ -714,6 +714,7 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
             scroll,
             ref preview,
             ref active_template,
+            active_capitalization,
             ref return_to_extract,
         } => {
             if let Some(browser) = return_to_extract.as_deref() {
@@ -729,6 +730,7 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
                 scroll,
                 preview,
                 active_template.as_deref(),
+                active_capitalization,
                 &mut app.button_map,
                 theme,
             );
@@ -9627,7 +9629,10 @@ mod tests {
             target: super::super::app::TemplateTarget::Filename,
             focus: super::super::app::TemplateBuilderFocus::TemplateInput,
             grid_cursor: 0,
-            saved_templates: vec!["%NN% - %TITLE%".to_string()],
+            saved_templates: vec![super::super::template_builder::NamingTemplate::plain("%NN% - %TITLE%")],
+            capitalize: false,
+            preview_page: 0,
+            output_extension: "flac".to_owned(),
             saved_selected: 0,
             saved_scroll: 0,
             token_scroll: 0,
