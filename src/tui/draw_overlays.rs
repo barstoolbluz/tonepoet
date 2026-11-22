@@ -21,6 +21,7 @@ fn template_builder_input_hit_rect(
     area: Rect,
     state: &super::app::TemplateBuilderState,
 ) -> Option<Rect> {
+    if state.save_dialog.is_some() {return None;}
     let popup = super::template_builder::builder_popup(area, state)?;
     // Match the rendered editor after "  Template:  " (13 cells). The label
     // and popup border are not text-input targets.
@@ -696,7 +697,7 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
             // The template renderer lives outside the round-4 source bundle,
             // but its layout contract is mirrored by the existing mouse handler
             // below. Register only the actual editable line with the shared
-            // text dispatcher; the renderer then records token, saved-row, and
+            // text dispatcher; the renderer then records token and
             // footer regions normally.
             if let Some(rect) = template_builder_input_hit_rect(f.size(), state) {
                 app.button_map
@@ -716,8 +717,12 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
             ref active_template,
             active_capitalization,
             ref return_to_extract,
+            ref return_to_builder,
         } => {
-            if let Some(browser) = return_to_extract.as_deref() {
+            let browser=return_to_builder.as_ref()
+                .and_then(|builder|builder.return_to_extract.as_deref())
+                .or(return_to_extract.as_deref());
+            if let Some(browser) = browser {
                 let scratch = crate::tui::disc_browser_actions::native_working_root(
                     browser, app.config.conversion.scratch_directory.as_deref());
                 crate::tui::disc_extract_render::draw(f,browser,&scratch,&mut app.button_map,theme);
@@ -9622,23 +9627,9 @@ mod tests {
 
     #[test]
     fn template_builder_hit_region_is_only_the_editable_line() {
-        let state = super::super::app::TemplateBuilderState {
-            template_input: super::super::text_input::TextInputState::new(
-                "%ARTIST% - %TITLE%".to_string(),
-            ),
-            target: super::super::app::TemplateTarget::Filename,
-            focus: super::super::app::TemplateBuilderFocus::TemplateInput,
-            grid_cursor: 0,
-            saved_templates: vec![super::super::template_builder::NamingTemplate::plain("%NN% - %TITLE%")],
-            capitalize: false,
-            preview_page: 0,
-            output_extension: "flac".to_owned(),
-            saved_selected: 0,
-            saved_scroll: 0,
-            token_scroll: 0,
-            return_to_extract: None,
-            disc_format: None,
-        };
+        let state = super::super::app::TemplateBuilderState::new(
+            super::super::app::TemplateTarget::Filename,"%ARTIST% - %TITLE%",
+            super::super::app::TemplateBuilderFocus::TemplateInput);
         let rect = template_builder_input_hit_rect(Rect::new(0, 0, 100, 40), &state)
             .expect("template input hit region");
         assert_eq!(rect.height, 1);

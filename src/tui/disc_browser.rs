@@ -318,8 +318,6 @@ pub struct DiscBrowserState {
     pub editing_template: bool,
     pub naming_template: String,
     pub capitalize_naming: bool,
-    /// Read-only naming result page; no effect on the job or its destination.
-    pub naming_preview_page: usize,
     pub program_subfolders: bool,
     pub overwrite_policy: crate::convert::pipeline::native_extract::NativeOverwritePolicy,
     pub extraction_log: bool,
@@ -474,7 +472,6 @@ impl DiscBrowserState {
             editing_template: false,
             naming_template: "%TRACKNUMBER% - %TITLE%".into(),
             capitalize_naming: false,
-            naming_preview_page: 0,
             program_subfolders: true,
             overwrite_policy: crate::convert::pipeline::native_extract::NativeOverwritePolicy::Fail,
             extraction_log: true,
@@ -1474,6 +1471,37 @@ impl DiscBrowserState {
         -> Option<PathBuf> {
         use crate::convert::pipeline::native_extract::{proposed_destination,
             proposed_destination_for_program};
+        let (job, program)=self.native_preview_job_and_program(template,capitalize)?;
+        if self.file_per_program {
+            Some(proposed_destination_for_program(&job,&program))
+        } else {
+            Some(proposed_destination(&job,&program,program.tracks.first()?))
+        }
+    }
+
+    /// The editor displays only the authored part. Run its one worker
+    /// renderer without doing a second, discarded full-path render during
+    /// routine Extract redraws.
+    pub fn native_preview_naming_for_template_case(&self, template: &str,
+        capitalize: bool) -> Option<String> {
+        use crate::convert::pipeline::native_extract::{authored_template_name_for_program,
+            authored_template_name_for_track,authored_template_name_for_archive};
+        let (job, program)=self.native_preview_job_and_program(template,capitalize)?;
+        if self.file_per_program {
+            Some(authored_template_name_for_program(&job,&program))
+        } else {
+            let track=program.tracks.first()?;
+            if self.contents.format == DiscFormat::Archive {
+                Some(authored_template_name_for_archive(&job,&program,track))
+            } else {
+                Some(authored_template_name_for_track(&job,&program,track))
+            }
+        }
+    }
+
+    fn native_preview_job_and_program(&self, template: &str,
+        capitalize: bool) -> Option<(crate::convert::pipeline::native_extract::NativeExtractionJob,
+        crate::convert::pipeline::native_extract::NativeProgramChoice)> {
         if !self.is_extractable(self.cursor) { return None; }
         let authored = self.contents.presentations.get(self.cursor)?;
         let program = self.native_program_choice(self.cursor,authored,Some(self.item_cursor))?;
@@ -1499,12 +1527,7 @@ impl DiscBrowserState {
                 }
             }
         }
-        if self.file_per_program {
-            Some(proposed_destination_for_program(&job,&program))
-        } else {
-            let track = program.tracks.first()?;
-            Some(proposed_destination(&job,&program,track))
-        }
+        Some((job,program))
     }
 
     pub fn blockers(&self, scratch: &Path) -> Vec<String> {

@@ -9038,6 +9038,8 @@ pub enum ActiveOverlay {
         active_capitalization: bool,
         /// Return to the extract form, not Convert, when opened from Naming.
         return_to_extract: Option<Box<crate::tui::disc_browser::DiscBrowserState>>,
+        /// A picker launched inside Custom returns the choice to that editor.
+        return_to_builder: Option<Box<TemplateBuilderState>>,
     },
     /// Advanced file-operation settings opened from the Config screen. The
     /// overlay owns a draft and commits all values together on Enter.
@@ -9090,8 +9092,25 @@ pub enum TemplateTarget {
 pub enum TemplateBuilderFocus {
     TemplateInput,
     Capitalization,
-    SavedList,
     TokenGrid,
+    /// The four footer actions, in their displayed order.
+    Footer(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateSaveFocus {
+    Name,
+    Overwrite,
+    SaveNew,
+    Cancel,
+}
+
+#[derive(Debug, Clone)]
+pub struct TemplateSaveDialog {
+    pub name_input: crate::tui::text_input::TextInputState,
+    pub original_name: Option<String>,
+    pub focus: TemplateSaveFocus,
+    pub error: Option<String>,
 }
 
 /// State for the template builder overlay.
@@ -9100,8 +9119,6 @@ pub struct TemplateBuilderState {
     /// The editable template line.
     pub template_input: crate::tui::text_input::TextInputState,
     pub capitalize: bool,
-    /// Read-only rendered-path page. The editable template caret is separate.
-    pub preview_page: usize,
     /// Convert's selected container extension, captured when the editor opens.
     /// Native extraction obtains its extension from the extraction planner.
     pub output_extension: String,
@@ -9111,12 +9128,10 @@ pub struct TemplateBuilderState {
     pub focus: TemplateBuilderFocus,
     /// Cursor position in the token/separator grid.
     pub grid_cursor: usize,
-    /// Saved naming patterns with their capitalization choices.
-    pub saved_templates: Vec<super::template_builder::NamingTemplate>,
-    /// Selected index in the saved templates list.
-    pub saved_selected: usize,
-    /// Scroll offset for the saved templates list.
-    pub saved_scroll: usize,
+    /// Identity of the template last loaded or saved; edits never auto-save it.
+    pub loaded_template: Option<super::template_builder::NamingTemplate>,
+    /// A decision and editable name, shown before any write.
+    pub save_dialog: Option<TemplateSaveDialog>,
     /// Scroll position for the shared token palette; the action footer stays fixed.
     pub token_scroll: usize,
     /// Shared Convert builder may also edit a native extraction template.

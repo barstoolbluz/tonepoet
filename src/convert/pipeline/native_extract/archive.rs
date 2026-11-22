@@ -286,6 +286,23 @@ mod tests {
     }
 
     #[test]
+    fn round_2_archive_builder_preview_excludes_original_member_parent() {
+        let (_root, mut job)=archive_job();
+        job.transfer_tags=true;
+        job.tag_fields=0x1ff;
+        job.naming_template="%TRACKNUMBER%/%TITLE%".into();
+        let program=&job.programs[0];
+        let track=&program.tracks[0];
+        assert_eq!(proposed_archive_destination(&job,program,track),
+            job.destination.join("Disc 1/07/From embedded tags.mp3"));
+        assert_eq!(super::super::authored_template_name_for_archive(&job,program,track),
+            "07/From embedded tags.mp3");
+        job.transfer_tags=false;
+        assert_eq!(super::super::authored_template_name_for_archive(
+            &job,&job.programs[0],&job.programs[0].tracks[0]),"01 - original.mp3");
+    }
+
+    #[test]
     fn archive_selection_binds_source_snapshot_member_size_and_safe_paths() {
         let (_root, mut job) = archive_job();
         validate_job(&job).unwrap();

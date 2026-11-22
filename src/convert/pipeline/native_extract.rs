@@ -2117,9 +2117,8 @@ pub(crate) fn native_log_content_for_index(
     render_native_extraction_log_with_outcome(&per_program,published,skipped,unfinished,outcome,error)
 }
 
-pub(crate) fn proposed_destination_for_program(job: &NativeExtractionJob, program: &NativeProgramChoice) -> PathBuf {
+fn authored_program_stem(job: &NativeExtractionJob, program: &NativeProgramChoice) -> String {
     let virtual_track = NativeTrackChoice { duration_secs: None, number: 0, name: program.label.clone(), tags: NativeTagValues::default(), estimated_bytes: None };
-    let legacy = legacy_naming_template(&job.naming_template);
     // Already-queued/recoverable jobs still store the pre-R27 default. Their
     // continuous output must retain its existing name across an upgrade.
     let mut stem = if job.naming_template == default_naming_template()
@@ -2131,6 +2130,22 @@ pub(crate) fn proposed_destination_for_program(job: &NativeExtractionJob, progra
         stem = crate::convert::renaming::capitalize_naming_path(
             &stem, Some(extraction_extension(job,program)));
     }
+    stem
+}
+
+/// Only the author's rendered folder and filename, without the chosen
+/// destination or an automatically added program routing prefix.
+pub(crate) fn authored_template_name_for_program(job: &NativeExtractionJob,
+    program: &NativeProgramChoice) -> String {
+    let stem = authored_program_stem(job,program);
+    let extension = extraction_extension(job,program);
+    if legacy_naming_template(&job.naming_template) { format!("{stem}.{extension}") }
+    else { with_native_extension(stem,extension) }
+}
+
+pub(crate) fn proposed_destination_for_program(job: &NativeExtractionJob, program: &NativeProgramChoice) -> PathBuf {
+    let legacy = legacy_naming_template(&job.naming_template);
+    let mut stem = authored_program_stem(job,program);
     if prefix_implicit_program_name(job) {
         // The program label is an automatic routing prefix, not authored by
         // the naming template; leave its spelling untouched.
@@ -2658,11 +2673,7 @@ pub(crate) fn proposed_destination(job: &NativeExtractionJob, program: &NativePr
             .map(|s| s.extension.as_str()).unwrap_or("invalid")
     } else { extraction_extension(job, program) };
     let legacy = legacy_naming_template(&job.naming_template);
-    let mut stem = render_naming_template_for_extension(&job.naming_template, program, track,
-        extension, &job.disc_identity);
-    if job.capitalize_naming {
-        stem = crate::convert::renaming::capitalize_naming_path(&stem, Some(extension));
-    }
+    let mut stem = authored_track_stem(job,program,track,extension);
     if prefix_implicit_program_name(job) {
         // The default can be reused across unrelated authored streams. Prefix
         // the stream identity when flattening, without changing the automatic
@@ -2675,6 +2686,41 @@ pub(crate) fn proposed_destination(job: &NativeExtractionJob, program: &NativePr
     let parent = if job.program_subfolders { job.destination.join(sanitize_component(&program.label)) }
         else { job.destination.clone() };
     parent.join(file_name)
+}
+
+fn authored_track_stem(job: &NativeExtractionJob, program: &NativeProgramChoice,
+    track: &NativeTrackChoice, extension: &str) -> String {
+    let mut stem = render_naming_template_for_extension(&job.naming_template,program,track,
+        extension,&job.disc_identity);
+    if job.capitalize_naming {
+        stem = crate::convert::renaming::capitalize_naming_path(&stem,Some(extension));
+    }
+    stem
+}
+
+/// Archive members may have original relative parent directories that are not
+/// part of the authored naming pattern. Reuse the archive publisher's name,
+/// excluding that parent and the chosen absolute destination.
+pub(crate) fn authored_template_name_for_archive(job: &NativeExtractionJob,
+    program: &NativeProgramChoice, track: &NativeTrackChoice) -> String {
+    let path=archive::proposed_archive_destination(job,program,track);
+    let parent=job.archive_members.iter().find(|m|m.number==track.number)
+        .and_then(|m|m.relative_path.parent())
+        .unwrap_or_else(||Path::new(""));
+    let root=job.destination.join(parent);
+    path.strip_prefix(&root).unwrap_or(path.as_path())
+        .to_string_lossy().into_owned()
+}
+
+pub(crate) fn authored_template_name_for_track(job: &NativeExtractionJob,
+    program: &NativeProgramChoice, track: &NativeTrackChoice) -> String {
+    let extension = if job.format == DiscFormat::CueImage {
+        job.cue_segments.iter().find(|s|s.presentation == program.id && s.number == track.number)
+            .map(|s|s.extension.as_str()).unwrap_or("invalid")
+    } else { extraction_extension(job,program) };
+    let stem = authored_track_stem(job,program,track,extension);
+    if legacy_naming_template(&job.naming_template) { format!("{stem}.{extension}") }
+    else { with_native_extension(stem,extension) }
 }
 
 /// A skipped audio file must never leave its companion to be overwritten or

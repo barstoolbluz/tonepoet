@@ -501,7 +501,7 @@ fn open_native_naming_picker(app: &mut AppState) {
     let active_capitalization=state.capitalize_naming;
     app.active_overlay=ActiveOverlay::TemplatePicker {
         target:TemplateTarget::Filename,templates,selected:0,scroll:0,preview,
-        active_template,active_capitalization,return_to_extract:Some(state),
+        active_template,active_capitalization,return_to_extract:Some(state),return_to_builder:None,
     };
 }
 
@@ -933,14 +933,6 @@ pub fn handle_disc_browser_button_click_with_shift(
         }
         TuiButton::DiscBrowserNamingCustom => {
             open_native_naming_builder(app);
-            true
-        }
-        TuiButton::NamingPreviewPrevious | TuiButton::NamingPreviewNext => {
-            let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { return false; };
-            focus_native_row(state, "Naming");
-            state.naming_preview_page = if matches!(button, TuiButton::NamingPreviewPrevious) {
-                state.naming_preview_page.saturating_sub(1)
-            } else { state.naming_preview_page.saturating_add(1) };
             true
         }
         TuiButton::DiscBrowserExtract => {
@@ -1710,7 +1702,6 @@ fn commit_native_text_edit(state:&mut DiscBrowserState) -> bool {
     if state.editing_template {
         if value.is_empty() {return false;}
         state.naming_template=value;
-        state.naming_preview_page = 0;
     } else {
         let path=expand_native_home(&value);
         if !path.is_absolute() || path.components().any(|component|
@@ -1720,7 +1711,6 @@ fn commit_native_text_edit(state:&mut DiscBrowserState) -> bool {
             return false;
         }
         state.destination=path;
-        state.naming_preview_page = 0;
     }
     cancel_native_text_edit(state);
     true
@@ -1789,17 +1779,6 @@ pub fn handle_disc_browser_key(
             state.maximized = !state.maximized;
         }
         return;
-    }
-    if let ActiveOverlay::DiscBrowser(state)=&mut app.active_overlay {
-        if state.panel.is_none() && !state.overwrite_open && !state.editing_destination
-            && state.focus==ExtractFocus::Output && state.current_output_row()=="Naming"
-            && key.modifiers==KeyModifiers::ALT
-            && matches!(key.code, KeyCode::Left | KeyCode::Right) {
-            state.naming_preview_page = if key.code == KeyCode::Left {
-                state.naming_preview_page.saturating_sub(1)
-            } else { state.naming_preview_page.saturating_add(1) };
-            return;
-        }
     }
     if let ActiveOverlay::DiscBrowser(state)=&app.active_overlay {
         if state.panel.is_none() && !state.overwrite_open && !state.editing_destination
@@ -2798,7 +2777,7 @@ mod tests {
     }
 
     #[test]
-    fn naming_result_keyboard_and_mouse_pages_do_not_change_template_or_focus() {
+    fn round_2_editor_and_extract_have_no_preview_pager() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers as M};
         let contents=selectable_disc_contents(
             PathBuf::from("disc.iso"),FolderDiscMarkerKind::Sacd);
@@ -2810,22 +2789,87 @@ mod tests {
         let (tx,_rx)=tokio::sync::mpsc::channel(8);
         handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Right,M::ALT),&tx);
         assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(browser)
-            if browser.naming_preview_page==1 && browser.current_output_row()=="Naming"
-                && browser.naming_template=="%ALBUM_ARTIST%/%TRACKNUMBER% - %TITLE%"));
-        handle_disc_browser_button_click(&mut app,&TuiButton::NamingPreviewPrevious,1,&tx);
-        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(browser)
-            if browser.naming_preview_page==0));
+            if browser.naming_template=="%ALBUM_ARTIST%/%TRACKNUMBER% - %TITLE%"));
         handle_disc_browser_button_click(&mut app,&TuiButton::DiscBrowserNamingCustom,1,&tx);
         assert!(matches!(&app.active_overlay,ActiveOverlay::TemplateBuilder(_)));
         crate::tui::keybindings::handle_key(
             &mut app,KeyEvent::new(KeyCode::Right,M::ALT),&tx);
         assert!(matches!(&app.active_overlay,ActiveOverlay::TemplateBuilder(builder)
-            if builder.preview_page==1
-                && builder.template_input.text=="%ALBUM_ARTIST%/%TRACKNUMBER% - %TITLE%"));
+            if builder.template_input.text=="%ALBUM_ARTIST%/%TRACKNUMBER% - %TITLE%"));
+    }
+
+    #[test]
+    fn round_2_saved_picker_from_builder_loads_for_editing_without_applying() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers as M,
+            MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{backend::TestBackend, Terminal};
+        use crate::tui::app::TemplateSaveFocus;
+        let contents=selectable_disc_contents(PathBuf::from("disc.iso"),FolderDiscMarkerKind::Sacd);
+        let mut state=DiscBrowserState::new(contents,PathBuf::from("disc.iso"));
+        state.naming_template="%TRACKNN% - %TITLE%".into();
+        let original=state.naming_template.clone();
+        let mut app=AppState::new_for_test(TonepoetConfig::default());
+        let convert_before=app.convert.output_options.filename_template.clone();
+        app.active_overlay=ActiveOverlay::DiscBrowser(Box::new(state));
+        let (tx,_rx)=tokio::sync::mpsc::channel(8);
+        handle_disc_browser_button_click(&mut app,&TuiButton::DiscBrowserNamingCustom,1,&tx);
         crate::tui::keybindings::handle_key(
-            &mut app,KeyEvent::new(KeyCode::Left,M::ALT),&tx);
+            &mut app,KeyEvent::new(KeyCode::Char('l'),M::ALT),&tx);
+        let pattern="%ALBUM_ARTIST%/%TRACKNUMBER% - %TITLE%";
+        let choice=super::super::template_builder::NamingTemplate {
+            name:"Album ordering (ALTERNATE)".into(),pattern:pattern.into(),capitalize:true,
+        };
+        if let ActiveOverlay::TemplatePicker{templates,return_to_builder,..}=&mut app.active_overlay {
+            assert!(return_to_builder.is_some(),"picker must own the unfinished editor");
+            *templates=vec![choice.clone()];
+        } else {panic!("Custom did not open the saved picker");}
+
+        // A mouse click loads the selected pattern and its capitalization
+        // into Custom. Neither Extract nor Convert may be updated here.
+        let theme=crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        let mut terminal=Terminal::new(TestBackend::new(80,24)).unwrap();
+        app.button_map=crate::tui::button_map::ButtonRenderMap::new();
+        if let ActiveOverlay::TemplatePicker{target,templates,selected,scroll,preview,
+            active_template,active_capitalization,..}=&app.active_overlay {
+            terminal.draw(|frame|crate::tui::template_builder::draw_template_picker(
+                frame,*target,templates,*selected,*scroll,preview,
+                active_template.as_deref(),*active_capitalization,&mut app.button_map,theme)).unwrap();
+        }
+        let row=app.button_map.button_rect(TuiButton::TemplatePickerRow(0)).unwrap();
+        crate::tui::keybindings::handle_mouse(&mut app, MouseEvent {
+            kind:MouseEventKind::Down(MouseButton::Left),column:row.x+1,row:row.y,modifiers:M::NONE,
+        },&tx);
         assert!(matches!(&app.active_overlay,ActiveOverlay::TemplateBuilder(builder)
-            if builder.preview_page==0));
+            if builder.template_input.text==pattern && builder.capitalize
+                && builder.loaded_template.as_ref()==Some(&choice)
+                && builder.return_to_extract.as_deref().is_some_and(|s|s.naming_template==original)));
+        assert_eq!(app.convert.output_options.filename_template,convert_before);
+
+        // Saving after loading must ask for an affirmative decision, retaining
+        // a mutable alternate name. Cancel does not write or apply anything.
+        crate::tui::keybindings::handle_key(
+            &mut app,KeyEvent::new(KeyCode::Char('s'),M::ALT),&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::TemplateBuilder(builder)
+            if builder.save_dialog.as_ref().is_some_and(|d|
+                d.original_name.as_deref()==Some("Album ordering (ALTERNATE)")
+                && d.name_input.text=="Album ordering (ALTERNATE)")));
+        crate::tui::keybindings::handle_key(&mut app,KeyEvent::new(KeyCode::Tab,M::NONE),&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::TemplateBuilder(builder)
+            if builder.save_dialog.as_ref().is_some_and(|d|d.focus==TemplateSaveFocus::Overwrite)));
+        crate::tui::keybindings::handle_key(&mut app,KeyEvent::new(KeyCode::Tab,M::NONE),&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::TemplateBuilder(builder)
+            if builder.save_dialog.as_ref().is_some_and(|d|d.focus==TemplateSaveFocus::SaveNew)));
+        crate::tui::keybindings::handle_key(&mut app,KeyEvent::new(KeyCode::Esc,M::NONE),&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::TemplateBuilder(builder)
+            if builder.save_dialog.is_none() && builder.template_input.text==pattern));
+
+        // Esc from the nested picker restores the same unfinished editor.
+        crate::tui::keybindings::handle_key(
+            &mut app,KeyEvent::new(KeyCode::Char('l'),M::ALT),&tx);
+        crate::tui::keybindings::handle_key(&mut app,KeyEvent::new(KeyCode::Esc,M::NONE),&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::TemplateBuilder(builder)
+            if builder.loaded_template.as_ref()==Some(&choice) && builder.capitalize));
+        assert_eq!(app.convert.output_options.filename_template,convert_before);
     }
 
     #[test]
@@ -2859,7 +2903,6 @@ mod tests {
 
         handle_disc_browser_button_click(&mut app,&TuiButton::DiscBrowserNamingCustom,1,&tx);
         if let ActiveOverlay::TemplateBuilder(builder)=&mut app.active_overlay {
-            builder.saved_templates=(0..4).map(|n|super::super::template_builder::NamingTemplate::plain(format!("%ARTIST% - {n}"))).collect();
             builder.template_input=crate::tui::text_input::TextInputState::new(
                 "%DISC%/%TRACKNN% - %TITLE%".into());
         } else {panic!("shared Convert builder not opened");}

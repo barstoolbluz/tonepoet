@@ -4,8 +4,9 @@
 //! an editable template line. Clicking a token inserts `%TOKEN%` at the
 //! cursor position. Templates can be saved to and loaded from disk.
 
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use ratatui::{
     layout::Rect,
@@ -15,7 +16,8 @@ use ratatui::{
     Frame,
 };
 
-use super::app::{TemplateBuilderFocus, TemplateBuilderState, TemplateTarget};
+use super::app::{TemplateBuilderFocus, TemplateBuilderState, TemplateSaveDialog,
+    TemplateSaveFocus, TemplateTarget};
 use super::button_map::{ButtonRenderMap, TuiButton};
 use super::text_input::TextInputState;
 
@@ -154,12 +156,12 @@ fn templates_dir(target: TemplateTarget) -> PathBuf {
     }
 }
 
-fn template_filename(template: &str) -> String {
+fn template_filename(name: &str) -> String {
     // Use distinct replacements so templates with literal dashes don't
     // collide with templates containing slashes:
     //   %ARTIST%/%ALBUM%  → %ARTIST%⁄%ALBUM%.toml  (fraction slash U+2044)
     //   %ARTIST%-%ALBUM%  → %ARTIST%-%ALBUM%.toml   (unchanged)
-    let sanitized: String = template
+    let sanitized: String = name
         .chars()
         .map(|c| match c {
             '/' => '\u{2044}',   // fraction slash — visually similar, filesystem safe
@@ -184,6 +186,7 @@ fn template_filename(template: &str) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamingTemplate {
+    pub name: String,
     pub pattern: String,
     pub capitalize: bool,
 }
@@ -191,7 +194,8 @@ pub struct NamingTemplate {
 impl NamingTemplate {
     #[cfg(test)]
     pub fn plain(pattern: impl Into<String>) -> Self {
-        Self { pattern: pattern.into(), capitalize: false }
+        let pattern = pattern.into();
+        Self { name: pattern.clone(), pattern, capitalize: false }
     }
 }
 
@@ -205,41 +209,72 @@ pub fn list_templates(target: TemplateTarget) -> Vec<NamingTemplate> {
                 if let Ok(content) = fs::read_to_string(&path) {
                     if let Ok(parsed) = toml::from_str::<TemplateFile>(&content) {
                         if !parsed.template.trim().is_empty() {
-                            templates.push(NamingTemplate { pattern: parsed.template, capitalize: parsed.capitalize });
+                            templates.push(NamingTemplate {
+                                name: parsed.name, pattern: parsed.template, capitalize: parsed.capitalize,
+                            });
                         }
                     }
                 }
             }
         }
     }
-    templates.sort_by(|a, b| a.pattern.cmp(&b.pattern));
-    templates.dedup_by(|a, b| a.pattern == b.pattern);
+    templates.sort_by(|a, b| a.name.cmp(&b.name));
     templates
 }
 
-pub fn save_template(target: TemplateTarget, template: &str, capitalize: bool) -> Result<(), String> {
+/// New saves use create_new: neither a loaded template nor an unrelated name
+/// can be overwritten by an incidental Save click. Overwrite is an explicit
+/// action in the confirmation sheet, never the default.
+fn write_template(dir: &Path, name: &str, template: &str, capitalize: bool,
+    overwrite: bool) -> Result<(), String> {
     if template.trim().is_empty() {
         return Err("template cannot be empty".to_string());
     }
-    let dir = templates_dir(target);
-    fs::create_dir_all(&dir).map_err(|e| format!("failed to create templates directory: {e}"))?;
-    let filename = template_filename(template);
+    let name = name.trim();
+    if name.is_empty() || name.chars().any(char::is_control) {
+        return Err("template name must not be empty or contain control characters".into());
+    }
+    fs::create_dir_all(dir).map_err(|e| format!("failed to create templates directory: {e}"))?;
+    let filename = template_filename(name);
     let path = dir.join(&filename);
-    let file = TemplateFile {
-        template: template.to_string(),
-        capitalize,
-    };
+    let file = TemplateFile { name: name.to_string(), template: template.to_string(), capitalize };
     let content =
         toml::to_string_pretty(&file).map_err(|e| format!("failed to serialize template: {e}"))?;
-    fs::write(&path, content).map_err(|e| format!("failed to write template: {e}"))?;
+    if overwrite {
+        let old = fs::read_to_string(&path)
+            .map_err(|e| format!("cannot overwrite a template that is no longer saved: {e}"))?;
+        let existing: TemplateFile = toml::from_str(&old)
+            .map_err(|e| format!("cannot overwrite an unreadable saved template: {e}"))?;
+        if existing.name != name {
+            return Err("another template uses this filename".into());
+        }
+        fs::write(&path, content).map_err(|e| format!("failed to overwrite template: {e}"))?;
+    } else {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&path)
+            .map_err(|e| format!("could not create a new template (name may already exist): {e}"))?;
+        if let Err(e) = file.write_all(content.as_bytes()) {
+            drop(file);
+            let _ = fs::remove_file(&path);
+            return Err(format!("failed to write template: {e}"));
+        }
+    }
     Ok(())
 }
 
-pub fn delete_template(target: TemplateTarget, template: &str) -> Result<(), String> {
+pub fn save_template(target: TemplateTarget, name: &str, template: &str, capitalize: bool,
+    overwrite: bool) -> Result<(), String> {
+    write_template(&templates_dir(target), name, template, capitalize, overwrite)
+}
+
+pub fn delete_template(target: TemplateTarget, name: &str) -> Result<(), String> {
     let dir = templates_dir(target);
-    let filename = template_filename(template);
+    let filename = template_filename(name);
     let path = dir.join(&filename);
     if path.exists() {
+        let parsed: TemplateFile = toml::from_str(&fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read template: {e}"))?)
+            .map_err(|e| format!("invalid template file: {e}"))?;
+        if parsed.name != name { return Err("another template uses this filename".into()); }
         fs::remove_file(&path).map_err(|e| format!("failed to delete template: {e}"))?;
     }
     Ok(())
@@ -247,6 +282,7 @@ pub fn delete_template(target: TemplateTarget, template: &str) -> Result<(), Str
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct TemplateFile {
+    name: String,
     template: String,
     #[serde(default)]
     capitalize: bool,
@@ -258,24 +294,44 @@ struct TemplateFile {
 
 impl TemplateBuilderState {
     pub fn new(target: TemplateTarget, initial: &str, focus: TemplateBuilderFocus) -> Self {
-        let saved_templates = list_templates(target);
         let mut input = TextInputState::new(initial.to_string());
         input.cursor = input.text.len(); // cursor at end
         Self {
             template_input: input,
             capitalize: false,
-            preview_page: 0,
             output_extension: "flac".to_string(),
             target,
             focus,
             grid_cursor: 0,
-            saved_templates,
-            saved_selected: 0,
-            saved_scroll: 0,
+            loaded_template: None,
+            save_dialog: None,
             token_scroll: 0,
             return_to_extract: None,
             disc_format: None,
         }
+    }
+
+    pub fn load_template(&mut self, template: NamingTemplate) {
+        self.template_input = TextInputState::new(template.pattern.clone());
+        self.template_input.cursor = self.template_input.text.len();
+        self.capitalize = template.capitalize;
+        self.loaded_template = Some(template);
+        self.focus = TemplateBuilderFocus::TemplateInput;
+    }
+
+    pub fn begin_save(&mut self) {
+        let name = self.loaded_template.as_ref()
+            .filter(|old| old.pattern == self.template_input.text)
+            .map(|old| old.name.as_str())
+            .unwrap_or(&self.template_input.text);
+        let mut input = TextInputState::new(name.to_owned());
+        input.cursor = input.text.len();
+        self.save_dialog = Some(TemplateSaveDialog {
+            name_input: input,
+            original_name: self.loaded_template.as_ref().map(|t| t.name.clone()),
+            focus: TemplateSaveFocus::Name,
+            error: None,
+        });
     }
 
     pub fn token_categories(&self) -> Vec<&'static TokenCategory> {
@@ -389,20 +445,15 @@ fn builder_token_rows(state: &TemplateBuilderState, inner_width: u16) -> Vec<Bui
     rows
 }
 
-fn builder_saved_rows(state: &TemplateBuilderState) -> u16 {
-    state.saved_templates.len().min(4).max(1) as u16
-}
-
 /// Shared popup geometry for drawing, editor hit testing, and mouse dismissal.
-/// The token region may scroll, but template input, saved templates and footer
-/// always occupy real rows inside this rectangle.
+/// The token region may scroll; the input, result, and footer stay fixed.
 pub(crate) fn builder_popup(area: Rect, state: &TemplateBuilderState) -> Option<Rect> {
     let w = (area.width.saturating_mul(80) / 100)
         .max(60)
         .min(area.width.saturating_sub(2));
     if w < 60 || area.height < 14 { return None; }
     let tokens = builder_token_rows(state, w.saturating_sub(2)).len() as u16;
-    let inner_height = 4 + 1 + builder_saved_rows(state) + 1 + tokens + 1 + 1;
+    let inner_height = 5 + tokens + 1 + 1;
     let h = (inner_height + 2).min(area.height.saturating_sub(2));
     if h < 12 { return None; }
     Some(Rect::new(
@@ -415,7 +466,7 @@ pub(crate) fn builder_token_viewport(area: Rect, state: &TemplateBuilderState) -
     let popup = builder_popup(area, state)?;
     let inner = Rect::new(popup.x + 1, popup.y + 1,
         popup.width.saturating_sub(2), popup.height.saturating_sub(2));
-    let top = inner.y + 4 + 1 + builder_saved_rows(state) + 1;
+    let top = inner.y + 5;
     // Leave a blank row before the fixed footer so the token palette never
     // paints over actions when the modal is shorter than its natural height.
     let bottom = inner.y + inner.height.saturating_sub(2);
@@ -444,68 +495,62 @@ impl TemplateBuilderState {
     }
 }
 
-/// A terminal-cell-safe window onto one *complete* resolved output path.
-/// Only the read-only presentation is paged; no replacement, truncation or
-/// abbreviation is passed to an output planner. Joining all pages recovers the
-/// original string, including every folder separator and the extension.
-#[derive(Debug, Clone)]
-pub(crate) struct PathPreviewWindow {
-    pub visible: String,
-    pub index: usize,
-    pub total: usize,
-}
-
-fn path_preview_chunks(path: &str, cells: usize) -> Vec<String> {
-    let cells = cells.max(1);
-    let mut chunks = Vec::new();
-    let mut part = String::new();
+/// Keep the beginning of a constructed name and mark its clipped end.
+/// The cap is measured in terminal cells, never bytes or Unicode scalars.
+fn clip_result(value: &str, cells: usize) -> String {
+    if super::display_width::width(value) <= cells { return value.to_owned(); }
+    if cells <= 3 { return ".".repeat(cells); }
+    let mut result = String::new();
     let mut occupied = 0;
-    for ch in path.chars() {
+    for ch in value.chars() {
         let width = super::display_width::char_width(ch);
-        if occupied + width > cells && !part.is_empty() {
-            chunks.push(std::mem::take(&mut part));
-            occupied = 0;
-        }
-        part.push(ch);
+        if occupied + width > cells - 3 { break; }
+        result.push(ch);
         occupied += width;
     }
-    chunks.push(part);
-    chunks
+    result.push_str("...");
+    result
 }
 
-pub(crate) fn path_preview_window(path: &str, width: u16, requested: usize) -> PathPreviewWindow {
-    let usable = (width as usize).saturating_sub(2).max(1); // arrow and space
-    if super::display_width::width(path) <= usable {
-        return PathPreviewWindow { visible: path.to_owned(), index: 0, total: 1 };
-    }
-    // The number of Unicode scalars bounds the page count. Reserve the
-    // navigator at that bound, so no count-dependent relayout can oscillate
-    // around a decimal digit boundary when the path grows.
-    let max_pages = path.chars().count().max(1);
-    let max_nav = format!("◀ {0}/{0} ▶", max_pages);
-    let content_width = usable.saturating_sub(1 + super::display_width::width(&max_nav)).max(1);
-    let chunks = path_preview_chunks(path, content_width);
-    let index = requested % chunks.len();
-    PathPreviewWindow { visible: chunks[index].clone(), index, total: chunks.len() }
+/// Extract shows the worker's entire path when it fits. Only on overflow,
+/// ask for the author's rendered name so automatic program/archive folders
+/// cannot take cells away from it. A non-suffix or unavailable name falls
+/// back to the previous destination-relative shortening rule.
+pub(crate) fn destination_path_preview(
+    path: &Path, destination: &Path, cells: usize,
+    authored: impl FnOnce() -> Option<String>,
+) -> String {
+    let full = path.to_string_lossy();
+    if super::display_width::width(&full) <= cells { return full.into_owned(); }
+    let preferred = authored().and_then(|name| {
+        let suffix = Path::new(&name);
+        if suffix.as_os_str().is_empty() || suffix.is_absolute() || !path.ends_with(suffix) {
+            return None;
+        }
+        path.ancestors().nth(suffix.components().count())
+            .map(|prefix| (prefix.to_string_lossy().into_owned(), name))
+    });
+    let (root, name) = if let Some(preferred) = preferred { preferred } else {
+        let Some(relative) = path.strip_prefix(destination).ok()
+            .filter(|p| !p.as_os_str().is_empty())
+        else { return clip_result(&full, cells); };
+        (destination.to_string_lossy().into_owned(), relative.to_string_lossy().into_owned())
+    };
+    let name_width = super::display_width::width(&name);
+    if name_width >= cells { return clip_result(&name, cells); }
+    let remaining = cells - name_width;
+    // A slash plus at least three dots are needed to usefully abbreviate the
+    // prefix. Otherwise the complete constructed name stands alone.
+    if remaining < 4 { return name; }
+    let root = clip_result(&root, remaining - 1);
+    format!("{}/{}", root.trim_end_matches('/'), name)
 }
 
-pub(crate) fn draw_full_path_preview(
-    f: &mut Frame, buttons: &mut ButtonRenderMap, area: Rect,
-    path: &str, page: usize, style: Style,
-) {
+pub(crate) fn draw_naming_preview(f: &mut Frame, area: Rect,
+    name: &str, style: Style) {
     if area.width == 0 || area.height == 0 { return; }
-    let view = path_preview_window(path, area.width, page);
-    f.render_widget(Paragraph::new(format!("→ {}", view.visible)).style(style), area);
-    if view.total <= 1 || area.width < 16 { return; }
-    let navigation = format!("◀ {}/{} ▶", view.index + 1, view.total);
-    let nav_width = super::display_width::width(&navigation) as u16;
-    let nav_x = area.x + area.width.saturating_sub(nav_width);
-    f.render_widget(Paragraph::new(navigation).style(style),
-        Rect::new(nav_x, area.y, nav_width, 1));
-    buttons.record_button(TuiButton::NamingPreviewPrevious,
-        Rect::new(nav_x, area.y, 1, 1));
-    buttons.record_button(TuiButton::NamingPreviewNext,
-        Rect::new(nav_x + nav_width - 1, area.y, 1, 1));
+    let visible = clip_result(name, area.width.saturating_sub(2) as usize);
+    f.render_widget(Paragraph::new(format!("→ {visible}")).style(style), area);
 }
 
 pub fn draw_template_builder(
@@ -521,12 +566,14 @@ pub fn draw_template_builder(
         TemplateTarget::Folder => " Build folder template ",
         TemplateTarget::Filename => " Build filename template ",
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.amber))
-        .title(Span::styled(title, Style::default().fg(theme.amber).add_modifier(Modifier::BOLD)));
-    let inner = block.inner(popup);
-    f.render_widget(block, popup);
+    let body = Rect::new(popup.x,popup.y+1,popup.width,popup.height.saturating_sub(1));
+    let block = Block::default().borders(Borders::LEFT|Borders::RIGHT|Borders::BOTTOM)
+        .border_style(Style::default().fg(theme.title));
+    let inner = block.inner(body);
+    f.render_widget(block,body);
+    f.render_widget(Paragraph::new(super::draw_browse::browse_title_bar_line(
+        popup.width as usize,&format!("▸{}",title),"",theme.title,theme,theme.panel_bg,None)),
+        Rect::new(popup.x,popup.y,popup.width,1));
     if inner.width < 40 || inner.height < 10 { return; }
 
     let iw = inner.width as usize;
@@ -567,48 +614,12 @@ pub fn draw_template_builder(
 
     let template = &state.template_input.text;
     let example = state.return_to_extract.as_deref().and_then(|browser| {
-        browser.native_preview_path_for_template_case(template, state.capitalize)
-            .map(|path| path.to_string_lossy().into_owned())
+        browser.native_preview_naming_for_template_case(template,state.capitalize)
     }).unwrap_or_else(|| render_template_preview_with_case_and_extension(
         template, state.capitalize, &state.output_extension));
-    draw_full_path_preview(f, button_map,
-        Rect::new(inner.x, inner.y + 2, inner.width, 1),
-        &example, state.preview_page, Style::default().fg(theme.text_bright));
-
-    // Saved templates: keep the familiar Convert list and its hit targets.
-    let mut y = inner.y + 4;
-    f.render_widget(Paragraph::new(Line::from(Span::styled(
-        "  ── Saved templates ──",
-        Style::default().fg(theme.text_dim).add_modifier(Modifier::BOLD)))),
-        Rect::new(inner.x, y, inner.width, 1));
-    y += 1;
-    if state.saved_templates.is_empty() {
-        f.render_widget(Paragraph::new(Line::from(Span::styled(
-            "    (none saved)", Style::default().fg(theme.text_dim)))),
-            Rect::new(inner.x, y, inner.width, 1));
-    } else {
-        let start = state.saved_scroll.min(state.saved_templates.len().saturating_sub(1));
-        let end = (start + builder_saved_rows(state) as usize).min(state.saved_templates.len());
-        for (visible_index, index) in (start..end).enumerate() {
-            let selected = state.focus == TemplateBuilderFocus::SavedList && index == state.saved_selected;
-            let marker = if selected { "  ▸ " } else { "    " };
-            let style = Style::default().fg(if selected { theme.amber } else { theme.text });
-            let tmpl = &state.saved_templates[index];
-            let name_width = iw.saturating_sub(if tmpl.capitalize { 8 } else { 5 });
-            let display = super::display_width::truncate_right(&tmpl.pattern, name_width);
-            let mut spans = vec![Span::styled(marker, style), Span::styled(display.clone(), style)];
-            if tmpl.capitalize {
-                let used = 4 + super::display_width::width(&display);
-                spans.push(Span::raw(" ".repeat(iw.saturating_sub(used + 2))));
-                spans.push(Span::styled("Aa", Style::default().fg(theme.header)
-                    .add_modifier(Modifier::BOLD)));
-            }
-            let row_y = y + visible_index as u16;
-            f.render_widget(Paragraph::new(Line::from(spans)), Rect::new(inner.x, row_y, inner.width, 1));
-            button_map.record_button(TuiButton::TemplateBuilderSavedItem(index),
-                Rect::new(inner.x, row_y, inner.width, 1));
-        }
-    }
+    // Exactly one empty row separates the tick from the resolved name.
+    draw_naming_preview(f, Rect::new(inner.x,inner.y+3,inner.width,1),
+        &example,Style::default().fg(theme.text_bright));
 
     // The token grid wraps complete pills into rows. Scroll only this region,
     // with all actions continuously available in the fixed footer.
@@ -654,25 +665,26 @@ pub fn draw_template_builder(
         }
     }
 
-    // All four footer controls stay visible and clickable at 80x24, even
-    // when the token palette or saved-template list is long.
+    // All four footer actions stay reachable while the token palette scrolls.
     let footer_y = inner.y + inner.height - 1;
     let pills: &[(&str, TuiButton, Color)] = &[
         ("apply", TuiButton::TemplateBuilderApply, theme.green),
         ("save", TuiButton::TemplateBuilderSave, theme.blue),
+        ("saved templates ▾",TuiButton::TemplateBuilderSavedTemplates,theme.blue),
         ("clear", TuiButton::TemplateBuilderClear, theme.purple),
-        ("x delete", TuiButton::TemplateBuilderDelete, theme.destructive),
     ];
-    let total_w: u16 = pills.iter().map(|(l, _, _)| l.len() as u16 + 2).sum::<u16>()
+    let total_w: u16 = pills.iter().map(|(l, _, _)| super::display_width::width(l) as u16 + 2).sum::<u16>()
         + (pills.len().saturating_sub(1) as u16);
     let left_pad = inner.width.saturating_sub(total_w) / 2;
     let mut x = inner.x + left_pad;
     let mut spans = vec![Span::raw(" ".repeat(left_pad as usize))];
     for (index, (label, button, color)) in pills.iter().enumerate() {
         if index > 0 { spans.push(Span::raw(" ")); x += 1; }
-        let width = label.len() as u16 + 2;
+        let width = super::display_width::width(label) as u16 + 2;
         spans.push(Span::styled(format!(" {} ", label), Style::default()
-            .fg(theme.pill_active_fg).bg(*color).add_modifier(Modifier::BOLD)));
+            .fg(if state.focus == TemplateBuilderFocus::Footer(index) { theme.bg } else { theme.pill_active_fg })
+            .bg(if state.focus == TemplateBuilderFocus::Footer(index) { theme.amber } else { *color })
+            .add_modifier(Modifier::BOLD)));
         button_map.record_button(*button, Rect::new(x, footer_y, width, 1));
         x += width;
     }
@@ -680,6 +692,82 @@ pub fn draw_template_builder(
     spans.push(Span::styled("Esc close", theme.muted()));
     f.render_widget(Paragraph::new(Line::from(spans)),
         Rect::new(inner.x, footer_y, inner.width, 1));
+
+    if let Some(dialog) = state.save_dialog.as_ref() {
+        draw_save_dialog(f,dialog,button_map,theme,popup);
+    }
+}
+
+/// A smaller, modal sheet for a named save. The proposed new name is editable
+/// even when an existing template was loaded; overwrite and new are separate
+/// affirmative buttons, with no implicit overwrite from the name field.
+fn draw_save_dialog(f: &mut Frame, dialog: &TemplateSaveDialog,
+    buttons: &mut ButtonRenderMap, theme: super::theme::Theme, parent: Rect) {
+    let width = parent.width.saturating_sub(6).min(76);
+    let area = Rect::new(parent.x + (parent.width-width)/2,
+        parent.y + parent.height.saturating_sub(8)/2,width,8);
+    f.render_widget(Clear,area);
+    f.render_widget(Block::default().style(Style::default().bg(theme.panel_bg)),area);
+    let body = Rect::new(area.x,area.y+1,area.width,area.height-1);
+    let block = Block::default().borders(Borders::LEFT|Borders::RIGHT|Borders::BOTTOM)
+        .border_style(Style::default().fg(theme.title));
+    let inner = block.inner(body);
+    f.render_widget(block,body);
+    f.render_widget(Paragraph::new(super::draw_browse::browse_title_bar_line(
+        area.width as usize,"▸ Save naming template ","",theme.title,theme,theme.panel_bg,None)),
+        Rect::new(area.x,area.y,area.width,1));
+
+    let label = "  Name: ";
+    let field_width = inner.width.saturating_sub(label.len() as u16 + 2) as usize;
+    let focused = dialog.focus == TemplateSaveFocus::Name;
+    let input_style = Style::default().fg(theme.text_bright)
+        .bg(if focused {theme.input_focused_bg} else {theme.input_unfocused_bg});
+    let mut spans = vec![Span::styled(label,theme.muted())];
+    spans.extend(super::inline_edit::render_text_input_value_with_style(
+        &dialog.name_input,field_width,focused,input_style,theme));
+    f.render_widget(Paragraph::new(Line::from(spans)),
+        Rect::new(inner.x,inner.y,inner.width,1));
+    buttons.record_button(TuiButton::TemplateSaveName,Rect::new(
+        inner.x+label.len() as u16,inner.y,inner.width.saturating_sub(label.len() as u16),1));
+    if focused {
+        f.set_cursor(inner.x+label.len() as u16+
+            super::inline_edit::inline_cursor_col(&dialog.name_input,field_width),inner.y);
+    }
+    let explanation = if let Some(name) = dialog.original_name.as_deref() {
+        format!("  Loaded: {name}")
+    } else { "  Save the current pattern under a new name".to_owned() };
+    f.render_widget(Paragraph::new(super::display_width::truncate_right(
+        &explanation,inner.width as usize)).style(theme.muted()),
+        Rect::new(inner.x,inner.y+2,inner.width,1));
+    if let Some(error) = dialog.error.as_deref() {
+        f.render_widget(Paragraph::new(super::display_width::truncate_right(
+            error,inner.width.saturating_sub(2) as usize))
+            .style(Style::default().fg(theme.error)),
+            Rect::new(inner.x+2,inner.y+3,inner.width.saturating_sub(2),1));
+    }
+    let mut actions = Vec::new();
+    if dialog.original_name.is_some() {
+        actions.push(("overwrite",TuiButton::TemplateSaveOverwrite,TemplateSaveFocus::Overwrite,theme.destructive));
+    }
+    actions.push(("save as new",TuiButton::TemplateSaveNew,TemplateSaveFocus::SaveNew,theme.green));
+    actions.push(("cancel",TuiButton::TemplateSaveCancel,TemplateSaveFocus::Cancel,theme.purple));
+    let total_width: u16 = actions.iter().map(|(name,_,_,_)|name.len() as u16+2)
+        .sum::<u16>() + actions.len().saturating_sub(1) as u16;
+    let left = inner.width.saturating_sub(total_width)/2;
+    let mut x = inner.x+left;
+    let y = inner.y+inner.height-1;
+    let mut spans = vec![Span::raw(" ".repeat(left as usize))];
+    for (index,(name,button,focus,color)) in actions.into_iter().enumerate() {
+        if index>0 {spans.push(Span::raw(" "));x+=1;}
+        let active = dialog.focus == focus;
+        let width = name.len() as u16+2;
+        spans.push(Span::styled(format!(" {name} "),Style::default()
+            .fg(if active {theme.bg} else {theme.pill_active_fg})
+            .bg(if active {theme.amber} else {color}).add_modifier(Modifier::BOLD)));
+        buttons.record_button(button,Rect::new(x,y,width,1));
+        x+=width;
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)),Rect::new(inner.x,y,inner.width,1));
 }
 
 // =========================================================================
@@ -794,15 +882,15 @@ pub fn draw_template_picker(
     f.render_widget(Clear, outer);
 
     let title_label = match target {
-        TemplateTarget::Folder => "Load Folder Template",
-        TemplateTarget::Filename => "Load Filename Template",
+        TemplateTarget::Folder => "▸ Load folder template ",
+        TemplateTarget::Filename => "▸ Load filename template ",
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.cyan))
-        .title(format!(" {} ", title_label))
-        .title_alignment(ratatui::layout::Alignment::Center);
-    f.render_widget(block, outer);
+    let body = Rect::new(outer.x,outer.y+1,outer.width,outer.height.saturating_sub(1));
+    f.render_widget(Block::default().borders(Borders::LEFT|Borders::RIGHT|Borders::BOTTOM)
+        .border_style(Style::default().fg(theme.title)),body);
+    f.render_widget(Paragraph::new(super::draw_browse::browse_title_bar_line(
+        outer.width as usize,title_label,"",theme.title,theme,theme.panel_bg,None)),
+        Rect::new(outer.x,outer.y,outer.width,1));
 
     let inner = Rect::new(outer.x + 1, outer.y + 1, outer.width.saturating_sub(2), outer.height.saturating_sub(2));
     let mut cy = inner.y;
@@ -839,7 +927,7 @@ pub fn draw_template_picker(
                 Style::default().fg(theme.text)
             };
             let width = inner.width.saturating_sub(8 + if tmpl.capitalize { 3 } else { 0 }) as usize;
-            spans.push(Span::styled(super::display_width::truncate_right(&tmpl.pattern, width), style));
+            spans.push(Span::styled(super::display_width::truncate_right(&tmpl.name, width), style));
             if tmpl.capitalize { spans.push(Span::styled("  Aa", Style::default().fg(theme.header))); }
 
             // Active badge
@@ -919,13 +1007,10 @@ mod tests {
     use ratatui::Terminal;
 
     #[test]
-    fn capitalization_toggle_and_saved_badge_have_distinct_hit_targets() {
+    fn capitalization_toggle_and_saved_button_have_distinct_hit_targets() {
         let theme = crate::tui::theme::theme_by_slug_or_default("tokyo-night");
         let mut state = TemplateBuilderState::new(TemplateTarget::Filename,
             "%ALBUM_ARTIST%/%TRACKNN% - %TITLE%", TemplateBuilderFocus::Capitalization);
-        state.saved_templates = vec![NamingTemplate {
-            pattern: "%ARTIST%/%TITLE%".into(), capitalize: true,
-        }];
         let mut buttons = ButtonRenderMap::new();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|frame| draw_template_builder(frame, &state, &mut buttons, theme)).unwrap();
@@ -937,21 +1022,22 @@ mod tests {
         state.capitalize = true;
         terminal.draw(|frame| draw_template_builder(frame, &state, &mut buttons, theme)).unwrap();
         assert_eq!(terminal.backend().buffer().get(toggle.x + 2, toggle.y).symbol(), "☒");
-        let saved = buttons.button_rect(TuiButton::TemplateBuilderSavedItem(0)).unwrap();
+        let saved = buttons.button_rect(TuiButton::TemplateBuilderSavedTemplates).unwrap();
         assert_eq!(buttons.find_button_at(saved.x + 2, saved.y),
-            Some(TuiButton::TemplateBuilderSavedItem(0)));
-        assert_eq!(terminal.backend().buffer().get(saved.x + saved.width - 2, saved.y).symbol(), "A");
+            Some(TuiButton::TemplateBuilderSavedTemplates));
+        assert_eq!(terminal.backend().buffer().get(saved.x + 1, saved.y).symbol(), "s");
     }
 
     #[test]
     fn capitalization_setting_round_trips_in_saved_template_format() {
-        let input = TemplateFile { template: "%ALBUM%/%TITLE%".into(), capitalize: true };
+        let input = TemplateFile { name: "First (ALTERNATE)".into(),
+            template: "%ALBUM%/%TITLE%".into(), capitalize: true };
         let data = toml::to_string(&input).unwrap();
         let restored: TemplateFile = toml::from_str(&data).unwrap();
         assert_eq!(restored.template, input.template);
+        assert_eq!(restored.name, input.name);
         assert!(restored.capitalize);
-        assert!(!toml::from_str::<TemplateFile>("template = '%TITLE%'")
-            .unwrap().capitalize);
+        assert!(toml::from_str::<TemplateFile>("template = '%TITLE%'").is_err());
     }
 
     #[test]
@@ -993,13 +1079,11 @@ mod tests {
         use std::collections::HashSet;
         let theme = crate::tui::theme::theme_by_slug_or_default("tokyo-night");
         for (width, height) in [(80,24),(100,30),(160,40)] {
-            for saved in [0,4] {
                 // Both the extraction extension and the unchanged ordinary
                 // Convert palette use the same viewport and button map.
                 for native in [false,true] {
                     let mut state = TemplateBuilderState::new(TemplateTarget::Filename,
                         "%TRACKNN% - %TITLE%",TemplateBuilderFocus::TemplateInput);
-                    state.saved_templates = (0..saved).map(|n|NamingTemplate::plain(format!("%ARTIST% - {n}"))).collect();
                     state.disc_format = native.then_some(crate::disc::DiscFormat::Sacd);
                     let area = Rect::new(0,0,width,height);
                     let popup = builder_popup(area,&state).expect("popup should fit");
@@ -1014,12 +1098,12 @@ mod tests {
                         for (button,letter) in [
                             (TuiButton::TemplateBuilderApply,"a"),
                             (TuiButton::TemplateBuilderSave,"s"),
+                            (TuiButton::TemplateBuilderSavedTemplates,"s"),
                             (TuiButton::TemplateBuilderClear,"c"),
-                            (TuiButton::TemplateBuilderDelete,"x"),
                         ] {
                             let rect=buttons.button_rect(button).expect("fixed footer action");
                             assert_eq!(rect.y,popup.y+popup.height-2,
-                                "{width}x{height}, native={native}, saved={saved}");
+                                "{width}x{height}, native={native}");
                             assert_eq!(terminal.backend().buffer().get(rect.x+1,rect.y).symbol(),letter);
                             assert_eq!(buttons.find_button_at(rect.x+1,rect.y),Some(button));
                         }
@@ -1034,7 +1118,7 @@ mod tests {
                         }
                     }
                     assert_eq!(seen.len(),state.total_grid_items(),
-                        "all Convert and native tokens must be reachable by mouse at {width}x{height}, saved={saved}, native={native}");
+                        "all Convert and native tokens must be reachable by mouse at {width}x{height}, native={native}");
                     // Clicking a visible native item uses the original
                     // index-to-token insertion path, not a second map.
                     if native {
@@ -1045,7 +1129,6 @@ mod tests {
                         assert_eq!(state.template_input.text,"%AREA%");
                     }
                 }
-            }
         }
     }
 
@@ -1074,59 +1157,150 @@ mod tests {
         assert!(selected.starts_with("01 - Shine on You Crazy Diamond"), "{selected}");
         assert!(selected.ends_with(".mp3"), "{selected}");
         assert!(!selected.ends_with(".flac"));
-        let saved = NamingTemplate {pattern: filename.into(), capitalize: true};
+        let saved = NamingTemplate {name: "Favorite".into(),pattern: filename.into(), capitalize: true};
         assert_eq!(preview_for_context_with_extension(&saved, None, selected_extension), selected,
             "saved-template picker and Custom must use the same preview");
     }
 
     #[test]
-    fn corrective_preview_pager_preserves_complete_unicode_paths_at_standard_sizes() {
-        let path = format!("/home/user/Music/Extracted/{}/{} - {}.dsf",
-            "Björk – an extraordinarily long collection folder/Another Long Album",
-            "01", "Shine on You Crazy Diamond and Some Additional Extended Track Name");
-        let theme = crate::tui::theme::theme_by_slug_or_default("tokyo-night");
-        for (width,height) in [(80,24),(100,30)] {
-            let mut state = TemplateBuilderState::new(TemplateTarget::Filename,
-                &path,TemplateBuilderFocus::TemplateInput);
-            let popup = builder_popup(Rect::new(0,0,width,height),&state).unwrap();
-            let preview_rect = Rect::new(popup.x+1,popup.y+3,popup.width-2,1);
-            let first = path_preview_window(&path,preview_rect.width,0);
-            assert!(first.total>1, "long path must be pageable at {width}x{height}");
-            let mut concatenated=String::new();
-            let mut terminal=Terminal::new(TestBackend::new(width,height)).unwrap();
-            for page in 0..first.total {
-                state.preview_page=page;
-                let mut buttons=ButtonRenderMap::new();
-                // The sample preview is deliberately rendered by the same
-                // reusable widget that Custom and the Extract form call.
-                terminal.draw(|frame|draw_full_path_preview(frame,&mut buttons,
-                    preview_rect,&path,state.preview_page,
-                    Style::default().fg(theme.text_bright))).unwrap();
-                let view=path_preview_window(&path,preview_rect.width,page);
-                concatenated.push_str(&view.visible);
-                let displayed=(preview_rect.x..preview_rect.x+preview_rect.width)
-                    .map(|x|terminal.backend().buffer().get(x,preview_rect.y).symbol().to_owned())
-                    .collect::<Vec<_>>().join("");
-                assert!(displayed.contains(&format!("→ {}",view.visible)),
-                    "page {page}, {width}x{height}: {displayed:?}");
-                for button in [TuiButton::NamingPreviewPrevious,TuiButton::NamingPreviewNext] {
-                    let rect=buttons.button_rect(button).expect("preview page arrows");
-                    assert_eq!(buttons.find_button_at(rect.x,rect.y),Some(button));
-                    assert_eq!(rect.y,preview_rect.y);
-                }
-            }
-            assert_eq!(concatenated,path,"pagination must preserve every source character");
-            // Custom's actual drawing must keep its footer and token view
-            // separate, regardless of the read-only preview page.
+    fn round_2_destination_preview_keeps_constructed_names_before_the_root() {
+        let destination=Path::new("/home/user/Music/Extracted/A Very Long Destination");
+        let path=destination.join("Björk - Debut/01 - Human Behaviour.dsf");
+        let full=path.to_string_lossy();
+        let suffix="Björk - Debut/01 - Human Behaviour.dsf";
+        let full_width=super::super::display_width::width(&full);
+        assert_eq!(destination_path_preview(&path,destination,full_width,|| None),full.as_ref());
+        let width=super::super::display_width::width(suffix)+15;
+        let abbreviated=destination_path_preview(&path,destination,width,|| None);
+        assert!(abbreviated.ends_with(suffix),"{abbreviated}");
+        assert!(abbreviated.contains(".../"),"{abbreviated}");
+        assert!(super::super::display_width::width(&abbreviated)<=width);
+        assert_eq!(destination_path_preview(&path,destination,
+            super::super::display_width::width(suffix),|| None),suffix);
+        let clipped=destination_path_preview(&path,destination,22,|| None);
+        assert!(clipped.starts_with("Björk - Debut/"),"{clipped}");
+        assert!(clipped.ends_with("..."),"{clipped}");
+        assert!(super::super::display_width::width(&clipped)<=22);
+    }
+
+    #[test]
+    fn round_2_implicit_and_archive_prefixes_do_not_displace_authored_names() {
+        use super::super::display_width::width;
+        let destination = Path::new("/home/user/Music/A Very Long Destination");
+        let authored = "Wish You Were Here/01 - Shine On You Crazy Diamond.dsf";
+        let worker_path = destination.join("Multichannel").join(authored);
+        let cells = width(authored) + 6;
+        assert!(width(&worker_path.to_string_lossy()) > cells);
+        assert!(width(&worker_path.strip_prefix(destination).unwrap().to_string_lossy()) > cells);
+
+        // The author-built part is a suffix of the actual worker output,
+        // not an invented filename. Routing components yield their cells.
+        let abbreviated = destination_path_preview(&worker_path, destination, cells,
+            || Some(authored.into()));
+        assert!(abbreviated.ends_with(authored), "{abbreviated}");
+        assert!(abbreviated.contains(".../"), "{abbreviated}");
+        assert!(width(&abbreviated) <= cells);
+
+        // A complete worker path never triggers the second renderer.
+        let full = worker_path.to_string_lossy();
+        assert_eq!(destination_path_preview(&worker_path, destination, width(&full),
+            || panic!("full paths must not render the authored name")), full.as_ref());
+
+        // When the authored portion cannot fit, keep its start and clip the end.
+        let clipped = destination_path_preview(&worker_path, destination, 23,
+            || Some(authored.into()));
+        assert!(clipped.starts_with("Wish You Were Here/"), "{clipped}");
+        assert!(clipped.ends_with("..."), "{clipped}");
+        assert!(width(&clipped) <= 23);
+
+        // Archives keep their original parents in the published path but
+        // those parents do not displace the renamed, authored portion.
+        let archive_name = "07/From embedded tags.mp3";
+        let archive_path = destination.join("Disc 1").join(archive_name);
+        let archive_cells = width(archive_name) + 5;
+        let archive_preview = destination_path_preview(&archive_path, destination, archive_cells,
+            || Some(archive_name.into()));
+        assert!(archive_preview.ends_with(archive_name), "{archive_preview}");
+        assert!(archive_preview.contains(".../"), "{archive_preview}");
+        assert_eq!(archive_path, destination.join("Disc 1/07/From embedded tags.mp3"));
+
+        // When an authored preview is missing or not an actual path suffix,
+        // use the original destination-relative display rule unchanged.
+        let flat = destination.join("Multichannel - 01 - Track.dsf");
+        let fallback = destination_path_preview(&flat, destination, 20, || None);
+        assert_eq!(destination_path_preview(&flat, destination, 20,
+            || Some("01 - Track.dsf".into())), fallback);
+    }
+
+    #[test]
+    fn round_2_builder_rows_and_title_are_stable_at_standard_sizes() {
+        let theme=crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        for (width,height) in [(80,24),(100,30),(160,40)] {
+            let mut state=TemplateBuilderState::new(TemplateTarget::Filename,
+                "%ALBUM%/%TRACKNN% - %TITLE%",TemplateBuilderFocus::TemplateInput);
+            state.capitalize=true;
+            let area=Rect::new(0,0,width,height);
+            let popup=builder_popup(area,&state).unwrap();
             let mut buttons=ButtonRenderMap::new();
+            let mut terminal=Terminal::new(TestBackend::new(width,height)).unwrap();
             terminal.draw(|f|draw_template_builder(f,&state,&mut buttons,theme)).unwrap();
-            for button in [TuiButton::TemplateBuilderApply,TuiButton::TemplateBuilderSave,
-                TuiButton::TemplateBuilderClear,TuiButton::TemplateBuilderDelete] {
-                let rect=buttons.button_rect(button).expect("footer must remain reachable");
-                assert_eq!(buttons.find_button_at(rect.x,rect.y),Some(button));
-            }
-            assert!(builder_token_viewport(Rect::new(0,0,width,height),&state).is_some());
+            let b=terminal.backend().buffer();
+            assert_eq!(b.get(popup.x,popup.y).symbol(),"┌");
+            assert_eq!(b.get(popup.x+1,popup.y).bg,theme.title);
+            assert_eq!(b.get(popup.x+popup.width-1,popup.y).symbol(),"┐");
+            let blank_y=popup.y+3;
+            let blank=(popup.x+1..popup.x+popup.width-1)
+                .map(|x|b.get(x,blank_y).symbol().to_owned()).collect::<Vec<_>>().join("");
+            assert!(blank.trim().is_empty(),"one blank row between tick and result");
+            let preview_y=popup.y+4;
+            let shown=(popup.x+1..popup.x+popup.width-1)
+                .map(|x|b.get(x,preview_y).symbol().to_owned()).collect::<Vec<_>>().join("");
+            assert!(shown.contains("→ ") && shown.contains("Wish"),"{shown:?}");
+            assert!(!shown.contains("/home/"));
+            assert!(buttons.button_rect(TuiButton::TemplateBuilderSavedTemplates).is_some());
+            assert!(builder_token_viewport(area,&state).unwrap().y>preview_y);
         }
+    }
+
+    #[test]
+    fn round_2_named_saves_require_explicit_overwrite_and_keep_alternates() {
+        let directory=tempfile::tempdir().unwrap();
+        let pattern="%ALBUM%/%TRACKNN% - %TITLE%";
+        write_template(directory.path(),"Original",pattern,true,false).unwrap();
+        assert!(write_template(directory.path(),"Original","%TITLE%",false,false).is_err());
+        let file=directory.path().join(template_filename("Original"));
+        let original:TemplateFile=toml::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(original.template,pattern);
+        assert!(original.capitalize);
+        write_template(directory.path(),"Original","%TITLE%",false,true).unwrap();
+        write_template(directory.path(),"Original (ALTERNATE)",pattern,true,false).unwrap();
+        let alternate:TemplateFile=toml::from_str(&fs::read_to_string(
+            directory.path().join(template_filename("Original (ALTERNATE)"))).unwrap()).unwrap();
+        assert_eq!(alternate.name,"Original (ALTERNATE)");
+        assert_eq!(alternate.template,pattern);
+        assert!(alternate.capitalize);
+        assert_eq!(toml::from_str::<TemplateFile>(&fs::read_to_string(&file).unwrap())
+            .unwrap().template,"%TITLE%");
+    }
+
+    #[test]
+    fn round_2_loaded_save_dialog_offers_both_actions() {
+        let theme=crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        let mut state=TemplateBuilderState::new(TemplateTarget::Filename,
+            "",TemplateBuilderFocus::TemplateInput);
+        state.load_template(NamingTemplate {
+            name:"First".into(),pattern:"%ALBUM%/%TITLE%".into(),capitalize:true,
+        });
+        state.begin_save();
+        let mut terminal=Terminal::new(TestBackend::new(80,24)).unwrap();
+        let mut buttons=ButtonRenderMap::new();
+        terminal.draw(|f|draw_template_builder(f,&state,&mut buttons,theme)).unwrap();
+        for button in [TuiButton::TemplateSaveName,TuiButton::TemplateSaveOverwrite,
+            TuiButton::TemplateSaveNew,TuiButton::TemplateSaveCancel] {
+            let rect=buttons.button_rect(button).unwrap();
+            assert_eq!(buttons.find_button_at(rect.x+1,rect.y),Some(button));
+        }
+        assert_eq!(state.save_dialog.as_ref().unwrap().name_input.text,"First");
     }
 
     #[test]
