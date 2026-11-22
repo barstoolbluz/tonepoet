@@ -557,7 +557,7 @@ pub fn draw_template_builder(
         (TemplateTarget::Folder, false) => ("to folder names", if state.capitalize { "☒" } else { "☐" }),
         (TemplateTarget::Filename, false) => ("to file names", if state.capitalize { "☒" } else { "☐" }),
     };
-    let caption = format!("  {marker} Apply TonePoet capitalization     {scope}");
+    let caption = format!("  {marker} Apply TonePoet capitalization {scope}");
     f.render_widget(Paragraph::new(caption).style(Style::default()
         .fg(if focus_cap { theme.amber } else { theme.value })
         .add_modifier(if focus_cap { Modifier::BOLD } else { Modifier::empty() })),
