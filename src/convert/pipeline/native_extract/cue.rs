@@ -34,6 +34,17 @@ fn verify_segment(segment: &NativeCueSegment) -> Result<(), String> {
         segment.encoder.is_empty() || segment.muxer.is_empty() || segment.channels == 0 {
         return Err("Invalid CUE track geometry or missing source encoder".into());
     }
+    if segment.index00_sample.is_some_and(|start|start>segment.index01_sample)
+        || segment.index01_sample>=segment.total_samples {
+        return Err("Invalid CUE INDEX 00/01 snapshot".into());
+    }
+    if let Some(extra)=&segment.appended_gap {
+        verify_source(&extra.image,extra.source_length,extra.source_modified)?;
+        if extra.end_sample==0 || extra.end_sample>=extra.total_samples ||
+            extra.image==segment.image || is_lossy(segment) {
+            return Err("Invalid CUE cross-image appended interval".into());
+        }
+    }
     if is_lossy(segment) {
         if segment.packet_part_index > segment.packet_cut_samples.len() ||
             segment.packet_cut_samples.iter().any(|cut|*cut==0 || *cut>=segment.total_samples) ||
@@ -68,7 +79,8 @@ pub(super) fn validate_cue_job(job: &NativeExtractionJob) -> Result<(), String> 
         return Err("CUE geometry does not match checked tracks".into());
     }
     if job.cue_input_paths.is_empty() || job.cue_segments.iter().any(|s|
-        !job.cue_input_paths.contains(&s.image) || !job.cue_input_paths.contains(&s.cue_path)) {
+        !job.cue_input_paths.contains(&s.image) || !job.cue_input_paths.contains(&s.cue_path) ||
+        s.appended_gap.as_ref().is_some_and(|extra|!job.cue_input_paths.contains(&extra.image))) {
         return Err("CUE job lacks authoritative input protection".into());
     }
     let mut seen = BTreeSet::new();
@@ -181,12 +193,23 @@ fn packet_input(path: &Path) -> Result<(ffmpeg_next::format::context::Input,usiz
     Ok((input,index))
 }
 
+#[cfg(test)]
 fn verify_packet_partition(source: &Path, parts: &[PathBuf]) -> Result<(),String> {
+    verify_packet_partition_receipts(source,parts,false).map(|_|())
+}
+
+/// This is the existing source/segmenter packet-identity pass. When Verify is
+/// on, its audio-packet digests become producer receipts for the track copies.
+/// They are taken before final metadata work and before final publication.
+fn verify_packet_partition_receipts(source: &Path, parts: &[PathBuf],
+    capture: bool) -> Result<Vec<[u8;32]>,String> {
     let (mut original,source_index)=packet_input(source)?;
     let mut packets=original.packets().filter(|(stream,_)|stream.index()==source_index);
+    let mut receipts=Vec::new();
     for part in parts {
         let (mut output,index)=packet_input(part)?;
         let mut count=0usize;
+        let mut digest=capture.then(Sha256::new);
         for (_,packet) in output.packets().filter(|(stream,_)|stream.index()==index) {
             let (_,expected)=packets.next().ok_or_else(||format!(
                 "Packet-copy split added audio packets: {}",part.display()))?;
@@ -194,15 +217,43 @@ fn verify_packet_partition(source: &Path, parts: &[PathBuf]) -> Result<(),String
                 return Err(format!("Packet-copy split changed audio packet payload: {}",
                     part.display()));
             }
+            if let Some(digest)=digest.as_mut() {
+                let payload=packet.data().ok_or_else(||format!(
+                    "Empty compressed audio packet: {}",part.display()))?;
+                digest.update((payload.len() as u64).to_le_bytes());
+                digest.update(payload);
+            }
             count+=1;
         }
         if count==0 {return Err(format!("CUE packet-cut produced an empty audio part: {}",
             part.display()));}
+        if let Some(digest)=digest {receipts.push(digest.finalize().into());}
     }
     if packets.next().is_some() {
         return Err(format!("Packet-copy split lost source audio packets: {}",source.display()));
     }
-    Ok(())
+    Ok(receipts)
+}
+
+/// Read back compressed packet payloads without depending on ID3/Vorbis/MP4
+/// tag bytes or headers. Both source partitioning and destination readback
+/// use the same length-delimited packet fingerprint.
+pub(super) fn packet_audio_fingerprint(path: &Path,
+    checkpoint: &mut dyn FnMut() -> std::io::Result<()>,
+) -> Result<[u8;32],String> {
+    let (mut input,index)=packet_input(path)?;
+    let mut digest=Sha256::new();
+    let mut count=0;
+    for (_,packet) in input.packets().filter(|(stream,_)|stream.index()==index) {
+        checkpoint().map_err(|e|format!("Packet verification interrupted: {e}"))?;
+        let payload=packet.data().ok_or_else(||format!(
+            "Missing compressed packet data in {}",path.display()))?;
+        digest.update((payload.len() as u64).to_le_bytes());
+        digest.update(payload);
+        count+=1;
+    }
+    if count==0 {return Err(format!("No audio packets in {}",path.display()));}
+    Ok(digest.finalize().into())
 }
 
 fn verify_packet_file_equal(expected: &Path, actual: &Path) -> Result<(),String> {
@@ -299,21 +350,38 @@ async fn run_mac_ape(input: &Path, output: &Path, cancel: &CancellationToken,
 }
 
 fn encode_command(job: &NativeExtractionJob, program: &NativeProgramChoice,
-    track: &NativeTrackChoice, segment: &NativeCueSegment, output: &Path)
-    -> Result<ToolCommand,String>
+    track: &NativeTrackChoice, segment: &NativeCueSegment, output: &Path,
+    hash_output: Option<&Path>) -> Result<ToolCommand,String>
 {
     let mut args = vec!["-hide_banner","-nostdin","-loglevel","error","-xerror","-y"]
         .into_iter().map(str::to_owned).collect::<Vec<_>>();
     let (encoder,muxer) = if segment.encoder == "mac" {
         (ape_wav_encoder(segment.sample_bits)?.to_string(),"wav")
     } else { (segment.encoder.clone(),segment.muxer.as_str()) };
-    args.extend(["-i".into(),utf8_path(&segment.image)?,
-        "-map".into(),"0:a:0".into(),"-vn".into(),"-sn".into(),"-dn".into(),
+    args.extend(["-i".into(),utf8_path(&segment.image)?]);
+    let split=if hash_output.is_some() {",asplit=2[audio][tap]"}else{"[combined]"};
+    let map=if hash_output.is_some() {"[audio]"}else{"[combined]"};
+    if let Some(extra)=&segment.appended_gap {
+        args.extend(["-i".into(),utf8_path(&extra.image)?,
+            "-filter_complex".into(),format!(
+                "[0:a:0]atrim=start_sample={}:end_sample={},asetpts=PTS-STARTPTS[one];\
+                 [1:a:0]atrim=start_sample=0:end_sample={},asetpts=PTS-STARTPTS[two];\
+                 [one][two]concat=n=2:v=0:a=1{split}",
+                segment.start_sample,segment.end_sample,extra.end_sample),
+            "-map".into(),map.into()]);
+    } else if hash_output.is_some() {
+        args.extend(["-filter_complex".into(),format!(
+            "[0:a:0]atrim=start_sample={}:end_sample={},asetpts=PTS-STARTPTS,asplit=2[audio][tap]",
+                segment.start_sample,segment.end_sample),
+            "-map".into(),"[audio]".into()]);
+    } else {
+        args.extend(["-map".into(),"0:a:0".into(),
+            "-af".into(),format!("atrim=start_sample={}:end_sample={},asetpts=PTS-STARTPTS",
+                segment.start_sample,segment.end_sample)]);
+    }
+    args.extend(["-vn".into(),"-sn".into(),"-dn".into(),
         "-map_metadata".into(),"-1".into(),"-map_chapters".into(),"-1".into(),
-        "-af".into(),format!("atrim=start_sample={}:end_sample={},asetpts=PTS-STARTPTS",
-            segment.start_sample,segment.end_sample),
-        "-ar".into(),segment.sample_rate.to_string(),
-        "-c:a".into(),encoder]);
+        "-ar".into(),segment.sample_rate.to_string(),"-c:a".into(),encoder]);
     if muxer == "wav" {
         // Large split WAVs must remain writable without a 4 GiB RIFF ceiling.
         args.extend(["-rf64".into(),"auto".into()]);
@@ -346,6 +414,14 @@ fn encode_command(job: &NativeExtractionJob, program: &NativeProgramChoice,
         args.extend(["-metadata".into(),format!("track={}",track.number)]);
     }
     args.extend(["-f".into(),muxer.to_string(),utf8_path(output)?]);
+    if let Some(path)=hash_output {
+        // The hash muxer consumes the *same filter output* as the encoder.
+        // FFmpeg computes this digest as frames are produced, before any
+        // metadata rewrite or publication can affect the completed file.
+        args.extend(["-map".into(),"[tap]".into(),"-c:a".into(),"pcm_f64le".into(),
+            "-f".into(),"hash".into(),"-hash".into(),"SHA256".into(),
+            utf8_path(path)?]);
+    }
     Ok(ToolCommand {binary:ToolBinary::Ffmpeg,args,secret_args:Vec::new(),cwd:None,
         environment_policy:tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         env:Vec::new(),timeout:Duration::from_secs(6*60*60)})
@@ -363,12 +439,14 @@ pub(super) async fn execute_inner(
     let temp = tempfile::Builder::new().prefix("tonepoet-cue-").tempdir_in(&work)
         .map_err(|e|format!("Private CUE storage: {e}"))?;
     let runner = RealToolRunner::new(HashMap::new()).with_native_pause(controls.tool_pause());
-    let total: usize = job.programs.iter().map(|p|p.tracks.len()).sum();
+    let total: usize = job.programs.iter().map(|p|p.tracks.len()+
+        usize::from(native_cue_hidden_target(&job,p).is_some())).sum();
     let estimated_bytes_total = job.programs.iter().flat_map(|p|&p.tracks)
         .try_fold(0u64,|sum,track|sum.checked_add(track.estimated_bytes?));
     let mut published = Vec::new();
     // One single-pass segmenter execution per distinct compressed image.
     let mut packet_cache: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+    let mut packet_receipts: BTreeMap<PathBuf, Vec<[u8;32]>> = BTreeMap::new();
     let (mut done,mut skipped) = (0usize,0usize);
     let (mut bytes_done,mut bytes_skipped,mut bytes_published) = (0u64,0u64,0u64);
     let mut emit = |current: String,current_file: Option<PathBuf>,estimate:Option<u64>,
@@ -383,10 +461,24 @@ pub(super) async fn execute_inner(
     emit("Checking selected CUE tracks".into(),None,None,done,skipped,&published,
         bytes_done,bytes_skipped,bytes_published);
     for (pi,program) in job.programs.iter().enumerate() {
+        let mut items: Vec<(NativeTrackChoice,NativeCueSegment,PathBuf)> = Vec::new();
+        if let Some(target)=native_cue_hidden_target(&job,program) {
+            let first=segment_for(&job,program.id,1)?;
+            let hidden=NativeCueSegment {number:0,start_sample:0,
+                end_sample:first.index01_sample,pre_emphasis:false,
+                // The later-image pregap belongs only to its real predecessor.
+                appended_gap:None,packet_part_index:0,..first.clone()};
+            items.push((NativeTrackChoice {number:0,name:"Hidden Track".into(),
+                tags:NativeTagValues::default(),duration_secs:Some(
+                    first.index01_sample as f64/f64::from(first.sample_rate)),
+                estimated_bytes:None},hidden,target));
+        }
         for track in &program.tracks {
+            let segment=segment_for(&job,program.id,track.number)?.clone();
+            items.push((track.clone(),segment,proposed_destination(&job,program,track)));
+        }
+        for (track,segment,target) in &items {
             if cancel.is_cancelled() {return Err("Extraction cancelled".into());}
-            let segment = segment_for(&job,program.id,track.number)?;
-            let target = proposed_destination(&job,program,track);
             let estimated = track.estimated_bytes.unwrap_or(0);
             let item = controls.begin_item(&cancel);
             controls.set_attempted_output(target.clone());
@@ -404,6 +496,8 @@ pub(super) async fn execute_inner(
             }
             verify_segment(segment)?;
             let completed = temp.path().join(format!("cue-{pi}-{}.{}",track.number,segment.extension));
+            let producer_hash=(job.options.verify_after && !is_lossy(segment)).then(||
+                temp.path().join(format!("cue-{pi}-{}-audio.sha256",track.number)));
             controls.watch_file(completed.clone(),format!("Preparing {}",track.name),
                 track.estimated_bytes,false);
             emit(format!("Preparing {}",track.name),Some(completed.clone()),track.estimated_bytes,
@@ -421,8 +515,11 @@ pub(super) async fn execute_inner(
                         }
                         let original=segment.image.clone();
                         let check=parts.clone();
-                        tokio::task::spawn_blocking(move ||verify_packet_partition(&original,&check))
+                        let verify=job.options.verify_after;
+                        let receipts=tokio::task::spawn_blocking(move ||
+                            verify_packet_partition_receipts(&original,&check,verify))
                             .await.map_err(|error|format!("Packet-verification task: {error}"))??;
+                        if verify {packet_receipts.insert(segment.image.clone(),receipts);}
                         packet_cache.insert(segment.image.clone(),parts);
                     }
                     let part=packet_cache.get(&segment.image)
@@ -430,11 +527,18 @@ pub(super) async fn execute_inner(
                         .ok_or("Missing copied CUE packet part")?;
                     fs::copy(part,&completed).map_err(|error|
                         format!("Copy compressed packets into track: {error}"))?;
+                    if job.options.verify_after {
+                        let digest=packet_receipts.get(&segment.image)
+                            .and_then(|receipts|receipts.get(segment.packet_part_index))
+                            .copied().ok_or("Missing producer-time packet fingerprint")?;
+                        controls.record_packet_fingerprint(&completed,digest);
+                    }
                 } else if segment.encoder == "mac" {
                     let wav = temp.path().join(format!("cue-{pi}-{}-ape-input.wav",track.number));
                     controls.watch_file(wav.clone(),format!("Decoding {} for APE",track.name),
                         track.estimated_bytes,false);
-                    runner.run(encode_command(&job,program,track,segment,&wav)?,&item)
+                    runner.run(encode_command(&job,program,track,segment,&wav,
+                        producer_hash.as_deref())?,&item)
                         .await.map_err(|error|format!("CUE APE PCM stage: {error}"))?;
                     controls.wait_ready(&cancel,&item).await?;
                     controls.watch_file(completed.clone(),format!("Encoding {} as APE",track.name),
@@ -443,10 +547,15 @@ pub(super) async fn execute_inner(
                     let _ = fs::remove_file(&wav);
                     encode?;
                 } else {
-                    runner.run(encode_command(&job,program,track,segment,&completed)?,&item)
+                    runner.run(encode_command(&job,program,track,segment,&completed,
+                        producer_hash.as_deref())?,&item)
                         .await.map_err(|error|format!("CUE re-encoding: {error}"))?;
                 }
                 controls.wait_ready(&cancel,&item).await?;
+                if let Some(hash)=producer_hash.as_deref() {
+                    controls.record_audio_fingerprint(&completed,
+                        native_audio_hash_receipt(hash)?,"pcm_f64le");
+                }
                 let meta = fs::metadata(&completed).map_err(|error|
                     format!("CUE output was not encoded: {error}"))?;
                 if meta.len()==0 { return Err("CUE encoder produced an empty file".into()); }
@@ -454,9 +563,11 @@ pub(super) async fn execute_inner(
                     // Lossless carriers must have the exact decoded CUE frame
                     // count; a successful encoder exit alone is not proof.
                     let (frames,rate) = crate::tui::accuraterip::probe_sample_count(&completed)?;
-                    if rate != segment.sample_rate || frames != segment.end_sample-segment.start_sample {
+                    let expected=(segment.end_sample-segment.start_sample)
+                        +segment.appended_gap.as_ref().map_or(0,|extra|extra.end_sample);
+                    if rate != segment.sample_rate || frames != expected {
                         return Err(format!("Encoded CUE frame count mismatch for {}: expected {}, got {}",
-                            track.name,segment.end_sample-segment.start_sample,frames));
+                            track.name,expected,frames));
                     }
                 }
                 if is_lossy(segment) && job.transfer_tags && segment.extension != "aac" {
@@ -489,6 +600,15 @@ pub(super) async fn execute_inner(
                             write_completed_native_metadata(&completed_copy,&[],Some(&artwork)))
                             .await.map_err(|error|format!("CUE artwork embedding task: {error}"))??;
                     }
+                }
+                // Pre-emphasis is independent of ordinary metadata-transfer
+                // preferences. Only positively marked tracks carry the tag.
+                if job.options.keep_preemphasis && segment.pre_emphasis &&
+                    matches!(segment.extension.as_str(),
+                        "wav"|"flac"|"wv"|"ape"|"tta"|"mp3"|"m4a"|"ogg"|"opus") {
+                    let output=completed.clone();
+                    tokio::task::spawn_blocking(move ||options::write_preemphasis_tag(&output))
+                        .await.map_err(|e|format!("Pre-emphasis metadata task: {e}"))??;
                 }
                 if is_lossy(segment) {
                     let original=packet_cache.get(&segment.image)
@@ -539,6 +659,9 @@ pub(super) async fn execute_inner(
                 bytes_done,bytes_skipped,bytes_published);
         }
     }
+    options::copy_cue_folder_contents(&job,temp.path(),&cancel,&controls,&mut published)?;
+    emit("Copied selected CUE companions".into(),None,None,done,skipped,&published,
+        bytes_done,bytes_skipped,bytes_published);
     if job.extraction_log {
         for (index,target) in native_log_targets(&job).into_iter().enumerate() {
             let content = native_log_content_for_index(&job,index,&published,
@@ -559,7 +682,8 @@ mod tests {
     fn cue_range_cannot_be_empty_or_past_eof() {
         let s = NativeCueSegment { presentation:PresentationId::CueAlbum(1),number:1,
             cue_path:PathBuf::from("none"),image:PathBuf::from("none"),start_sample:200,
-            end_sample:200,total_samples:300,sample_rate:44100,extension:"flac".into(),
+            end_sample:200,index00_sample:None,index01_sample:200,pre_emphasis:false,
+            hidden_track_published:false,appended_gap:None,total_samples:300,sample_rate:44100,extension:"flac".into(),
             encoder:"flac".into(),muxer:"flac".into(),sample_bits:Some(16),channels:2,
             source_length:0,source_modified:None,cue_length:0,cue_modified:None,
             source_bit_rate:None,packet_cut_samples:Vec::new(),packet_part_index:0};
@@ -571,7 +695,8 @@ mod tests {
         let segment=NativeCueSegment {
             presentation:PresentationId::CueAlbum(1),number:1,
             cue_path:"a.cue".into(),image:"a.mp3".into(),start_sample:0,
-            end_sample:48_000,total_samples:96_000,sample_rate:48_000,
+            end_sample:48_000,index00_sample:None,index01_sample:0,pre_emphasis:false,
+            hidden_track_published:false,appended_gap:None,total_samples:96_000,sample_rate:48_000,
             extension:"mp3".into(),encoder:"libmp3lame".into(),muxer:"mp3".into(),
             sample_bits:None,channels:2,source_length:0,source_modified:None,
             cue_length:0,cue_modified:None,source_bit_rate:None,
@@ -605,7 +730,8 @@ mod tests {
             let segment=NativeCueSegment {
                 presentation:PresentationId::CueAlbum(1),number:1,
                 cue_path:"album.cue".into(),image:PathBuf::from(format!("image.{extension}")),
-                start_sample:0,end_sample:288_000,total_samples:288_000,sample_rate:48_000,
+                start_sample:0,end_sample:288_000,index00_sample:None,index01_sample:0,pre_emphasis:false,
+                hidden_track_published:false,appended_gap:None,total_samples:288_000,sample_rate:48_000,
                 extension:extension.into(),encoder:"not-used".into(),muxer:muxer.into(),
                 sample_bits:None,channels:2,source_length:0,source_modified:None,
                 cue_length:0,cue_modified:None,source_bit_rate:None,
@@ -622,6 +748,116 @@ mod tests {
                 assert!(args.windows(2).any(|pair|pair==["-write_xing","0"]));
             } else {assert!(!args.iter().any(|arg|arg=="-write_xing"));}
             assert_eq!(packet_segment_paths(&segment,Path::new("/tmp"),5).len(),1);
+        }
+    }
+
+    #[tokio::test]
+    async fn r2d01_two_wav_images_preserve_cross_file_pregap_samples_for_all_gap_modes() {
+        if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {
+            eprintln!("Skipping real two-image CUE test: ffmpeg unavailable");
+            return;
+        }
+        fn make_wav(path:&Path, samples:&[i16]) {
+            let pcm=samples.iter().flat_map(|sample|sample.to_le_bytes()).collect::<Vec<_>>();
+            let mut wav=b"RIFF".to_vec();
+            wav.extend_from_slice(&(36u32+pcm.len() as u32).to_le_bytes());
+            wav.extend_from_slice(b"WAVEfmt ");
+            wav.extend_from_slice(&16u32.to_le_bytes());
+            wav.extend_from_slice(&1u16.to_le_bytes());
+            wav.extend_from_slice(&1u16.to_le_bytes());
+            wav.extend_from_slice(&48_000u32.to_le_bytes());
+            wav.extend_from_slice(&96_000u32.to_le_bytes());
+            wav.extend_from_slice(&2u16.to_le_bytes());
+            wav.extend_from_slice(&16u16.to_le_bytes());
+            wav.extend_from_slice(b"data");
+            wav.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+            wav.extend_from_slice(&pcm);
+            fs::write(path,wav).unwrap();
+        }
+        fn decode_pcm(path:&Path)->Vec<i16> {
+            let output=std::process::Command::new("ffmpeg")
+                .args(["-hide_banner","-loglevel","error","-nostdin","-i"])
+                .arg(path).args(["-map","0:a:0","-c:a","pcm_s16le","-f","s16le","-"])
+                .output().unwrap();
+            assert!(output.status.success(),"{}: {}",path.display(),
+                String::from_utf8_lossy(&output.stderr));
+            assert_eq!(output.stdout.len()%2,0);
+            output.stdout.chunks_exact(2)
+                .map(|bytes|i16::from_le_bytes([bytes[0],bytes[1]])).collect()
+        }
+        let root=tempfile::tempdir().unwrap();
+        let first=root.path().join("side-a.wav");
+        let second=root.path().join("side-b.wav");
+        let cue=root.path().join("album.cue");
+        let a=vec![1234i16;48_000];
+        let b=[vec![-2345i16;96_000],vec![3456i16;48_000]].concat();
+        make_wav(&first,&a);make_wav(&second,&b);
+        fs::write(&cue,"FILE \"side-a.wav\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\nFILE \"side-b.wav\" WAVE\n  TRACK 02 AUDIO\n    INDEX 00 00:00:00\n    INDEX 01 00:02:00\n").unwrap();
+        let cue_meta=fs::metadata(&cue).unwrap();
+        let mut all=Vec::new();
+        for (number,image,total,index00,index01) in [
+            (1u32,&first,48_000u64,None,0u64),
+            (2u32,&second,144_000u64,Some(0u64),96_000u64),
+        ] {
+            let meta=fs::metadata(image).unwrap();
+            all.push(NativeCueSegment {
+                presentation:PresentationId::CueAlbum(1),number,
+                cue_path:cue.clone(),image:image.clone(),start_sample:index01,
+                end_sample:total,index00_sample:index00,index01_sample:index01,
+                pre_emphasis:false,hidden_track_published:false,appended_gap:None,
+                total_samples:total,sample_rate:48_000,extension:"wav".into(),
+                encoder:"pcm_s16le".into(),muxer:"wav".into(),sample_bits:Some(16),
+                channels:1,source_length:meta.len(),source_modified:meta.modified().ok(),
+                cue_length:cue_meta.len(),cue_modified:cue_meta.modified().ok(),
+                source_bit_rate:None,packet_cut_samples:Vec::new(),packet_part_index:0,
+            });
+        }
+        for (mode,label) in [
+            (NativeCueBetweenGap::AppendPrevious,"append"),
+            (NativeCueBetweenGap::PrependNext,"prepend"),
+            (NativeCueBetweenGap::Drop,"drop"),
+        ] {
+            let mut job=super::super::tests::fixture_job(
+                &root.path().join(label),root.path());
+            job.format=DiscFormat::CueImage;
+            job.source=cue.clone();
+            job.programs[0].id=PresentationId::CueAlbum(1);
+            job.programs[0].source_rate=Some(48_000);
+            job.programs[0].source_depth=Some(16);
+            job.programs[0].source_channels=Some(1);
+            job.programs[0].source_codec="pcm_s16le".into();
+            job.programs[0].tracks=vec![
+                NativeTrackChoice {number:1,name:"First".into(),tags:NativeTagValues::default(),
+                    duration_secs:None,estimated_bytes:None},
+                NativeTrackChoice {number:2,name:"Second".into(),tags:NativeTagValues::default(),
+                    duration_secs:None,estimated_bytes:None},
+            ];
+            job.program_subfolders=false;
+            job.round4_layout=true;
+            job.naming_template="%TITLE%".into();
+            job.cue_input_paths=vec![cue.clone(),first.clone(),second.clone()];
+            job.options.between_gap=mode;
+            job.options.verify_after=true;
+            job.cue_segments=all.clone();
+            configure_cue_gap_segments(&all,&mut job.cue_segments,&job.options).unwrap();
+            let report=super::super::execute(job,CancellationToken::new(),|_|{})
+                .await.unwrap_or_else(|err|panic!("{label}: {err}"));
+            assert_eq!(report.published.len(),2,"{label} (no track 00 at second FILE)");
+            let one=decode_pcm(&report.published[0]);
+            let two=decode_pcm(&report.published[1]);
+            let gap=&b[..96_000];
+            let content=&b[96_000..];
+            let (expected_one,expected_two) = match mode {
+                NativeCueBetweenGap::AppendPrevious => ([a.as_slice(),gap].concat(),content.to_vec()),
+                NativeCueBetweenGap::PrependNext => (a.clone(),b.clone()),
+                NativeCueBetweenGap::Drop => (a.clone(),content.to_vec()),
+            };
+            assert_eq!(one,expected_one,"{label}: first track");
+            assert_eq!(two,expected_two,"{label}: second track");
+            if mode!=NativeCueBetweenGap::Drop {
+                assert_eq!([one,two].concat(),[a.as_slice(),b.as_slice()].concat(),
+                    "{label}: bit-exact reconstruction of both source images");
+            }
         }
     }
 
@@ -654,7 +890,8 @@ mod tests {
             let segment=NativeCueSegment {
                 presentation:PresentationId::CueAlbum(1),number:1,
                 cue_path:cue.clone(),image:input.clone(),
-                start_sample:0,end_sample:samples,total_samples:samples,sample_rate:rate,
+                start_sample:0,end_sample:samples,index00_sample:None,index01_sample:0,pre_emphasis:false,
+                hidden_track_published:false,appended_gap:None,total_samples:samples,sample_rate:rate,
                 extension:extension.into(),encoder:encoder.into(),muxer:muxer.into(),
                 sample_bits:None,channels:2,source_length:image_meta.len(),
                 source_modified:image_meta.modified().ok(),cue_length:cue_meta.len(),
@@ -676,6 +913,8 @@ mod tests {
             job.program_subfolders=false;
             job.round4_layout=true;
             job.naming_template="%TITLE%".into();
+            // MP3 also exercises the packet-extraction-time verify receipt.
+            job.options.verify_after=extension=="mp3";
             let report=super::super::execute(job.clone(),CancellationToken::new(),|_|{})
                 .await.unwrap_or_else(|error|panic!("{extension}: {error}"));
             assert_eq!(report.published.len(),1,"{extension}");

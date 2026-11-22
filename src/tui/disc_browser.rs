@@ -290,6 +290,7 @@ pub struct DiscBrowserState {
     pub panel: Option<ExtractPanel>,
     /// Focused control in the Tags sheet (index into tag_sheet_controls).
     pub panel_cursor: usize,
+    pub option_parent_cursor: usize,
     pub tag_source_open: bool,
     pub tag_source_cursor: usize,
     /// A MusicBrainz match was accepted and committed through the existing
@@ -317,6 +318,9 @@ pub struct DiscBrowserState {
     pub program_subfolders: bool,
     pub overwrite_policy: crate::convert::pipeline::native_extract::NativeOverwritePolicy,
     pub extraction_log: bool,
+    pub extract_settings: crate::convert::pipeline::native_extract::NativeExtractSettings,
+    /// Transient opt-in: save the extract choices only after a successful launch.
+    pub save_extract_defaults: bool,
     pub destination: PathBuf,
     pub wav_container: crate::convert::pipeline::native_extract::NativeWavContainer,
     pub keep_dst: Vec<bool>,
@@ -337,7 +341,6 @@ pub struct DiscBrowserState {
     pub downmix: crate::convert::pipeline::DvdaDownmixPolicy,
     pub file_per_program: bool,
     pub cue: bool,
-    pub dvda_group_preset: u8,
     /// Source reads for the pre-extraction eligibility probe never run on the
     /// UI reducer. A late completion only applies to this overlay generation.
     pub probe_id: u64,
@@ -355,7 +358,18 @@ pub enum ExtractFocus { Programs, Items, Output, Footer }
 pub enum DestinationFeedback { WillBeCreated, NotWritable, InvalidPath }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExtractPanel { Tags, Downmix, AssumeDecrypted, Diagnostics, More, ConvertChoice, Keys }
+pub enum ExtractPanel { Tags, Downmix, AssumeDecrypted, Diagnostics, Options, Chapters, CueFiles, CopyFolder, ConvertChoice, Keys }
+
+/// Modal rows are one authority for keyboard order, mouse targets and drawing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractOptionControl {
+    WriteLog, Verify, Chapters, CueFiles, CopyFolder, SaveNext,
+    WriteChapters, CreateCue, EmbedCue, KeepPreemphasis,
+    BetweenAppend, BetweenPrepend, BetweenDrop,
+    FirstPrepend, FirstOwn00, FirstDrop,
+    CopyArtwork, CopyArtFolders, CopyLog, CopyCue, CopyTxt, CopyNfo,
+    CopyMd, CopyPdf, CopyMd5, CopyOther, Done,
+}
 
 /// Shared Tags-sheet focus and mouse activation targets. No row-specific key
 /// shortcuts or hidden hot spots: all items use the same activation path.
@@ -437,6 +451,7 @@ impl DiscBrowserState {
             show_hidden: false,
             panel: None,
             panel_cursor: 0,
+            option_parent_cursor: 0,
             tag_source_open: false,
             tag_source_cursor: 0,
             tag_mb_available: false,
@@ -454,7 +469,9 @@ impl DiscBrowserState {
             naming_template: "%TRACKNUMBER% - %TITLE%".into(),
             program_subfolders: true,
             overwrite_policy: crate::convert::pipeline::native_extract::NativeOverwritePolicy::Fail,
-            extraction_log: false,
+            extraction_log: true,
+            extract_settings: Default::default(),
+            save_extract_defaults: false,
             destination: source_path.parent().unwrap_or(Path::new(".")).join("Extracted"),
             wav_container: crate::convert::pipeline::native_extract::NativeWavContainer::Automatic,
             keep_dst: vec![false; len],
@@ -470,8 +487,7 @@ impl DiscBrowserState {
             // MKV/MKA defaults to an unchanged audio-packet copy. Choosing
             // split chapters explicitly changes the result to decoded WAV.
             file_per_program: file_backed,
-            cue: false,
-            dvda_group_preset: 0,
+            cue: true,
             probe_id: NEXT_EXTRACT_PROBE_ID.fetch_add(1, Ordering::Relaxed),
             probe_cancel: CancellationToken::new(),
             probe_statuses,
@@ -733,7 +749,7 @@ impl DiscBrowserState {
         Some(NativeSpaceKey {
             outputs, format: self.contents.format, continuous: self.file_per_program,
             overwrite: self.overwrite_policy, artwork: self.tags && self.tag_artwork,
-            source: self.source_path.clone(), cue: self.cue,
+            source: self.source_path.clone(), cue: self.cue && self.native_cue_applicable(),
             extraction_log: self.extraction_log,
         })
     }
@@ -1060,27 +1076,6 @@ impl DiscBrowserState {
         }
     }
 
-    /// DVD-Audio More presets select groups only; authored track checkboxes
-    /// and the Convert pipeline retain their existing state. Ineligible groups
-    /// stay uncheckable under every preset.
-    pub fn cycle_dvda_group_preset(&mut self) {
-        if self.contents.format != DiscFormat::DvdAudio { return; }
-        self.dvda_group_preset = (self.dvda_group_preset + 1) % 4;
-        let max = self.contents.presentations.iter().enumerate()
-            .filter(|(i,_)|self.is_extractable(*i))
-            .map(|(_,p)| (p.format.sample_rate.unwrap_or(0),p.format.bit_depth.unwrap_or(0)))
-            .max().unwrap_or((0,0));
-        for i in 0..self.len() {
-            let p = &self.contents.presentations[i];
-            self.selected[i] = self.is_extractable(i) && match self.dvda_group_preset {
-                0 => true,
-                1 => p.format.channels.is_some_and(|channels| channels <= 2),
-                2 => p.format.channels.is_some_and(|channels| channels > 2),
-                _ => (p.format.sample_rate.unwrap_or(0),p.format.bit_depth.unwrap_or(0)) == max,
-            };
-        }
-    }
-
     pub(crate) fn matroska_cue_available(&self) -> bool {
         self.contents.format == DiscFormat::Matroska && self.file_per_program &&
             self.contents.presentations.iter().enumerate().any(|(i, p)| {
@@ -1092,6 +1087,40 @@ impl DiscBrowserState {
             })
     }
 
+    /// The same control order drives drawing, keyboard focus and mouse hits.
+    /// Controls remain visible across sources, while worker applicability
+    /// determines whether each setting has an effect.
+    pub fn option_controls(&self) -> Vec<ExtractOptionControl> {
+        use ExtractOptionControl as C;
+        match self.panel {
+            Some(ExtractPanel::Options) => vec![C::WriteLog,C::Verify,C::Chapters,
+                C::CueFiles,C::CopyFolder,C::SaveNext,C::Done],
+            Some(ExtractPanel::Chapters) => vec![C::WriteChapters,C::Done],
+            Some(ExtractPanel::CueFiles) => vec![C::CreateCue,C::EmbedCue,
+                C::KeepPreemphasis,C::BetweenAppend,C::BetweenPrepend,C::BetweenDrop,
+                C::FirstPrepend,C::FirstOwn00,C::FirstDrop,C::Done],
+            Some(ExtractPanel::CopyFolder) => vec![C::CopyArtwork,C::CopyArtFolders,
+                C::CopyLog,C::CopyCue,C::CopyTxt,C::CopyNfo,C::CopyMd,C::CopyPdf,
+                C::CopyMd5,C::CopyOther,C::Done],
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn current_extract_settings(&self) -> crate::convert::pipeline::native_extract::NativeExtractSettings {
+        let mut settings = self.extract_settings.clone();
+        settings.write_log = self.extraction_log;
+        settings.create_cue = self.cue;
+        settings
+    }
+
+    pub fn native_cue_applicable(&self) -> bool {
+        self.file_per_program && match self.contents.format {
+            DiscFormat::DvdAudio | DiscFormat::DvdVideo | DiscFormat::BluRay => true,
+            DiscFormat::Matroska => self.matroska_cue_available(),
+            _ => false,
+        }
+    }
+
     pub fn output_rows(&self) -> Vec<&'static str> {
         // Keep DST is meaningful only when a selected SACD area is DST encoded.
         let mut rows = vec!["Format", "Overwrite"];
@@ -1099,11 +1128,7 @@ impl DiscBrowserState {
             && super::disc_browser_actions::selected_sacd_has_dst(self) {
             rows.push("Keep DST");
         }
-        rows.extend(["Files", "Tags", "Log"]);
-        if self.file_per_program && self.contents.format != DiscFormat::CueImage && (self.matroska_cue_available() ||
-            !matches!(self.contents.format, DiscFormat::Sacd | DiscFormat::Matroska | DiscFormat::TransportFile | DiscFormat::Archive)) {
-            rows.push("CUE");
-        }
+        rows.extend(["Files", "Tags"]);
         rows.extend(["Folder", "Naming"]);
         if self.contents.format == DiscFormat::DvdAudio && self.contents.presentations.iter().enumerate()
             .any(|(i,p)| self.selected.get(i) == Some(&true) && p.format.channels.unwrap_or(0) > 2) {
@@ -1115,14 +1140,13 @@ impl DiscBrowserState {
         rows
     }
 
-    /// The wide form has three paired rows and two full-width fields. CUE
-    /// occupies the otherwise empty left cell beside Log, not an extra row.
-    /// Extra DVD-Audio controls retain fixed row positions independently.
+    /// The wide form retains the paired format/files controls. Extract-specific
+    /// extras live in Options rather than competing with the output form.
     pub fn wide_output_height(&self) -> u16 {
         let rows = self.output_rows();
-        if rows.contains(&"Assume decrypted") { 10 }
-        else if rows.contains(&"Downmix") { 9 }
-        else { 8 }
+        if rows.contains(&"Assume decrypted") { 9 }
+        else if rows.contains(&"Downmix") { 8 }
+        else { 7 }
     }
 
     /// Track selected DSF and DFF destinations, including plain DSDIFF/DSD
@@ -1507,9 +1531,6 @@ impl DiscBrowserState {
                 _ => {},
             }
         }
-        if self.cue && self.contents.format == DiscFormat::Sacd {
-            problems.push("CUE indexes cannot describe DSF/DFF media; disable CUE for continuous native SACD".into());
-        }
         if !self.destination.is_absolute() || !scratch.is_absolute() {
             problems.push("Choose an absolute destination and working-storage path".into());
         } else if refresh {
@@ -1668,12 +1689,25 @@ impl DiscBrowserState {
         // program discriminator. A single checked area goes straight to Folder.
         let program_subfolders = programs.len() > 1 &&
             !native_template_has_program_token(&self.naming_template);
-        let cue_segments = if self.contents.format == DiscFormat::CueImage {
+        let mut cue_segments = if self.contents.format == DiscFormat::CueImage {
             self.cue_segments.iter().enumerate().filter(|(i,_)|
                 self.selected.get(*i) == Some(&true)).flat_map(|(i,segments)|
                 segments.iter().filter(move |s| self.items_checked[i].get(s.number as usize - 1)
                     == Some(&true)).cloned()).collect()
         } else { Vec::new() };
+        if self.contents.format == DiscFormat::CueImage {
+            // Admission guarantees original geometry. Settings may change
+            // until Extract, so derive the selected ownership at that point.
+            let all = self.cue_segments.iter().flatten().cloned().collect::<Vec<_>>();
+            // Invalid geometry will be rejected again by native admission.
+            if let Err(error) = configure_cue_gap_segments(
+                &all, &mut cue_segments, &self.current_extract_settings()) {
+                // Force validation to reject rather than fall back to a
+                // different gap policy for a malformed source.
+                cue_segments.clear();
+                let _ = error;
+            }
+        }
         let cue_input_paths = if self.contents.format == DiscFormat::CueImage {
             let mut paths = self.cue_segments.iter().flatten()
                 .flat_map(|segment|[segment.cue_path.clone(),segment.image.clone()])
@@ -1692,9 +1726,9 @@ impl DiscBrowserState {
             wav_container:self.wav_container, assume_decrypted:self.assume_decrypted,downmix:self.downmix,
             naming_template:self.naming_template.clone(), program_subfolders,
             overwrite_policy:self.overwrite_policy, extraction_log:self.extraction_log,
+            options: self.current_extract_settings(),
             program_log_paths:Vec::new(), round4_layout:true,
-            file_per_program:self.file_per_program, cue:self.cue && self.contents.format != DiscFormat::CueImage && (self.contents.format != DiscFormat::Matroska ||
-                self.matroska_cue_available()) && !matches!(self.contents.format, DiscFormat::TransportFile | DiscFormat::Archive),
+            file_per_program:self.file_per_program, cue:self.cue && self.native_cue_applicable(),
             transfer_tags:self.tags && self.native_tags_available(),
             sacd_dff:self.sacd_dff,
             tag_source:self.tag_source,
@@ -3410,6 +3444,7 @@ mod disc_selection_bridge_tests {
         let contents = disc_contents(DiscFormat::Sacd,
             PresentationId::SacdArea(SacdAreaId::MultiChannel), "DSD Multichannel");
         let mut state = DiscBrowserState::new(contents, "disc.iso".into());
+        state.extraction_log = false; // Audio-only capacity model in this test.
         state.file_per_program = true;
         state.tags = false;
         state.tag_artwork = false;
@@ -3432,6 +3467,7 @@ mod disc_selection_bridge_tests {
         let contents = disc_contents(DiscFormat::Sacd,
             PresentationId::SacdArea(SacdAreaId::Stereo), "DSD Stereo");
         let mut state = DiscBrowserState::new(contents, "disc.iso".into());
+        state.extraction_log = false;
         let presentation = &mut state.contents.presentations[0];
         presentation.format.sample_rate = Some(2_822_400);
         presentation.format.bit_depth = Some(1);
@@ -3484,6 +3520,7 @@ mod disc_selection_bridge_tests {
         let contents = disc_contents(DiscFormat::Sacd,
             PresentationId::SacdArea(SacdAreaId::Stereo), "DSD Stereo");
         let mut state = DiscBrowserState::new(contents, temp.path().join("album.iso"));
+        state.extraction_log = false;
         state.destination = temp.path().join("out");
         state.contents.presentations[0].format.sample_rate = Some(2_822_400);
         state.contents.presentations[0].format.bit_depth = Some(1);
@@ -3551,6 +3588,7 @@ mod disc_selection_bridge_tests {
         let contents = disc_contents(DiscFormat::Sacd,
             PresentationId::SacdArea(SacdAreaId::Stereo), "DSD Stereo");
         let mut state = DiscBrowserState::new(contents, source);
+        state.extraction_log = false;
         state.destination = temp.path().join("out");
         state.tags = true;
         state.tag_artwork = true;
@@ -3568,6 +3606,8 @@ mod disc_selection_bridge_tests {
     fn continuous_preflight_accounts_for_all_retained_chapters_and_join_spool() {
         let contents = disc_contents(DiscFormat::DvdVideo, PresentationId::dvd_video(1, 1, 0), "English");
         let mut state = DiscBrowserState::new(contents, "dvd".into());
+        state.extraction_log = false;
+        state.cue = false;
         let template = state.contents.presentations[0].tracks[0].clone();
         state.contents.presentations[0].tracks = (0..20).map(|index| {
             let mut item = template.clone();

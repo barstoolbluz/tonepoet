@@ -998,6 +998,30 @@ where
     )
 }
 
+/// The verified native extraction path observes canonical decoded DSD only
+/// after the corresponding frame has been written. The ordinary API above
+/// remains unchanged and performs no extra frame work.
+pub fn extract_track_with_area_frame_format_and_cancel_tapped<W, F>(
+    iso: &mut IsoReader,
+    output: &mut W,
+    opts: ExtractOptions,
+    area_frame_format: FrameFormat,
+    integrity_options: ExtractIntegrityOptions,
+    mut is_cancelled: F,
+    on_audio: &mut dyn FnMut(&[u8]),
+) -> Result<ExtractReport, ExtractError>
+where
+    W: Write + Seek,
+    F: FnMut() -> bool,
+{
+    extract_track_impl_with_cancel_tapped(
+        iso, output, opts,
+        integrity_options.with_frame_format(area_frame_format),
+        DstExtractionOptions::default(),
+        &mut is_cancelled, Some(on_audio),
+    )
+}
+
 /// Extract one ISO track with explicit DSDIFF/DST handling while preserving
 /// the source-compatible [`ExtractOptions`] shape.
 ///
@@ -1155,6 +1179,24 @@ where
     W: Write + Seek,
     F: FnMut() -> bool,
 {
+    extract_track_impl_with_cancel_tapped(
+        iso, output, opts, integrity_options, dst_options, is_cancelled, None,
+    )
+}
+
+fn extract_track_impl_with_cancel_tapped<W, F>(
+    iso: &mut IsoReader,
+    output: &mut W,
+    opts: ExtractOptions,
+    integrity_options: ExtractIntegrityOptions,
+    dst_options: DstExtractionOptions,
+    is_cancelled: &mut F,
+    on_audio: Option<&mut dyn FnMut(&[u8])>,
+) -> Result<ExtractReport, ExtractError>
+where
+    W: Write + Seek,
+    F: FnMut() -> bool,
+{
     if is_cancelled() {
         return Err(extraction_cancelled_error());
     }
@@ -1181,11 +1223,12 @@ where
     let mut sink_options = DsdSourceExtractOptions::from(&opts);
     sink_options.dst = dst_options;
     sink_options.recover_decode_errors = integrity_options.recover_sector_errors;
-    let mut report = write_dsd_source_with_cancel(
+    let mut report = write_dsd_source_with_cancel_tapped(
         &mut source,
         output,
         sink_options,
         is_cancelled,
+        on_audio,
     )?;
     report.integrity = ExtractIntegrityReport::from_reader_stats(source.frame_reader_stats());
     if is_cancelled() {
@@ -1225,6 +1268,21 @@ where
     W: Write + Seek,
     F: FnMut() -> bool,
 {
+    write_dsd_source_with_cancel_tapped(source, output, opts, is_cancelled, None)
+}
+
+fn write_dsd_source_with_cancel_tapped<S, W, F>(
+    source: &mut S,
+    output: &mut W,
+    opts: DsdSourceExtractOptions,
+    is_cancelled: &mut F,
+    mut on_audio: Option<&mut dyn FnMut(&[u8])>,
+) -> Result<ExtractReport, ExtractError>
+where
+    S: DsdSource + ?Sized,
+    W: Write + Seek,
+    F: FnMut() -> bool,
+{
     if is_cancelled() {
         return Err(extraction_cancelled_error());
     }
@@ -1241,7 +1299,11 @@ where
                 source,
                 opts.recover_decode_errors,
                 is_cancelled,
-                |frame| writer.write_interleaved(&frame.data).map_err(ExtractError::Io),
+                |frame| {
+                    writer.write_interleaved(&frame.data).map_err(ExtractError::Io)?;
+                    if let Some(tap)=on_audio.as_mut() { (*tap)(&frame.data); }
+                    Ok(())
+                },
             )?;
             writer.finish()?;
             Ok(report)
@@ -1255,7 +1317,11 @@ where
                 source,
                 opts.recover_decode_errors,
                 is_cancelled,
-                |frame| writer.write_frame(&frame.data).map_err(ExtractError::Io),
+                |frame| {
+                    writer.write_frame(&frame.data).map_err(ExtractError::Io)?;
+                    if let Some(tap)=on_audio.as_mut() { (*tap)(&frame.data); }
+                    Ok(())
+                },
             )?;
             writer.finish()?;
             Ok(report)
@@ -1276,7 +1342,11 @@ where
                     source,
                     opts.recover_decode_errors,
                     is_cancelled,
-                    |frame| writer.write_frame(&frame.data).map_err(ExtractError::Io),
+                    |frame| {
+                    writer.write_frame(&frame.data).map_err(ExtractError::Io)?;
+                    if let Some(tap)=on_audio.as_mut() { (*tap)(&frame.data); }
+                    Ok(())
+                },
                 )?;
                 writer.finish()?;
                 return Ok(report);
@@ -1291,6 +1361,7 @@ where
                 &mut writer,
                 &opts.dst,
                 is_cancelled,
+                &mut on_audio,
             )?;
             report.dff_dst = Some(writer.stats().clone());
             writer.finish()?;
@@ -1436,6 +1507,7 @@ fn drain_source_to_dff_dst<S, W, F>(
     writer: &mut DffDstWriter<W>,
     dst_options: &DstExtractionOptions,
     is_cancelled: &mut F,
+    on_audio: &mut Option<&mut dyn FnMut(&[u8])>,
 ) -> Result<ExtractReport, ExtractError>
 where
     S: DsdSource + ?Sized,
@@ -1491,6 +1563,7 @@ where
                         )));
                     }
                 }
+                if let Some(tap)=on_audio.as_mut() { (*tap)(&decoded.data); }
                 decoded.data.len()
             }
             DsdSourceFrame::Dsd(dsd) => {
@@ -1515,6 +1588,7 @@ where
                             .map_err(ExtractError::Io)?;
                     }
                 }
+                if let Some(tap)=on_audio.as_mut() { (*tap)(&dsd.data); }
                 dsd.data.len()
             }
         };

@@ -18,6 +18,7 @@ use crate::tui::command::select_default_disc_presentation_index;
 use crate::tui::disc_browser::{
     metadata_for_disc_presentation, presentation_supports_stream_conversion,
     source_mode_for_presentation, DiscBrowserState, DiscProbeFollowup,
+    ExtractOptionControl, ExtractPanel,
 };
 use crate::tui::message::AppMessage;
 
@@ -116,9 +117,9 @@ pub(crate) fn handle_archive_extract_ready(app:&mut AppState,path:PathBuf,reques
             state.archive_length=preview.source_length;
             state.archive_modified=preview.source_modified;
             state.archive_password=preview.password;
-            // An archive extracts exactly the checked members by default.
-            // A log is an additional artifact, never implicit for this mode.
-            state.extraction_log=false;
+            // Restore Extract preferences independently of Convert, including
+            // the log choice that now starts enabled unless saved otherwise.
+            restore_extract_options(&mut state,&app.config);
             state.refresh_destination_feedback();
             app.active_overlay=ActiveOverlay::DiscBrowser(Box::new(state));
         }
@@ -162,7 +163,7 @@ pub(crate) fn handle_cue_extract_ready(app: &mut AppState, path: PathBuf, reques
                 state.destination = path.join("Extracted");
                 state.refresh_destination_feedback();
             }
-            state.extraction_log = app.config.conversion.write_log_file;
+            restore_extract_options(&mut state,&app.config);
             app.active_overlay = ActiveOverlay::DiscBrowser(Box::new(state));
         }
         Err(error) => app.set_status(format!("Cannot extract CUE: {error}")),
@@ -248,9 +249,8 @@ pub fn open_disc_browser_from_contents(app: &mut AppState, contents: DiscContent
     };
     let mut state = DiscBrowserState::new(contents, extraction_source);
     state.probe_path = source_path;
-    // Match Convert's user preference rather than defaulting off for every
-    // extraction. A per-dialogue toggle never writes to the preference.
-    state.extraction_log = app.config.conversion.write_log_file;
+    // Extract has its own defaults; no per-dialogue choice modifies Convert.
+    restore_extract_options(&mut state,&app.config);
     if state.probe_statuses.iter().any(Option::is_none) {
         let id = state.probe_id;
         let cancel = state.probe_cancel.clone();
@@ -520,6 +520,76 @@ fn open_native_naming_builder(app: &mut AppState) {
     app.active_overlay=ActiveOverlay::TemplateBuilder(Box::new(builder));
 }
 
+fn activate_native_option(state:&mut DiscBrowserState,control:ExtractOptionControl) {
+    use crate::convert::pipeline::native_extract::{NativeCueBetweenGap as B, NativeCueFirstGap as F};
+    use ExtractOptionControl as C;
+    match control {
+        C::WriteLog => state.extraction_log=!state.extraction_log,
+        C::Verify => state.extract_settings.verify_after=!state.extract_settings.verify_after,
+        C::Chapters | C::CueFiles | C::CopyFolder => {
+            state.option_parent_cursor=state.panel_cursor;
+            state.panel=Some(match control { C::Chapters=>ExtractPanel::Chapters,
+                C::CueFiles=>ExtractPanel::CueFiles,_=>ExtractPanel::CopyFolder });
+            state.panel_cursor=0;
+        },
+        C::WriteChapters => state.extract_settings.write_chapters=!state.extract_settings.write_chapters,
+        C::CreateCue => state.cue=!state.cue,
+        C::EmbedCue => state.extract_settings.embed_cue=!state.extract_settings.embed_cue,
+        C::KeepPreemphasis => state.extract_settings.keep_preemphasis=!state.extract_settings.keep_preemphasis,
+        C::BetweenAppend => state.extract_settings.between_gap=B::AppendPrevious,
+        C::BetweenPrepend => state.extract_settings.between_gap=B::PrependNext,
+        C::BetweenDrop => state.extract_settings.between_gap=B::Drop,
+        C::FirstPrepend => state.extract_settings.first_gap=F::PrependFirst,
+        C::FirstOwn00 => state.extract_settings.first_gap=F::OwnTrack00,
+        C::FirstDrop => state.extract_settings.first_gap=F::Drop,
+        C::CopyArtwork => state.extract_settings.copy_folder.artwork=!state.extract_settings.copy_folder.artwork,
+        C::CopyArtFolders => state.extract_settings.copy_folder.art_folders=!state.extract_settings.copy_folder.art_folders,
+        C::CopyLog => state.extract_settings.copy_folder.log=!state.extract_settings.copy_folder.log,
+        C::CopyCue => state.extract_settings.copy_folder.cue=!state.extract_settings.copy_folder.cue,
+        C::CopyTxt => state.extract_settings.copy_folder.txt=!state.extract_settings.copy_folder.txt,
+        C::CopyNfo => state.extract_settings.copy_folder.nfo=!state.extract_settings.copy_folder.nfo,
+        C::CopyMd => state.extract_settings.copy_folder.md=!state.extract_settings.copy_folder.md,
+        C::CopyPdf => state.extract_settings.copy_folder.pdf=!state.extract_settings.copy_folder.pdf,
+        C::CopyMd5 => state.extract_settings.copy_folder.md5=!state.extract_settings.copy_folder.md5,
+        C::CopyOther => state.extract_settings.copy_folder.other=!state.extract_settings.copy_folder.other,
+        C::SaveNext => state.save_extract_defaults=!state.save_extract_defaults,
+        C::Done => {
+            if matches!(state.panel,Some(ExtractPanel::Chapters | ExtractPanel::CueFiles | ExtractPanel::CopyFolder)) {
+                state.panel=Some(ExtractPanel::Options);
+                state.panel_cursor=state.option_parent_cursor;
+            } else {state.panel=None;state.panel_cursor=0;}
+        }
+    }
+}
+
+/// The native-radio keys move only within the currently focused group.
+fn cycle_extract_radio(state:&mut DiscBrowserState,forward:bool) {
+    use ExtractOptionControl as C;
+    let controls=state.option_controls();
+    let Some(current)=controls.get(state.panel_cursor) else {return;};
+    let group:&[C]=match current {
+        C::BetweenAppend | C::BetweenPrepend | C::BetweenDrop =>
+            &[C::BetweenAppend,C::BetweenPrepend,C::BetweenDrop],
+        C::FirstPrepend | C::FirstOwn00 | C::FirstDrop =>
+            &[C::FirstPrepend,C::FirstOwn00,C::FirstDrop],
+        _=>return,
+    };
+    let index=group.iter().position(|value|value==current).unwrap_or(0);
+    let next=group[(index+if forward {1}else{group.len()-1})%group.len()];
+    if let Some(position)=controls.iter().position(|value|*value==next) {
+        state.panel_cursor=position;
+        activate_native_option(state,next);
+    }
+}
+
+fn restore_extract_options(state:&mut DiscBrowserState,config:&crate::config::TonepoetConfig) {
+    let saved=config.extract_defaults.clone().unwrap_or_default();
+    state.extraction_log=saved.write_log;
+    state.cue=saved.create_cue;
+    state.extract_settings=saved;
+    state.save_extract_defaults=false;
+}
+
 fn start_native_extraction(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     let ActiveOverlay::DiscBrowser(state) = &app.active_overlay else { return; };
     let root = native_working_root(state, app.config.conversion.scratch_directory.as_deref());
@@ -538,11 +608,21 @@ fn start_native_extraction(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
         return;
     }
     let probe_cancel = state.probe_cancel.clone();
+    let save_defaults=state.save_extract_defaults.then(||state.current_extract_settings());
     if let Err(error) = super::native_extract_task::launch(app, job, tx) {
         app.set_status(format!("Cannot start native extraction: {error}"));
         return;
     }
     probe_cancel.cancel();
+    if let Some(defaults)=save_defaults {
+        // Persist only this field under the config store lock. A whole-config
+        // save could replace unrelated edits made by a second instance.
+        if let Err(error)=app.config.update(|latest| {
+            latest.extract_defaults=Some(defaults.clone());
+        }) {
+            app.set_status(format!("Extraction started, but settings were not saved: {error}"));
+        }
+    }
 }
 
 /// Handle a click according to the visible extraction controls. Double-clicking
@@ -568,6 +648,23 @@ pub fn handle_disc_browser_button_click_with_shift(
     // precedence over the extraction window below it. Other panels remain
     // modal but read-only, as before.
     if let ActiveOverlay::DiscBrowser(state) = &app.active_overlay {
+        if matches!(state.panel,Some(ExtractPanel::Options | ExtractPanel::Chapters | ExtractPanel::CueFiles | ExtractPanel::CopyFolder)) {
+            if let ActiveOverlay::DiscBrowser(state)=&mut app.active_overlay {
+                match button {
+                    TuiButton::DiscBrowserOptionControl(index) => {
+                        if let Some(control)=state.option_controls().get(*index).copied() {
+                            state.panel_cursor=*index;
+                            activate_native_option(state,control);
+                        }
+                    }
+                    TuiButton::DiscBrowserOptionOutside => {
+                        activate_native_option(state,ExtractOptionControl::Done);
+                    }
+                    _ => {}, // passive area and previous-frame targets are inert
+                }
+            }
+            return true;
+        }
         if state.panel == Some(crate::tui::disc_browser::ExtractPanel::Tags) {
             // An open source dropdown owns its interaction until a choice is
             // made or it is dismissed; a click behind it never edits fields.
@@ -819,9 +916,10 @@ pub fn handle_disc_browser_button_click_with_shift(
             activate_overlay_convert(app);
             true
         }
-        TuiButton::DiscBrowserMore => {
+        TuiButton::DiscBrowserOptions => {
             if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
-                state.panel = Some(crate::tui::disc_browser::ExtractPanel::More);
+                state.panel = Some(crate::tui::disc_browser::ExtractPanel::Options);
+                state.panel_cursor=0;
             }
             true
         }
@@ -1009,8 +1107,8 @@ fn focus_native_row(state: &mut DiscBrowserState, name: &str) {
     state.focus = crate::tui::disc_browser::ExtractFocus::Output;
     state.output_cursor = state.output_rows().iter().position(|row| *row == name).unwrap_or(0);
     state.normalize_output_cursor();
-    if matches!(name, "Overwrite" | "Keep DST" | "Tags" | "Log") { state.form_column = 1; }
-    else if matches!(name, "Format" | "Files" | "CUE") { state.form_column = 0; }
+    if matches!(name, "Overwrite" | "Keep DST" | "Tags") { state.form_column = 1; }
+    else if matches!(name, "Format" | "Files") { state.form_column = 0; }
 }
 
 /// Logical coordinates match the form's fixed wide geometry; full-width
@@ -1021,9 +1119,8 @@ fn native_form_position(name: &str, has_keep_dst: bool) -> (usize, Option<usize>
         "Format" => (0,Some(0)), "Overwrite" => (0,Some(1)),
         "Keep DST" => (1,Some(1)),
         "Files" => (1+extra,Some(0)), "Tags" => (1+extra,Some(1)),
-        "CUE" => (2+extra,Some(0)), "Log" => (2+extra,Some(1)),
-        "Folder" => (3+extra,None), "Naming" => (4+extra,None),
-        "Downmix" => (5+extra,None), "Assume decrypted" => (6+extra,None),
+        "Folder" => (2+extra,None), "Naming" => (3+extra,None),
+        "Downmix" => (4+extra,None), "Assume decrypted" => (5+extra,None),
         _ => (0,None),
     }
 }
@@ -1090,11 +1187,6 @@ fn set_native_files(state: &mut DiscBrowserState, choice: usize) {
     if state.file_per_program && state.contents.format == crate::disc::DiscFormat::Matroska {
         for checked in &mut state.items_checked { checked.fill(true); }
     }
-    if !state.file_per_program || state.contents.format == crate::disc::DiscFormat::Sacd ||
-        (state.contents.format == crate::disc::DiscFormat::Matroska &&
-            !state.matroska_cue_available()) {
-        state.cue = false;
-    }
 }
 
 fn set_native_format(state: &mut DiscBrowserState, choice: usize) {
@@ -1138,11 +1230,6 @@ fn toggle_native_form_row(state: &mut DiscBrowserState) {
     match state.current_output_row() {
         "Keep DST" => toggle_native_keep_dst(state),
         "Tags" if state.native_tags_available() => state.tags = !state.tags,
-        "Log" => state.extraction_log = !state.extraction_log,
-        "CUE" if state.file_per_program && (state.matroska_cue_available() ||
-            !matches!(state.contents.format,
-                crate::disc::DiscFormat::Sacd | crate::disc::DiscFormat::Matroska | crate::disc::DiscFormat::TransportFile | crate::disc::DiscFormat::CueImage | crate::disc::DiscFormat::Archive)) =>
-            state.cue = !state.cue,
         "Assume decrypted" => state.assume_decrypted = !state.assume_decrypted,
         "Downmix" => cycle_native_option(state, 1),
         _ => {},
@@ -1219,7 +1306,7 @@ enum NativeKeyAction {
     NextFocus, PreviousFocus, ToPrograms, ToItems,
     Check, All, None, Invert, Enter, Space, Previous, Next,
     FormLeft, FormRight, FooterLeft, FooterRight,
-    Hidden, Diagnostics, More, Convert, Help, Close,
+    Hidden, Diagnostics, Options, Convert, Help, Close,
     EditDone, EditUndo, EditComplete, EditLeft, EditRight,
     OverwriteHelp, OverwriteHelpClose,
     NamingLoad, NamingCustom,
@@ -1294,7 +1381,7 @@ fn native_key_bindings(state: &DiscBrowserState) -> Vec<NativeKeyBinding> {
                 }
                 "Tags" if state.native_tags_available() =>
                     add(KeyCode::Char(' '), M::NONE, "Space toggle", A::Space),
-                "Log" | "CUE" | "Keep DST" =>
+                "Keep DST" =>
                     add(KeyCode::Char(' '), M::NONE, "Space toggle", A::Space),
                 "Naming" => {
                     add(KeyCode::Char('l'),M::NONE,"l presets",A::NamingLoad);
@@ -1311,7 +1398,7 @@ fn native_key_bindings(state: &DiscBrowserState) -> Vec<NativeKeyBinding> {
                 "Folder" => "↵ edit folder",
                 "Naming" => "↵ edit naming",
                 "Format" | "Files" => "↵ choose",
-                "Log" | "CUE" | "Keep DST" => "↵ toggle",
+                "Keep DST" => "↵ toggle",
                 _ => "↵ settings",
             }, A::Enter);
             }
@@ -1346,7 +1433,7 @@ fn native_key_bindings(state: &DiscBrowserState) -> Vec<NativeKeyBinding> {
     if !state.contents.diagnostics.is_empty() {
         add(KeyCode::Char('d'), M::NONE, "d diagnostics", A::Diagnostics);
     }
-    add(KeyCode::Char('m'), M::NONE, "m options", A::More);
+    add(KeyCode::Char('m'), M::NONE, "m options", A::Options);
     add(KeyCode::Char('c'), M::NONE, "c convert", A::Convert);
     add(KeyCode::Char('?'), M::NONE, "? all keys", A::Help);
     add(KeyCode::Esc, M::NONE, "Esc close", A::Close);
@@ -1697,46 +1784,6 @@ pub fn handle_disc_browser_key(
             return;
         }
     }
-    // Opening the existing editor mutates the overlay, so perform this route
-    // before borrowing the extraction state for in-panel key dispatch.
-    if matches!(&app.active_overlay, ActiveOverlay::DiscBrowser(state)
-        if matches!(state.panel, Some(ExtractPanel::More))
-            && !state.editing_destination)
-        && key.code == KeyCode::Char('e')
-    {
-        match open_extract_owned_tag_editor(app) {
-            Ok(true) => {},
-            Ok(false) => app.set_status("No selected presentation is available to edit"),
-            Err(error) => app.set_status(format!("Cannot open tag editor: {error}")),
-        }
-        return;
-    }
-    // More routes to established app actions, not a second lookup or probe.
-    if matches!(&app.active_overlay, ActiveOverlay::DiscBrowser(state)
-        if matches!(state.panel, Some(ExtractPanel::More)))
-        && key.code == KeyCode::Char('b')
-    {
-        match open_extract_owned_tag_editor(app) {
-            Ok(true) => crate::tui::command::execute_command(app,
-                crate::tui::command::Command::TagsFromMb {query:None,catno:None,year:None},tx),
-            Ok(false) => app.set_status("No selected presentation is available for lookup"),
-            Err(error) => app.set_status(format!("Cannot open tag lookup: {error}")),
-        }
-        return;
-    }
-    if let ActiveOverlay::DiscBrowser(state) = &app.active_overlay {
-        if state.panel == Some(ExtractPanel::More)
-            && state.contents.format != crate::disc::DiscFormat::Sacd
-            && key.code == KeyCode::Char('a') {
-            let path = state.probe_path.clone();
-            state.probe_cancel.cancel();
-            app.active_overlay = ActiveOverlay::None;
-            app.browse.disc_probe_followup.insert(path.clone(),
-                crate::tui::disc_browser::DiscProbeFollowup::OpenDiscBrowser);
-            force_disc_reprobe(app,path,tx);
-            return;
-        }
-    }
     // Enter now edits the field. The Browse button still opens the existing picker.
     let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { return; };
 
@@ -1750,6 +1797,23 @@ pub fn handle_disc_browser_key(
     }
 
     if let Some(panel) = state.panel {
+        if matches!(panel,ExtractPanel::Options | ExtractPanel::Chapters | ExtractPanel::CueFiles | ExtractPanel::CopyFolder) {
+            let len=state.option_controls().len();
+            match key.code {
+                KeyCode::Esc => activate_native_option(state,ExtractOptionControl::Done),
+                KeyCode::Up | KeyCode::BackTab => state.panel_cursor=state.panel_cursor.saturating_sub(1),
+                KeyCode::Down | KeyCode::Tab => state.panel_cursor=(state.panel_cursor+1).min(len.saturating_sub(1)),
+                KeyCode::Char('[') | KeyCode::Left => cycle_extract_radio(state,false),
+                KeyCode::Char(']') | KeyCode::Right => cycle_extract_radio(state,true),
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    if let Some(control)=state.option_controls().get(state.panel_cursor).copied() {
+                        activate_native_option(state,control);
+                    }
+                }
+                _ => {},
+            }
+            return;
+        }
         if panel == ExtractPanel::Tags {
             use crate::tui::disc_browser::TagSheetControl as C;
             if state.tag_source_open {
@@ -1790,10 +1854,6 @@ pub fn handle_disc_browser_key(
             (ExtractPanel::Downmix | ExtractPanel::AssumeDecrypted, KeyCode::Char(']')) => cycle_native_option(state, 1),
             (ExtractPanel::ConvertChoice, KeyCode::Enter) => { convert_overlay_cursor(app); }
             (ExtractPanel::ConvertChoice, KeyCode::Char('e')) => { queue_overlay_checked_programs(app); }
-            (ExtractPanel::More, KeyCode::Char('g')) => state.cycle_dvda_group_preset(),
-            (ExtractPanel::More, KeyCode::Char('h')) => { state.show_hidden = !state.show_hidden; }
-            (ExtractPanel::More, KeyCode::Char('d')) => { state.panel = Some(ExtractPanel::Diagnostics); }
-            (ExtractPanel::More, KeyCode::Char('c')) => { state.panel = Some(ExtractPanel::ConvertChoice); }
             (_, KeyCode::Down) => { state.panel_cursor = state.panel_cursor.saturating_add(1); }
             (_, KeyCode::Up) => { state.panel_cursor = state.panel_cursor.saturating_sub(1); }
             _ => {}
@@ -1862,7 +1922,7 @@ pub fn handle_disc_browser_key(
         }
         Some(A::Hidden) => state.show_hidden = !state.show_hidden,
         Some(A::Diagnostics) => {state.panel=Some(ExtractPanel::Diagnostics);state.panel_cursor=0;}
-        Some(A::More) => {state.panel=Some(ExtractPanel::More);state.panel_cursor=0;}
+        Some(A::Options) => {state.panel=Some(ExtractPanel::Options);state.panel_cursor=0;}
         Some(A::OverwriteHelp) => {state.overwrite_open=true;}
         Some(A::Convert) => activate_overlay_convert(app),
         Some(A::Previous | A::Next) => cycle_native_option(state, if action==Some(A::Previous){-1}else{1}),
@@ -1893,7 +1953,7 @@ pub fn handle_disc_browser_key(
             state.footer_cursor = (state.footer_cursor as i8 + step).clamp(minimum,3) as usize;
         }
         Some(A::Space) => match state.current_output_row() {
-            "Log" | "Tags" | "CUE" | "Keep DST" => toggle_native_form_row(state),
+            "Tags" | "Keep DST" => toggle_native_form_row(state),
             "Format" | "Files" | "Downmix" | "Assume decrypted" => cycle_native_option(state,1),
             "Folder" => begin_native_folder_edit(state),
             "Naming" => begin_native_template_edit(state),
@@ -1907,7 +1967,7 @@ pub fn handle_disc_browser_key(
                 "Folder" => begin_native_folder_edit(state),
                 "Naming" => begin_native_template_edit(state),
                 "Overwrite" => cycle_native_option(state,1),
-                "Log" | "CUE" | "Keep DST" => toggle_native_form_row(state),
+                "Keep DST" => toggle_native_form_row(state),
                 "Format" | "Files" | "Downmix" | "Assume decrypted" => cycle_native_option(state,1),
                 "Tags" => open_native_tags_sheet(state),
                 _ => {},
@@ -1915,7 +1975,7 @@ pub fn handle_disc_browser_key(
             ExtractFocus::Footer => match state.footer_cursor {
                 0 if state.footer_extract_enabled.get() => start_native_extraction(app,tx),
                 1 => activate_overlay_convert(app),
-                2 => {state.panel=Some(ExtractPanel::More);state.panel_cursor=0;},
+                2 => {state.panel=Some(ExtractPanel::Options);state.panel_cursor=0;},
                 3 => {state.probe_cancel.cancel();app.active_overlay=ActiveOverlay::None;},
                 _ => {},
             },
@@ -2742,22 +2802,22 @@ mod tests {
             let contents=selectable_disc_contents(PathBuf::from("disc.iso"),FolderDiscMarkerKind::Sacd);
             let mut state=DiscBrowserState::new(contents,PathBuf::from("disc.iso"));
             state.focus=ExtractFocus::Output;
-            focus_native_row(&mut state,"Log");
+            state.panel=Some(ExtractPanel::Options);
             let mut terminal=Terminal::new(TestBackend::new(width,height)).unwrap();
             let mut buttons=ButtonRenderMap::new();
             terminal.draw(|frame|crate::tui::disc_extract_render::draw(frame,&state,
                 Path::new("/tmp"),&mut buttons,crate::tui::theme::theme_by_slug_or_default("tokyo-night"))).unwrap();
-            let log_index=state.output_rows().iter().position(|r|*r=="Log").unwrap();
-            let toggle=buttons.button_rect(TuiButton::DiscBrowserToggle(log_index))
-                .expect("log toggle must be visible when focused");
+            let toggle=buttons.button_rect(TuiButton::DiscBrowserOptionControl(0))
+                .expect("log toggle must be visible in Options");
             assert_eq!(buttons.find_button_at(toggle.x,toggle.y),
-                Some(TuiButton::DiscBrowserToggle(log_index)));
+                Some(TuiButton::DiscBrowserOptionControl(0)));
             let mut app=AppState::new_for_test(TonepoetConfig::default());
             app.active_overlay=ActiveOverlay::DiscBrowser(Box::new(state));
-            handle_disc_browser_button_click(&mut app,&TuiButton::DiscBrowserToggle(log_index),1,&tx);
-            assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if s.extraction_log));
-            handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Char(' '),M::NONE),&tx);
+            handle_disc_browser_button_click(&mut app,&TuiButton::DiscBrowserOptionControl(0),1,&tx);
             assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if !s.extraction_log));
+            handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Char(' '),M::NONE),&tx);
+            assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if s.extraction_log));
+            handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Esc,M::NONE),&tx);
             if let ActiveOverlay::DiscBrowser(s)=&mut app.active_overlay {focus_native_row(s,"Overwrite");}
             handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Enter,M::NONE),&tx);
             assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
@@ -2774,24 +2834,26 @@ mod tests {
     }
 
     #[test]
-    fn r22_log_initial_setting_tracks_convert_without_modifying_preference() {
+    fn r22_extract_log_defaults_are_independent_of_convert() {
         let path = PathBuf::from("/tmp/native-extract-log-preference.iso");
         let contents = selectable_disc_contents(path.clone(), FolderDiscMarkerKind::Sacd);
         let mut config = TonepoetConfig::default();
-        config.conversion.write_log_file = true;
+        config.conversion.write_log_file = false;
         let mut app = AppState::new_for_test(config);
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
         open_disc_browser_from_contents(&mut app, contents, path, &tx);
         assert!(matches!(&app.active_overlay, ActiveOverlay::DiscBrowser(state)
             if state.extraction_log));
-        let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { unreachable!() };
-        focus_native_row(state, "Log");
+        handle_disc_browser_key(&mut app, KeyEvent::new(KeyCode::Char('m'),
+            crossterm::event::KeyModifiers::NONE), &tx);
         handle_disc_browser_key(&mut app, KeyEvent::new(KeyCode::Char(' '),
             crossterm::event::KeyModifiers::NONE), &tx);
         assert!(matches!(&app.active_overlay, ActiveOverlay::DiscBrowser(state)
-            if !state.extraction_log));
-        assert!(app.config.conversion.write_log_file,
+            if !state.extraction_log && state.panel == Some(ExtractPanel::Options)));
+        assert!(!app.config.conversion.write_log_file,
             "per-extraction changes must not alter Convert's setting");
+        assert!(app.config.extract_defaults.is_none(),
+            "changes are transient until Extract is pressed with save ticked");
     }
 
     #[test]
@@ -2995,12 +3057,12 @@ mod tests {
         let contents=selectable_disc_contents(disc.clone(),FolderDiscMarkerKind::Sacd);
         let state=DiscBrowserState::new(contents,disc);
         let original=state.destination.clone();
-        let log=state.output_rows().iter().position(|row| *row=="Log").unwrap();
+        let tags=state.output_rows().iter().position(|row| *row=="Tags").unwrap();
         let mut app=AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay=ActiveOverlay::DiscBrowser(Box::new(state));
         app.button_map.record_button(TuiButton::DiscBrowserFolderField,Rect::new(8,12,38,1));
         app.button_map.record_button(TuiButton::DiscBrowserFolderBrowse,Rect::new(48,12,7,1));
-        app.button_map.record_button(TuiButton::DiscBrowserToggle(log),Rect::new(55,13,20,1));
+        app.button_map.record_button(TuiButton::DiscBrowserToggle(tags),Rect::new(55,13,20,1));
         let (tx,_rx)=tokio::sync::mpsc::channel(8);
         let click=|x,y| MouseEvent{kind:MouseEventKind::Down(MouseButton::Left),
             column:x,row:y,modifiers:M::NONE};
@@ -3010,11 +3072,11 @@ mod tests {
         handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Char('X'),M::NONE),&tx);
         crate::tui::keybindings::handle_mouse(&mut app,click(56,13),&tx);
         assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
-            if !s.editing_destination && s.current_output_row()=="Log"
-                && s.extraction_log && s.destination==original));
+            if !s.editing_destination && s.current_output_row()=="Tags"
+                && !s.tags && s.destination==original));
         handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Char(' '),M::NONE),&tx);
         assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
-            if !s.extraction_log && s.destination==original));
+            if s.tags && s.destination==original));
         app.double_click.clear();
         crate::tui::keybindings::handle_mouse(&mut app,click(12,12),&tx);
         assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
@@ -3089,8 +3151,7 @@ mod tests {
         press(&mut app,KeyCode::Up);
         assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if s.current_output_row()=="Overwrite"));
         press(&mut app,KeyCode::Down);
-        press(&mut app,KeyCode::Down);
-        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if s.current_output_row()=="Log"));
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if s.current_output_row()=="Tags"));
         press(&mut app,KeyCode::Down);
         assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if s.current_output_row()=="Folder"));
         press(&mut app,KeyCode::Tab);
@@ -3532,7 +3593,8 @@ mod tests {
             selectable_disc_contents(source.clone(),FolderDiscMarkerKind::DvdAudio),source);
         state.file_per_program=true;
         state.focus=ExtractFocus::Output;
-        assert!(state.output_rows().contains(&"CUE"));
+        assert!(state.native_cue_applicable());
+        assert!(!state.output_rows().contains(&"CUE"));
         let mut app=AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay=ActiveOverlay::DiscBrowser(Box::new(state));
         let (tx,_rx)=tokio::sync::mpsc::channel(8);
@@ -3540,14 +3602,24 @@ mod tests {
             KeyEvent::new(code,M::NONE),&tx);
         for (width,height,wide) in [(110,34,false),(132,34,false),(154,40,true)] {
             if let ActiveOverlay::DiscBrowser(state)=&mut app.active_overlay {
-                focus_native_row(state,"CUE");
+                focus_native_row(state,"Tags");
+                state.cue=true;
             }
             r24_paint_folder(&mut app,width,height);
             assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(state)
                 if state.form_wide.get()==wide));
-            press(&mut app,KeyCode::Right);
+            press(&mut app,KeyCode::Char('m'));
+            for _ in 0..3 {press(&mut app,KeyCode::Down);}
             assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(state)
-                if state.current_output_row()==(if wide {"Log"}else{"CUE"})));
+                if state.panel==Some(ExtractPanel::Options)
+                    && state.option_controls().get(state.panel_cursor)==Some(&ExtractOptionControl::CueFiles)));
+            press(&mut app,KeyCode::Enter);
+            assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(state)
+                if state.panel == Some(ExtractPanel::CueFiles)));
+            press(&mut app,KeyCode::Char(' '));
+            assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(state) if !state.cue));
+            press(&mut app,KeyCode::Esc);
+            press(&mut app,KeyCode::Esc);
             if let ActiveOverlay::DiscBrowser(state)=&mut app.active_overlay {
                 state.focus=ExtractFocus::Footer;
             }
@@ -4070,7 +4142,7 @@ mod tests {
         assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
             if s.text_edit.as_ref().is_some_and(|i|i.select_all)));
         // A letter which is a window accelerator must replace the selection,
-        // not change a checkbox or trigger the More sheet.
+        // not change a checkbox or trigger Options.
         send(&mut app,KeyCode::Char('m'),M::NONE);
         assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
             if s.editing_destination && s.destination_input=="m" && s.panel.is_none()));
@@ -4132,6 +4204,48 @@ mod tests {
         assert!(!state.maximized);
         handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Char('m'),KeyModifiers::NONE),&tx);
         let ActiveOverlay::DiscBrowser(state)=&app.active_overlay else {panic!("missing extract overlay")};
-        assert_eq!(state.panel,Some(crate::tui::disc_browser::ExtractPanel::More));
+        assert_eq!(state.panel,Some(crate::tui::disc_browser::ExtractPanel::Options));
     }
+    #[test]
+    fn extract_options_saved_defaults_restore_without_modifying_convert() {
+        use crate::config::ExtractSavedOptions;
+        let source=PathBuf::from("disc.iso");
+        let contents=selectable_disc_contents(source.clone(),FolderDiscMarkerKind::DvdAudio);
+        let mut config=TonepoetConfig::default();
+        config.conversion.write_log_file=true;
+        config.extract_defaults=Some(ExtractSavedOptions {
+            write_log:false,create_cue:false, ..Default::default()
+        });
+        let mut state=DiscBrowserState::new(contents,source);
+        state.file_per_program=true;
+        restore_extract_options(&mut state,&config);
+        assert!(!state.extraction_log);
+        assert!(!state.cue);
+        assert!(!state.save_extract_defaults);
+        assert!(config.conversion.write_log_file);
+
+        state.panel=Some(ExtractPanel::Options);
+        assert_eq!(state.option_controls(),vec![ExtractOptionControl::WriteLog,
+            ExtractOptionControl::Verify,ExtractOptionControl::Chapters,
+            ExtractOptionControl::CueFiles,ExtractOptionControl::CopyFolder,
+            ExtractOptionControl::SaveNext,ExtractOptionControl::Done]);
+        activate_native_option(&mut state,ExtractOptionControl::WriteLog);
+        activate_native_option(&mut state,ExtractOptionControl::SaveNext);
+        assert!(state.extraction_log && state.save_extract_defaults);
+        assert!(!config.extract_defaults.as_ref().unwrap().write_log,
+            "editing the window must not persist the new preference");
+        let cue_row=state.option_controls().iter()
+            .position(|control|*control==ExtractOptionControl::CueFiles).unwrap();
+        state.panel_cursor=cue_row;
+        activate_native_option(&mut state,ExtractOptionControl::CueFiles);
+        assert_eq!(state.panel,Some(ExtractPanel::CueFiles));
+        activate_native_option(&mut state,ExtractOptionControl::CreateCue);
+        assert!(state.cue);
+        activate_native_option(&mut state,ExtractOptionControl::Done);
+        assert_eq!(state.panel,Some(ExtractPanel::Options));
+        assert_eq!(state.panel_cursor,cue_row);
+        activate_native_option(&mut state,ExtractOptionControl::Done);
+        assert_eq!(state.panel,None);
+    }
+
 }

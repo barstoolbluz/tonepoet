@@ -407,6 +407,9 @@ pub enum TuiButton {
     DiscBrowserTagSheetSourceChoice(usize),
     DiscBrowserTagSheetOutside,
     DiscBrowserTagSheetPassive,
+    DiscBrowserOptionControl(usize),
+    DiscBrowserOptionOutside,
+    DiscBrowserOptionPassive,
     DiscBrowserFolderField,
     DiscBrowserFolderBrowse,
     /// Context key hint; mapped back through the same table as keyboard input.
@@ -417,7 +420,7 @@ pub enum TuiButton {
     DiscBrowserNamingCustom,
     DiscBrowserOverwrite,
     DiscBrowserExtract,
-    DiscBrowserMore,
+    DiscBrowserOptions,
     DiscBrowserConvert,
     DiscBrowserClose,
 
@@ -605,6 +608,9 @@ impl TuiButton {
             | Self::DiscBrowserTagSheetSourceChoice(_)
             | Self::DiscBrowserTagSheetOutside
             | Self::DiscBrowserTagSheetPassive
+            | Self::DiscBrowserOptionControl(_)
+            | Self::DiscBrowserOptionOutside
+            | Self::DiscBrowserOptionPassive
             | Self::DiscBrowserFolderField
             | Self::DiscBrowserFolderBrowse
             | Self::DiscBrowserHint(_)
@@ -614,7 +620,7 @@ impl TuiButton {
             | Self::DiscBrowserNamingCustom
             | Self::DiscBrowserOverwrite
             | Self::DiscBrowserExtract
-            | Self::DiscBrowserMore
+            | Self::DiscBrowserOptions
             | Self::DiscBrowserConvert
             | Self::DiscBrowserClose
             | Self::ActionsAvailable(_)

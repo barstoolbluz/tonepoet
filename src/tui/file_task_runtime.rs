@@ -3194,7 +3194,7 @@ mod tests {
             wav_container:NativeWavContainer::Automatic,assume_decrypted:false,
             downmix:crate::convert::pipeline::DvdaDownmixPolicy::None,
             naming_template:"{track} - {title}".into(),program_subfolders:false,
-            overwrite_policy:NativeOverwritePolicy::Fail,extraction_log:true, program_log_paths: Vec::new(), round4_layout: false,
+            overwrite_policy:NativeOverwritePolicy::Fail,extraction_log:true, options: crate::convert::pipeline::native_extract::NativeExtractSettings {create_cue:false, write_chapters:false, ..Default::default()}, program_log_paths: Vec::new(), round4_layout: false,
             file_per_program:false,cue:false,transfer_tags:false,
             sacd_dff: false, tag_source:NativeTagSource::DiscAndSidecar,tag_fields:0,tag_artwork:false,
         }

@@ -406,7 +406,9 @@ mod tests {
             }
             let state = crate::tui::disc_browser::DiscBrowserState::new(contents, file);
             assert!(state.file_per_program);
-            assert!(!state.cue);
+            assert!(state.cue, "creation preference defaults on even for an unsupported stream");
+            assert!(!state.native_cue_applicable());
+            assert!(!state.native_job(std::env::temp_dir().join("scratch")).cue);
             assert!(state.selected.iter().all(|yes| *yes));
             assert!(state.output_rows().contains(&"Folder"));
             assert!(state.output_rows().contains(&"Naming"));

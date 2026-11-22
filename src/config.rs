@@ -20,9 +20,16 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
+/// All extraction options are persisted together when the user opts in.
+pub use crate::convert::pipeline::native_extract::NativeExtractSettings as ExtractSavedOptions;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TonepoetConfig {
     pub conversion: ConversionSettings,
+    /// Saved defaults for the native Extract window. None means built-in
+    /// defaults; an ordinary per-job choice never mutates this config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extract_defaults: Option<ExtractSavedOptions>,
     #[serde(default)]
     pub ui: UiConfig,
     #[serde(default)]
@@ -705,6 +712,7 @@ impl Default for TonepoetConfig {
     fn default() -> Self {
         Self {
             conversion: ConversionSettings::default(),
+            extract_defaults: None,
             ui: UiConfig::default(),
             performance: PerformanceConfig::default(),
             browsing: BrowsingConfig::default(),
@@ -2616,6 +2624,41 @@ mod theme_config_tests {
             once,
             "an identical remembered choice must be byte-idempotent"
         );
+    }
+
+    #[test]
+    fn extract_defaults_round_trip_and_narrow_save_preserve_convert_preferences() {
+        let original = TonepoetConfig::default();
+        assert!(original.extract_defaults.is_none());
+        let encoded = toml::to_string(&original).expect("encode default config");
+        assert!(!encoded.contains("extract_defaults"));
+        let decoded: TonepoetConfig = toml::from_str(&encoded).expect("decode default config");
+        assert!(decoded.extract_defaults.is_none());
+        assert_eq!(ExtractSavedOptions::default(), ExtractSavedOptions {
+            write_log: true, create_cue: true, ..Default::default()
+        });
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let _override = ConfigPathOverrideGuard::install(path.clone());
+        let mut config = TonepoetConfig::default();
+        config.conversion.write_log_file = true;
+        config.browsing.show_hidden = true;
+        config.save().expect("save initial preferences");
+        let saved = ExtractSavedOptions { write_log: false, create_cue: false,
+            verify_after: true, embed_cue: true, ..Default::default() };
+        config.update(|latest| latest.extract_defaults = Some(saved.clone()))
+            .expect("persist Extract preferences");
+        let reloaded = TonepoetConfig::load().expect("reload Extract preferences");
+        assert_eq!(reloaded.extract_defaults, Some(saved.clone()));
+        assert!(reloaded.conversion.write_log_file);
+        assert!(reloaded.browsing.show_hidden);
+
+        let before = std::fs::read(&path).expect("config after first update");
+        config.update(|latest| latest.extract_defaults = Some(saved.clone()))
+            .expect("repeat Extract preference update");
+        let after = std::fs::read(&path).expect("config after repeat update");
+        assert_eq!(before, after, "identical Extract defaults must save idempotently");
     }
 
     struct ConfigPathOverrideGuard;
