@@ -2136,6 +2136,7 @@ pub(crate) fn proposed_destination_for_program(job: &NativeExtractionJob, progra
 
 /// CUE indexes have 1/75-second resolution. Round *only the CUE index* to
 /// the nearest frame; never insert/remove samples or change the native media.
+#[cfg(test)]
 fn cue_for_continuous(filename: &str, titles: &[String], samples: &[u64], rate: u32) -> Result<String,String> {
     if titles.len() != samples.len() || titles.len() > 99 || rate == 0 {
         return Err("CUE cannot encode these native sample offsets".into());
@@ -2670,7 +2671,13 @@ fn inspect_companion_target(job:&NativeExtractionJob,planned:&mut HashSet<String
     if job.overwrite_policy==NativeOverwritePolicy::Skip &&
         fs::symlink_metadata(&companion).is_ok() &&
         fs::symlink_metadata(audio).is_err() {
-        return Err(format!("Companion already exists: '{}'; choose Replace, disable its option, or change the destination",
+        let (kind, setting) = if companion.extension().is_some_and(|ext|
+            ext.eq_ignore_ascii_case("cue")) {
+            ("CUE sheet", "CUE output")
+        } else {
+            ("Chapters file", "chapters.txt output")
+        };
+        return Err(format!("{kind} already exists: '{}'; choose Replace, disable {setting}, or change the destination",
             companion.display()));
     }
     inspect_publication_target(job,planned,companion)

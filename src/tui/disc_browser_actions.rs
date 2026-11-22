@@ -3609,7 +3609,10 @@ mod tests {
             assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(state)
                 if state.form_wide.get()==wide));
             press(&mut app,KeyCode::Char('m'));
-            press(&mut app,KeyCode::Down);
+            for _ in 0..3 {press(&mut app,KeyCode::Down);}
+            assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(state)
+                if state.panel==Some(ExtractPanel::Options)
+                    && state.option_controls().get(state.panel_cursor)==Some(&ExtractOptionControl::CueFiles)));
             press(&mut app,KeyCode::Enter);
             assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(state)
                 if state.panel == Some(ExtractPanel::CueFiles)));
@@ -4231,13 +4234,16 @@ mod tests {
         assert!(state.extraction_log && state.save_extract_defaults);
         assert!(!config.extract_defaults.as_ref().unwrap().write_log,
             "editing the window must not persist the new preference");
+        let cue_row=state.option_controls().iter()
+            .position(|control|*control==ExtractOptionControl::CueFiles).unwrap();
+        state.panel_cursor=cue_row;
         activate_native_option(&mut state,ExtractOptionControl::CueFiles);
         assert_eq!(state.panel,Some(ExtractPanel::CueFiles));
         activate_native_option(&mut state,ExtractOptionControl::CreateCue);
         assert!(state.cue);
         activate_native_option(&mut state,ExtractOptionControl::Done);
         assert_eq!(state.panel,Some(ExtractPanel::Options));
-        assert_eq!(state.panel_cursor,3);
+        assert_eq!(state.panel_cursor,cue_row);
         activate_native_option(&mut state,ExtractOptionControl::Done);
         assert_eq!(state.panel,None);
     }

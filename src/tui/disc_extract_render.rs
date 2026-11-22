@@ -3624,7 +3624,8 @@ mod extract_r3_render_tests {
                     .collect::<Vec<_>>().concat()).collect::<Vec<_>>().join("\n")
             };
             let initial=render(&state);
-            assert!(initial.contains("chapters on"),"{width}x{height}: {initial}");
+            assert!(initial.contains("chapters.txt on") || initial.contains("chapters on"),
+                "{width}x{height}: {initial}");
             assert!(initial.contains("7/10 types") || initial.contains("7 of 10 types"),
                 "{width}x{height}: {initial}");
             assert!(initial.contains("create on") && initial.contains("pre on") &&
@@ -3633,7 +3634,8 @@ mod extract_r3_render_tests {
             state.extract_settings.write_chapters=false;
             state.extract_settings.copy_folder.artwork=false;
             let changed=render(&state);
-            assert!(changed.contains("pre off") && changed.contains("chapters off"),
+            assert!(changed.contains("pre off") &&
+                (changed.contains("chapters.txt off") || changed.contains("chapters off")),
                 "{width}x{height}: {changed}");
             assert!(changed.contains("6/10 types") || changed.contains("6 of 10 types"),
                 "{width}x{height}: {changed}");

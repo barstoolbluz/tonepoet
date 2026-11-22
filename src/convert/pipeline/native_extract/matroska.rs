@@ -1213,11 +1213,20 @@ mod tests {
         let mut copy_job = state.native_job(temp.path().join("scratch"));
         assert!(copy_job.file_per_program);
         assert_eq!(copy_job.programs.len(), 1);
+        let mut without_chapters=copy_job.clone();
+        without_chapters.options.write_chapters=false;
+        assert_eq!(native_program_media_paths(&without_chapters,&without_chapters.programs[0]).len(),1,
+            "an unticked Chapters option must not schedule a sidecar");
         let first_copy = execute_with_controls(copy_job.clone(), CancellationToken::new(),
             Arc::new(NativeExtractionControl::default()), |_| {}).await.unwrap();
-        assert_eq!(first_copy.published.len(), 1);
+        assert_eq!(first_copy.published.len(), 2);
         let copied = &first_copy.published[0];
         assert_eq!(copied.extension().and_then(|ext| ext.to_str()), Some("flac"));
+        let chapters_path = native_chapters_target(&copy_job, copied);
+        assert_eq!(first_copy.published[1], chapters_path);
+        let chapters_body = fs::read_to_string(&chapters_path).unwrap();
+        assert!(chapters_body.contains("CHAPTER01=00:00:00.000"), "{chapters_body}");
+        assert!(chapters_body.contains("CHAPTER02=00:00:00.500"), "{chapters_body}");
         let info = Command::new("ffprobe").args([
             "-v", "error", "-show_entries", "stream=codec_name,codec_type",
             "-of", "compact",
@@ -1707,9 +1716,12 @@ mod tests {
         assert!(!job.cue);
         let first = execute_with_controls(job,CancellationToken::new(),
             Arc::new(NativeExtractionControl::default()), |_|{}).await.unwrap();
-        assert_eq!(first.published.len(),1);
+        assert_eq!(first.published.len(),2);
         assert_eq!(first.published[0].extension().and_then(|v|v.to_str()),Some("ac3"));
         assert!(!first.published[0].with_extension("cue").exists());
+        let chapter_path=&first.published[1];
+        assert_eq!(chapter_path.file_name().and_then(|name|name.to_str()),Some("chapters.txt"));
+        assert!(fs::read_to_string(chapter_path).unwrap().contains("CHAPTER02="));
         let packet_hashes = |path: &Path| {
             let output = Command::new("ffprobe").args([
                 "-v","error","-select_streams","a:0","-show_packets",
@@ -1728,7 +1740,9 @@ mod tests {
         validate_job(&job).unwrap();
         let result = execute_with_controls(job,CancellationToken::new(),
             Arc::new(NativeExtractionControl::default()), |_|{}).await.unwrap();
-        assert_eq!(result.published.len(),2);
+        assert_eq!(result.published.len(),3);
+        assert!(result.published.iter().any(|p|p.file_name().is_some_and(|x|x=="chapters.txt")),
+            "the Chapters tick remains independent of the CUE tick");
         let cue = result.published.iter().find(|p|p.extension().is_some_and(|x|x=="cue")).unwrap();
         let text = fs::read_to_string(cue).unwrap();
         assert!(text.contains("FILE \"Audio stream 1.ac3\" WAVE"),"{text}");

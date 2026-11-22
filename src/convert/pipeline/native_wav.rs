@@ -506,15 +506,6 @@ pub(super) fn generated_wave_span(path: &Path) -> Result<(NativePcmFormat, u64, 
 
 /// Assemble a continuous native PCM presentation from fully completed private
 /// per-item containers. Returns exact source sample-frame counts for CUE.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(super) fn concatenate_generated_waves_checked(
-    inputs: &[std::path::PathBuf], output: &Path,
-    container: NativeWavContainer, cancel: &CancellationToken,
-    checkpoint: impl FnMut() -> Result<(), String>,
-) -> Result<(Vec<u64>, u32), String> {
-    concatenate_generated_waves_with_tap(inputs,output,container,cancel,checkpoint,None)
-}
-
 pub(super) fn concatenate_generated_waves_with_tap(
     inputs: &[std::path::PathBuf], output: &Path,
     container: NativeWavContainer, cancel: &CancellationToken,

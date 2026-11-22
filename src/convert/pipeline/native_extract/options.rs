@@ -314,7 +314,29 @@ mod tests {
             &NativeExtractionControl::default(),&mut published).unwrap();
         assert_eq!(fs::read(job.destination.join("Audio/cover.jpg")).unwrap(),b"existing user art");
         assert_eq!(fs::read(job.destination.join("Other/cover.jpg")).unwrap(),b"other artwork");
+        assert_eq!(fs::read(job.destination.join("Audio/extraction.log")).unwrap(),
+            b"do not overwrite extraction log",
+            "a checked .log beside a second image is a valid noncolliding companion");
+        assert!(!job.destination.join("extraction.log").exists(),
+            "companion copying must not create the extraction's own receipt");
+        // The same companion is excluded if the extraction actually owns its
+        // destination path, even when its .log type is selected.
+        let protected=job.destination.join("Audio/extraction.log");
+        fs::remove_file(&protected).unwrap();
+        job.program_log_paths=vec![protected.clone()];
+        published.clear();
+        copy_cue_folder_contents(&job,&private,&CancellationToken::new(),
+            &NativeExtractionControl::default(),&mut published).unwrap();
+        assert!(!protected.exists(), "planned extraction outputs belong to the extractor");
+        // An unticked type must never be copied, even without a collision.
+        job.program_log_paths.clear();
+        job.options.copy_folder.log=false;
+        job.destination=temp.path().join("no-logs");
+        published.clear();
+        copy_cue_folder_contents(&job,&private,&CancellationToken::new(),
+            &NativeExtractionControl::default(),&mut published).unwrap();
         assert!(!job.destination.join("Audio/extraction.log").exists());
+        assert!(!job.destination.join("Audio/rip.log").exists());
     }
 
     #[test]
