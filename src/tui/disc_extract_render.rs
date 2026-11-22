@@ -1921,26 +1921,26 @@ fn extract_option_display(s:&DiscBrowserState,control:ExtractOptionControl) -> (
         C::WriteLog => (format!("{} Write extraction.log",mark(s.extraction_log)),
             "in destination folder, beside the tracks".into()),
         C::Verify => (format!("{} Verify after extraction",mark(settings.verify_after)),
-            "read back each published file; compare with extraction checksum".into()),
-        C::Chapters => ("[ Chapters… ]".into(),format!("chapters.txt {} · for single-file output",
+            "reads each file back and checks its audio".into()),
+        C::Chapters => ("Chapters…".into(),format!("chapters.txt {} · for single-file output",
             if settings.write_chapters {"on"}else{"off"})),
-        C::CueFiles => ("[ CUE files… ]".into(),format!("create {} · embed {} · pre {} · {} · {}",
+        C::CueFiles => ("CUE files…".into(),format!("create {} · embed {} · pre {} · {} · {}",
             if s.cue {"on"}else{"off"},if settings.embed_cue {"on"}else{"off"},
             if settings.keep_preemphasis {"on"}else{"off"},
             match settings.between_gap {B::AppendPrevious=>"append",B::PrependNext=>"prepend",B::Drop=>"drop"},
             match settings.first_gap {F::PrependFirst=>"prepend",F::OwnTrack00=>"00",F::Drop=>"drop"})),
-        C::CopyFolder => ("[ Copy folder contents… ]".into(),format!("{} of 10 types · for CUE images",
+        C::CopyFolder => ("Copy folder contents…".into(),format!("{} of 10 types · for CUE images",
             settings.copy_folder.enabled_count())),
         C::SaveNext => (format!("{} Use these settings next time",mark(s.save_extract_defaults)),
-            "save every setting when Extract is pressed".into()),
+            "saved when you press Extract".into()),
         C::WriteChapters => (format!("{} Write chapters.txt",mark(settings.write_chapters)),
-            "beside output when its container cannot keep chapters".into()),
+            "beside the output file".into()),
         C::CreateCue => (format!("{} Create CUE file",mark(s.cue)),
-            "list starts for DFF, continuous WAV/DSF and raw streams".into()),
+            "lists where each track starts".into()),
         C::EmbedCue => (format!("{} Embed CUE in the file",mark(settings.embed_cue)),
-            "FLAC and WavPack when saved as one file".into()),
+            "stored inside the audio file itself".into()),
         C::KeepPreemphasis => (format!("{} Keep pre-emphasis flags",mark(settings.keep_preemphasis)),
-            "FLAGS PRE in CUE; PRE_EMPHASIS=1 in taggable tracks".into()),
+            "marks tracks mastered with pre-emphasis".into()),
         C::BetweenAppend => (format!("{} Between tracks: Append to previous",radio(settings.between_gap==B::AppendPrevious)),
             "gap audio belongs to the preceding track".into()),
         C::BetweenPrepend => (format!("{} Between tracks: Prepend to next",radio(settings.between_gap==B::PrependNext)),
@@ -1966,25 +1966,241 @@ fn extract_option_display(s:&DiscBrowserState,control:ExtractOptionControl) -> (
         C::CopyMd5 => (format!("{} .md5",mark(settings.copy_folder.md5)),"original checksums".into()),
         C::CopyOther => (format!("{} Everything else",mark(settings.copy_folder.other)),
             "other regular companion files and directories".into()),
-        C::Done => ("[ Done ]".into(),"return to the parent window".into()),
+        C::Done => ("Done".into(),"return to the parent window".into()),
     }
 }
 
-/// A modal window, with focus and mouse geometry derived from the same controls.
-fn draw_extract_options_sheet(frame:&mut ratatui::Frame, s:&DiscBrowserState,
-    panel:ExtractPanel, popup:Rect, buttons:&mut ButtonRenderMap, theme:Theme,
+/// Visual vocabulary for the mockup-based Options forms. The existing ordered
+/// control list remains the authority for keyboard focus and mouse actions.
+#[derive(Clone,Copy)]
+enum ExtractOptionVisual { Toggle, Button, Radio }
+
+fn option_draw_text(frame:&mut ratatui::Frame,rect:Rect,text:&str,theme:Theme,color:Color) {
+    if rect.width==0 || rect.height==0 {return;}
+    frame.render_widget(Paragraph::new(clip_end(text,rect.width))
+        .style(Style::default().bg(theme.dropdown_bg).fg(readable_word(color,theme.dropdown_bg))),rect);
+}
+
+/// Value and qualifier share the current wording but retain the mockup's
+/// distinct value and muted-label tiers on both dark and light themes.
+fn option_draw_summary(frame:&mut ratatui::Frame,rect:Rect,text:&str,theme:Theme) {
+    if rect.width==0 || rect.height==0 {return;}
+    let clipped=clip_end(text,rect.width);
+    let (value,qualifier)=match clipped.split_once(" · for ") {
+        Some((value,rest))=>(value.to_owned(),format!(" · for {rest}")),
+        None=>(clipped,String::new()),
+    };
+    let surface=theme.dropdown_bg;
+    let line=Line::from(vec![
+        Span::styled(value,Style::default().fg(readable_word(theme.value,surface))),
+        Span::styled(qualifier,Style::default().fg(readable_word(theme.label,surface))),
+    ]);
+    frame.render_widget(Paragraph::new(line).style(Style::default().bg(surface)),rect);
+}
+
+fn option_draw_control(frame:&mut ratatui::Frame,buttons:&mut ButtonRenderMap,
+    choices:&[ExtractOptionControl],active:usize,hover:Option<TuiButton>,theme:Theme,
+    control:ExtractOptionControl,rect:Rect,label:&str,visual:ExtractOptionVisual)
+{
+    if rect.width==0 || rect.height==0 {return;}
+    let Some(index)=choices.iter().position(|item|*item==control) else {return;};
+    let focused=index==active;
+    let hovered=hover==Some(TuiButton::DiscBrowserOptionControl(index));
+    let bg=if focused {theme.pill_active_bg}
+        else if hovered {theme.pill_neutral_hover_bg}
+        else if matches!(visual,ExtractOptionVisual::Button) {theme.pill_neutral_bg}
+        else {theme.dropdown_bg};
+    let fg=readable_word(if focused {theme.pill_active_fg}else{theme.value},bg);
+    fill(frame,rect,bg);
+    let clipped=clip_end(label,rect.width);
+    let mut chars=clipped.chars();
+    let first=chars.next();
+    let mark=matches!(first,Some('☒'|'☐'|'●'|'○'));
+    if mark && !matches!(visual,ExtractOptionVisual::Button) {
+        let glyph=first.unwrap_or(' ');
+        let mark_fg=if focused {fg}
+            else if glyph=='☒' {readable_word(theme.success,bg)}
+            else if glyph=='●' {readable_word(theme.info,bg)}
+            else {readable_word(theme.label,bg)};
+        let text=Line::from(vec![
+            Span::styled(glyph.to_string(),Style::default().fg(mark_fg)),
+            Span::styled(chars.collect::<String>(),Style::default().fg(fg)),
+        ]);
+        frame.render_widget(Paragraph::new(text).style(Style::default().bg(bg)),rect);
+    } else {
+        frame.render_widget(Paragraph::new(clipped).style(Style::default().bg(bg).fg(fg)),rect);
+    }
+    buttons.record_button(TuiButton::DiscBrowserOptionControl(index),rect);
+}
+
+fn option_section(frame:&mut ratatui::Frame,area:Rect,y:u16,text:&str,theme:Theme) {
+    option_draw_text(frame,Rect::new(area.x+2,y,area.width.saturating_sub(4),1),
+        text,theme,theme.header);
+}
+
+fn option_footer(frame:&mut ratatui::Frame,s:&DiscBrowserState,area:Rect,
+    buttons:&mut ButtonRenderMap,choices:&[ExtractOptionControl],active:usize,
+    hover:Option<TuiButton>,theme:Theme)
+{
+    let rule_y=area.bottom().saturating_sub(3);
+    for x in area.x+1..area.right().saturating_sub(1) {
+        let cell=frame.buffer_mut().get_mut(x,rule_y);
+        cell.set_symbol("─");
+        cell.set_fg(theme.border);
+    }
+    let y=area.bottom().saturating_sub(2);
+    let hint=Rect::new(area.x+2,y,area.width.saturating_sub(14).min(10),1);
+    option_draw_text(frame,hint,"? all keys",theme,theme.label);
+    if hint.width>0 {
+        option_draw_text(frame,Rect::new(hint.x,hint.y,1,1),"?",theme,theme.info);
+        if let Some(index)=super::disc_browser_actions::native_key_hints(s)
+            .iter().position(|label|*label=="? all keys") {
+            buttons.record_button(TuiButton::DiscBrowserHint(index),hint);
+        }
+    }
+    let rect=Rect::new(area.right().saturating_sub(9),y,6,1);
+    option_draw_control(frame,buttons,choices,active,hover,theme,
+        ExtractOptionControl::Done,rect," Done ",ExtractOptionVisual::Button);
+    if let Some(index)=choices.iter().position(|item|*item==ExtractOptionControl::Done) {
+        let selected=index==active;
+        let bg=if selected {theme.pill_active_bg}else{theme.chip_go};
+        fill(frame,rect,bg);
+        frame.render_widget(Paragraph::new(" Done ").style(Style::default()
+            .bg(bg).fg(readable_word(if selected {theme.pill_active_fg}else{theme.panel_bg},bg))),rect);
+    }
+}
+
+fn draw_extract_options_compact(frame:&mut ratatui::Frame,s:&DiscBrowserState,
+    panel:ExtractPanel,area:Rect,buttons:&mut ButtonRenderMap,
+    choices:&[ExtractOptionControl],active:usize,hover:Option<TuiButton>,theme:Theme)
+{
+    use ExtractOptionControl as C;
+    let x=area.x+2;
+    let inner=area.width.saturating_sub(4);
+    let y=area.y;
+    match panel {
+        ExtractPanel::Options => {
+            option_section(frame,area,y+2,"OUTPUT",theme);
+            for (control,offset) in [(C::WriteLog,3),(C::Verify,4),(C::Chapters,5),
+                (C::CueFiles,6),(C::CopyFolder,8),(C::SaveNext,10)] {
+                let row=y+offset;
+                let (label,note)=extract_option_display(s,control);
+                let style=if matches!(control,C::Chapters|C::CueFiles|C::CopyFolder) {
+                    ExtractOptionVisual::Button
+                } else {ExtractOptionVisual::Toggle};
+                let short_label=if matches!(style,ExtractOptionVisual::Button) {
+                    format!(" {label} ")
+                } else {label};
+                let cap=if matches!(style,ExtractOptionVisual::Button) {
+                    (short_label.chars().count() as u16).min(inner)
+                } else {inner.min(short_label.chars().count() as u16)};
+                let target=Rect::new(x,row,cap,1);
+                option_draw_control(frame,buttons,choices,active,hover,theme,
+                    control,target,&short_label,style);
+                if control==C::CueFiles {
+                    let note_rect=Rect::new(x+1,row+1,inner.saturating_sub(1),1);
+                    option_draw_text(frame,note_rect,&note,theme,theme.label);
+                    if let Some(index)=choices.iter().position(|item|*item==control) {
+                        buttons.record_button(TuiButton::DiscBrowserOptionControl(index),note_rect);
+                    }
+                } else if control==C::Chapters || control==C::CopyFolder {
+                    let description=if control==C::Chapters {
+                        format!("chapters {}",if s.extract_settings.write_chapters {"on"}else{"off"})
+                    } else {format!("{}/10 types",s.extract_settings.copy_folder.enabled_count())};
+                    let note_x=x+cap+1;
+                    option_draw_text(frame,Rect::new(note_x,row,inner.saturating_sub(cap+1),1),
+                        &description,theme,theme.label);
+                }
+            }
+            option_section(frame,area,y+9,"DEFAULTS",theme);
+        },
+        ExtractPanel::Chapters => {
+            option_draw_text(frame,Rect::new(x,y+1,inner,1),
+                "Used when chapters from an ISO or container can't be kept in the output.",theme,theme.label);
+            let (label,_)=extract_option_display(s,C::WriteChapters);
+            option_draw_control(frame,buttons,choices,active,hover,theme,C::WriteChapters,
+                Rect::new(x,y+3,inner.min(label.chars().count() as u16),1),
+                &label,ExtractOptionVisual::Toggle);
+            for (i,text) in ["beside the output file","marks where each chapter starts",
+                "mkvmerge and MP4Box read it."].iter().enumerate() {
+                option_draw_text(frame,Rect::new(x+2,y+4+i as u16,inner.saturating_sub(2),1),
+                    text,theme,theme.label);
+            }
+        },
+        ExtractPanel::CueFiles => {
+            option_draw_text(frame,Rect::new(x,y+1,inner,1),
+                "Creating a CUE file, and splitting a CUE image into tracks.",theme,theme.label);
+            option_section(frame,area,y+2,"NEW CUE FILE",theme);
+            for (control,row) in [(C::CreateCue,3),(C::EmbedCue,4),(C::KeepPreemphasis,5)] {
+                let (label,_)=extract_option_display(s,control);
+                option_draw_control(frame,buttons,choices,active,hover,theme,control,
+                    Rect::new(x,y+row,inner.min(label.chars().count() as u16),1),
+                    &label,ExtractOptionVisual::Toggle);
+            }
+            option_section(frame,area,y+6,"SPLITTING A CUE IMAGE",theme);
+            let tight=area.height<18;
+            if !tight {
+                option_draw_text(frame,Rect::new(x,y+7,inner,1),
+                    "Gaps are the audio between INDEX 00 and INDEX 01.",theme,theme.label);
+            }
+            for (control,row,label) in [
+                (C::BetweenAppend,8,"Append to previous"),(C::BetweenPrepend,9,"Prepend to next"),
+                (C::BetweenDrop,10,"Drop between tracks"),(C::FirstPrepend,11,"Prepend to track 1"),
+                (C::FirstOwn00,12,"Own track 00"),(C::FirstDrop,13,"Drop before track 1")
+            ] {
+                let (marked,_)=extract_option_display(s,control);
+                let glyph=marked.chars().next().unwrap_or('○');
+                let display=format!("{glyph} {label}");
+                let visible_row=row-u16::from(tight);
+                option_draw_control(frame,buttons,choices,active,hover,theme,control,
+                    Rect::new(x,y+visible_row,inner.min(display.chars().count() as u16),1),
+                    &display,ExtractOptionVisual::Radio);
+            }
+        },
+        ExtractPanel::CopyFolder => {
+            option_draw_text(frame,Rect::new(x,y+1,inner,1),
+                "Copied from a CUE image's folder into the destination folder.",theme,theme.label);
+            let cols=2u16;
+            let col_width=inner/cols;
+            let copy_controls=&choices[..choices.len().saturating_sub(1)];
+            for (i,control) in copy_controls.iter().enumerate() {
+                let row=(i/cols as usize) as u16;
+                let col=(i%cols as usize) as u16;
+                let (label,_)=extract_option_display(s,*control);
+                let rect=Rect::new(x+col*col_width,y+3+row,
+                    (label.chars().count() as u16).min(if col==cols-1 {inner-col*col_width}else{col_width}),1);
+                option_draw_control(frame,buttons,choices,active,hover,theme,*control,
+                    rect,&label,ExtractOptionVisual::Toggle);
+            }
+            for (i,text) in ["Artwork: image files beside the CUE image.",
+                "Art folders: Artwork, Art, Scans, Covers and Booklet, in any case.",
+                ".cue and .md5 describe the source image, not the new tracks."].iter().enumerate() {
+                let row=y+9+i as u16;
+                if row<area.bottom().saturating_sub(3) {
+                    option_draw_text(frame,Rect::new(x,row,inner,1),text,theme,theme.label);
+                }
+            }
+        },
+        _=>{},
+    }
+}
+
+fn draw_extract_options_sheet(frame:&mut ratatui::Frame,s:&DiscBrowserState,
+    panel:ExtractPanel,popup:Rect,buttons:&mut ButtonRenderMap,theme:Theme,
     hover:Option<TuiButton>)
 {
-    let width=popup.width.saturating_sub(2).min(90);
+    use ExtractOptionControl as C;
+    use crate::convert::pipeline::native_extract::{NativeCueBetweenGap as B,NativeCueFirstGap as F};
+    let width=popup.width.saturating_sub(2).min(108);
     let max_height=match panel {
-        ExtractPanel::Options=>19,ExtractPanel::Chapters=>12,
-        ExtractPanel::CueFiles=>24,ExtractPanel::CopyFolder=>22,_=>12,
+        ExtractPanel::Options=>19,ExtractPanel::Chapters=>10,
+        ExtractPanel::CueFiles=>25,ExtractPanel::CopyFolder=>14,_=>12,
     };
     let height=popup.height.saturating_sub(2).min(max_height);
     if width<22 || height<7 {return;}
     let area=Rect::new(popup.x+(popup.width-width)/2,popup.y+(popup.height-height)/2,width,height);
-    for y in popup.y..popup.y.saturating_add(popup.height) {
-        for x in popup.x..popup.x.saturating_add(popup.width) {
+    for y in popup.y..popup.bottom() {
+        for x in popup.x..popup.right() {
             let cell=frame.buffer_mut().get_mut(x,y);
             cell.set_fg(blend_color(cell.fg,cell.bg,3,4));
         }
@@ -1992,117 +2208,174 @@ fn draw_extract_options_sheet(frame:&mut ratatui::Frame, s:&DiscBrowserState,
     buttons.record_button(TuiButton::DiscBrowserOptionOutside,frame.size());
     buttons.record_button(TuiButton::DiscBrowserOptionPassive,area);
     frame.render_widget(Clear,area);
-    fill(frame,area,theme.surface);
-    frame.render_widget(Block::default().borders(Borders::ALL)
-        .style(Style::default().bg(theme.surface).fg(theme.value))
-        .border_style(Style::default().fg(theme.border)),area);
-    let (title,intro)=match panel {
-        ExtractPanel::Options=>(" ▸ Options ","OUTPUT · Settings only apply where supported"),
-        ExtractPanel::Chapters=>(" ▸ Chapters ","When chapters cannot be kept in the audio file"),
-        ExtractPanel::CueFiles=>(" ▸ CUE files ","Creating CUEs, and splitting CUE images into tracks"),
-        ExtractPanel::CopyFolder=>(" ▸ Copy folder contents ","Copy from the CUE image's folder"),
+    fill(frame,area,theme.dropdown_bg);
+    // The mockup's solid title band replaces the top border; the frame
+    // surrounds only the body, and the footer has its own separator.
+    let body=Rect::new(area.x,area.y+1,area.width,area.height.saturating_sub(1));
+    frame.render_widget(Block::default().borders(Borders::LEFT|Borders::RIGHT|Borders::BOTTOM)
+        .style(Style::default().bg(theme.dropdown_bg))
+        .border_style(Style::default().fg(theme.title)),body);
+    let title=match panel {
+        ExtractPanel::Options=>"▸ Options",
+        ExtractPanel::Chapters=>"▸ Chapters",
+        ExtractPanel::CueFiles=>"▸ CUE files",
+        ExtractPanel::CopyFolder=>"▸ Copy folder contents",
         _=>unreachable!(),
     };
-    let title_rect=Rect::new(area.x+1,area.y+1,area.width.saturating_sub(2),1);
+    let title_rect=Rect::new(area.x+1,area.y,area.width.saturating_sub(2),1);
     fill(frame,title_rect,theme.title);
-    frame.render_widget(Paragraph::new(title).style(Style::default()
-        .bg(theme.title).fg(readable_word(theme.panel_bg,theme.title))
-        .add_modifier(Modifier::BOLD)),title_rect);
-    let intro_rect=Rect::new(area.x+2,area.y+2,area.width.saturating_sub(4),1);
-    frame.render_widget(Paragraph::new(clip_end(intro,intro_rect.width))
-        .style(Style::default().bg(theme.surface).fg(theme.info)),intro_rect);
+    frame.render_widget(Paragraph::new(format!(" {title}")).style(Style::default()
+        .bg(theme.title).fg(readable_word(theme.panel_bg,theme.title))),title_rect);
     let choices=s.option_controls();
-    let body_y=area.y+4;
-    let body_height=area.height.saturating_sub(7) as usize;
     let active=s.panel_cursor.min(choices.len().saturating_sub(1));
-    if panel==ExtractPanel::Options {
-        // Every popup has a live visible summary. At 64 columns only the CUE
-        // summary needs a separate row; all seven controls remain mouse-ready.
-        let inner=area.width.saturating_sub(4);
-        let cue_index=choices.iter().position(|control|*control==ExtractOptionControl::CueFiles);
-        let cue_extra=cue_index.is_some_and(|index| {
-            let (label,description)=extract_option_display(s,choices[index]);
-            (label.chars().count()+2+description.chars().count())>inner as usize
-        });
-        let total_rows=choices.len()+usize::from(cue_extra);
-        let active_end=active+1+usize::from(cue_extra && cue_index.is_some_and(|index|active>=index));
-        let scroll=active_end.saturating_sub(body_height)
-            .min(total_rows.saturating_sub(body_height));
-        for (index,control) in choices.iter().enumerate() {
-            let row_index=index+usize::from(cue_extra && cue_index.is_some_and(|cue|index>cue));
-            if row_index<scroll || row_index-scroll>=body_height {continue;}
-            let y=body_y+(row_index-scroll) as u16;
-            let selected=index==active;
-            let active_bg=if selected {theme.pill_active_bg}else{theme.surface};
-            let bg=if hover==Some(TuiButton::DiscBrowserOptionControl(index)) {
-                theme.pill_neutral_hover_bg
-            } else {active_bg};
-            let fg=readable_word(if selected {theme.pill_active_fg}else{theme.value},bg);
-            let (label,description)=extract_option_display(s,*control);
-            let note=match control {
-                ExtractOptionControl::Chapters if label.chars().count()+2+description.chars().count()>inner as usize =>
-                    format!("chapters {}",if s.extract_settings.write_chapters {"on"}else{"off"}),
-                ExtractOptionControl::CopyFolder if label.chars().count()+2+description.chars().count()>inner as usize =>
-                    format!("{}/10 types",s.extract_settings.copy_folder.enabled_count()),
-                ExtractOptionControl::CueFiles if cue_extra => String::new(),
-                ExtractOptionControl::Chapters|ExtractOptionControl::CueFiles|ExtractOptionControl::CopyFolder => description.clone(),
-                _=>String::new(),
-            };
-            let line=if note.is_empty() {label} else {format!("{label}  {note}")};
-            let rect=Rect::new(area.x+2,y,inner,1);
-            frame.render_widget(Paragraph::new(clip_end(&line,rect.width))
-                .style(Style::default().bg(bg).fg(fg)
-                    .add_modifier(if selected {Modifier::BOLD}else{Modifier::empty()})),rect);
-            buttons.record_button(TuiButton::DiscBrowserOptionControl(index),rect);
-            if *control==ExtractOptionControl::CueFiles && cue_extra && row_index+1>=scroll &&
-                row_index+1-scroll<body_height {
-                let note_rect=Rect::new(area.x+3,y+1,inner.saturating_sub(1),1);
-                frame.render_widget(Paragraph::new(clip_end(&description,note_rect.width))
-                    .style(Style::default().bg(theme.surface).fg(theme.text_dim)),note_rect);
-                buttons.record_button(TuiButton::DiscBrowserOptionControl(index),note_rect);
-            }
-        }
+    let full=match panel {
+        ExtractPanel::Options=>area.width>=88 && area.height>=19,
+        ExtractPanel::Chapters=>area.width>=80 && area.height>=10,
+        ExtractPanel::CueFiles=>area.width>=100 && area.height>=25,
+        ExtractPanel::CopyFolder=>area.width>=94 && area.height>=14,
+        _=>false,
+    };
+    if !full {
+        draw_extract_options_compact(frame,s,panel,area,buttons,&choices,active,hover,theme);
     } else {
-    // On a 24-row terminal a compact single-row presentation keeps every
-    // control mouse-reachable. Tall terminals show explanatory subtitles.
-    let compact_columns=choices.len()>body_height && area.width>=54;
-    let stride=if compact_columns {1} else if choices.len().saturating_mul(2)<=body_height {2} else {1};
-    let row_count=if compact_columns {(choices.len()+1)/2}else{choices.len()};
-    let active_row=if compact_columns {active/2} else {active};
-    let scroll=active_row.saturating_mul(stride).saturating_sub(body_height.saturating_sub(stride))
-        .min(row_count.saturating_mul(stride).saturating_sub(body_height));
-    for (index,control) in choices.iter().enumerate() {
-        let row_index=if compact_columns {index/2} else {index};
-        let offset=row_index.saturating_mul(stride);
-        if offset<scroll || offset-scroll>=body_height {continue;}
-        let y=body_y+(offset-scroll) as u16;
-        let selected=index==active;
-        let active_bg=if selected {theme.pill_active_bg}else{theme.surface};
-        let fg=readable_word(if selected {theme.pill_active_fg}else{theme.value},active_bg);
-        let (label,description)=extract_option_display(s,*control);
-        let row=if compact_columns {
-            let inner=area.width.saturating_sub(4);
-            let half=inner/2;
-            Rect::new(area.x+2+(index%2) as u16*half,y,
-                if index%2==0 {half} else {inner-half},1)
-        } else {Rect::new(area.x+2,y,area.width.saturating_sub(4),1)};
-        let bg=if hover==Some(TuiButton::DiscBrowserOptionControl(index)) {theme.pill_neutral_hover_bg}
-            else {active_bg};
-        frame.render_widget(Paragraph::new(clip_end(&label,row.width))
-            .style(Style::default().bg(bg).fg(readable_word(fg,bg))
-                .add_modifier(if selected {Modifier::BOLD}else{Modifier::empty()})),row);
-        buttons.record_button(TuiButton::DiscBrowserOptionControl(index),row);
-        if stride==2 && (offset-scroll)+1<body_height {
-            let note=Rect::new(row.x+2,y+1,row.width.saturating_sub(2),1);
-            frame.render_widget(Paragraph::new(clip_end(&description,note.width))
-                .style(Style::default().bg(theme.surface).fg(theme.text_dim)),note);
-            buttons.record_button(TuiButton::DiscBrowserOptionControl(index),note);
+        let x=area.x+2;
+        let y=area.y;
+        let inner=area.width.saturating_sub(4);
+        let column=x+34;
+        let note_width=area.right().saturating_sub(column+2);
+        match panel {
+            ExtractPanel::Options => {
+                option_section(frame,area,y+2,"OUTPUT",theme);
+                for (control,row) in [(C::WriteLog,3),(C::Verify,4)] {
+                    let (label,_)=extract_option_display(s,control);
+                    option_draw_control(frame,buttons,&choices,active,hover,theme,control,
+                        Rect::new(x,y+row,label.chars().count() as u16,1),
+                        &label,ExtractOptionVisual::Toggle);
+                }
+                option_draw_text(frame,Rect::new(column,y+3,note_width,1),
+                    "in destination folder, beside the tracks",theme,theme.label);
+                option_draw_text(frame,Rect::new(column,y+4,note_width,1),
+                    "reads each file back and checks its audio",theme,theme.label);
+                option_draw_text(frame,Rect::new(column,y+5,note_width,1),
+                    "against a checksum taken while extracting",theme,theme.label);
+                for (control,row) in [(C::Chapters,7),(C::CueFiles,9),(C::CopyFolder,11)] {
+                    let (label,note)=extract_option_display(s,control);
+                    let button_width=29u16;
+                    let rect=Rect::new(x,y+row,button_width,1);
+                    option_draw_control(frame,buttons,&choices,active,hover,theme,
+                        control,rect,&format!(" {label}"),ExtractOptionVisual::Button);
+                    let description=if control==C::CueFiles {
+                        format!("{note} · for new CUEs and images")
+                    } else {note};
+                    let available=note_width as usize;
+                    if description.chars().count()>available && control==C::CueFiles {
+                        let prefix=description.split(" · for new CUEs and images").next().unwrap_or("");
+                        option_draw_summary(frame,Rect::new(column,y+row,note_width,1),prefix,theme);
+                        option_draw_text(frame,Rect::new(column,y+row+1,note_width,1),
+                            "for new CUEs and images",theme,theme.label);
+                    } else {
+                        option_draw_summary(frame,Rect::new(column,y+row,note_width,1),
+                            &description,theme);
+                    }
+                }
+                option_section(frame,area,y+13,"DEFAULTS",theme);
+                let (label,_)=extract_option_display(s,C::SaveNext);
+                option_draw_control(frame,buttons,&choices,active,hover,theme,C::SaveNext,
+                    Rect::new(x,y+14,label.chars().count() as u16,1),&label,ExtractOptionVisual::Toggle);
+                option_draw_text(frame,Rect::new(column,y+14,note_width,1),
+                    "saved when you press Extract",theme,theme.label);
+            },
+            ExtractPanel::Chapters => {
+                option_draw_text(frame,Rect::new(x,y+1,inner,1),
+                    "Used when chapters from an ISO or container can't be kept in the output.",theme,theme.value);
+                let (label,_)=extract_option_display(s,C::WriteChapters);
+                option_draw_control(frame,buttons,&choices,active,hover,theme,C::WriteChapters,
+                    Rect::new(x,y+3,label.chars().count() as u16,1),&label,ExtractOptionVisual::Toggle);
+                for (offset,text) in [(3,"beside the output file"),(4,"marks where each chapter starts"),
+                    (5,"mkvmerge and MP4Box read it.")] {
+                    option_draw_text(frame,Rect::new(column,y+offset,note_width,1),text,theme,theme.label);
+                }
+            },
+            ExtractPanel::CueFiles => {
+                option_draw_text(frame,Rect::new(x,y+1,inner,1),
+                    "Creating a CUE file, and splitting a CUE image into tracks.",theme,theme.value);
+                option_section(frame,area,y+3,"NEW CUE FILE",theme);
+                for (control,row) in [(C::CreateCue,4),(C::EmbedCue,8),(C::KeepPreemphasis,11)] {
+                    let (label,_)=extract_option_display(s,control);
+                    option_draw_control(frame,buttons,&choices,active,hover,theme,control,
+                        Rect::new(x,y+row,label.chars().count() as u16,1),&label,ExtractOptionVisual::Toggle);
+                }
+                option_draw_text(frame,Rect::new(column,y+4,note_width,1),
+                    "lists where each track starts",theme,theme.label);
+                for (row,text) in [(5,"For SACD ISOs and DFF files, and for any area or stream saved as one"),
+                    (6,"file that cannot hold its own track list."),
+                    (9,"For FLAC and WavPack saved as one file.")] {
+                    option_draw_text(frame,Rect::new(x,y+row,inner,1),text,theme,theme.label);
+                }
+                option_draw_text(frame,Rect::new(column,y+8,note_width,1),
+                    "stored inside the audio file itself",theme,theme.label);
+                option_draw_text(frame,Rect::new(column,y+11,note_width,1),
+                    "marks tracks mastered with pre-emphasis",theme,theme.label);
+                option_draw_text(frame,Rect::new(column,y+12,note_width,1),
+                    "from the source CUE or the rip log",theme,theme.label);
+                option_section(frame,area,y+14,"SPLITTING A CUE IMAGE",theme);
+                option_draw_text(frame,Rect::new(x,y+15,inner,1),
+                    "Gaps are the audio between a track's INDEX 00 and INDEX 01.",theme,theme.label);
+                for (row,title,options,summary) in [
+                    (17,"Between tracks",[
+                        (C::BetweenAppend,"Append to previous"),(C::BetweenPrepend,"Prepend to next"),(C::BetweenDrop,"Drop")],
+                        match s.extract_settings.between_gap {
+                            B::AppendPrevious=>"Albums play gaplessly.",
+                            B::PrependNext=>"The gap starts the next track.",
+                            B::Drop=>"The gap audio is omitted.",
+                        }),
+                    (20,"Before track 1",[
+                        (C::FirstPrepend,"Prepend to track 1"),(C::FirstOwn00,"Own track 00"),(C::FirstDrop,"Drop")],
+                        match s.extract_settings.first_gap {
+                            F::PrependFirst=>"A hidden track becomes part of track 1.",
+                            F::OwnTrack00=>"A hidden track before track 1 becomes track 00.",
+                            F::Drop=>"The hidden-track audio is omitted.",
+                        }),
+                ] {
+                    option_draw_text(frame,Rect::new(x,y+row,17,1),title,theme,theme.label);
+                    let mut radio_x=x+18;
+                    for (control,label) in options {
+                        let (marked,_)=extract_option_display(s,control);
+                        let glyph=marked.chars().next().unwrap_or('○');
+                        let display=format!("{glyph} {label}");
+                        let width=display.chars().count() as u16;
+                        option_draw_control(frame,buttons,&choices,active,hover,theme,control,
+                            Rect::new(radio_x,y+row,width,1),&display,ExtractOptionVisual::Radio);
+                        radio_x=radio_x.saturating_add(width+2);
+                    }
+                    option_draw_text(frame,Rect::new(x+18,y+row+1,inner.saturating_sub(18),1),
+                        summary,theme,theme.label);
+                }
+            },
+            ExtractPanel::CopyFolder => {
+                option_draw_text(frame,Rect::new(x,y+1,inner,1),
+                    "Copied from a CUE image's folder into the destination folder.",theme,theme.value);
+                let col_width=inner/4;
+                for (i,control) in choices.iter().take(10).enumerate() {
+                    let col=(i%4) as u16;
+                    let row=(i/4) as u16;
+                    let (label,_)=extract_option_display(s,*control);
+                    option_draw_control(frame,buttons,&choices,active,hover,theme,*control,
+                        Rect::new(x+col*col_width,y+3+row,
+                            (label.chars().count() as u16).min(if col==3 {inner-col*col_width}else{col_width}),1),
+                        &label,ExtractOptionVisual::Toggle);
+                }
+                for (i,text) in ["Artwork: image files beside the CUE image.",
+                    "Art folders: Artwork, Art, Scans, Covers and Booklet, in any case.",
+                    ".cue and .md5 describe the source image, not the new tracks."].iter().enumerate() {
+                    option_draw_text(frame,Rect::new(x,y+7+i as u16,inner,1),
+                        text,theme,theme.label);
+                }
+            },
+            _=>unreachable!(),
         }
     }
-    }
-    let hint=Rect::new(area.x+2,area.y+area.height-2,area.width.saturating_sub(4),1);
-    frame.render_widget(Paragraph::new(clip_end("↑↓ / Tab focus · Space/Enter select · [ ] radio · Esc back",hint.width))
-        .style(Style::default().bg(theme.surface).fg(theme.info)),hint);
+    option_footer(frame,s,area,buttons,&choices,active,hover,theme);
 }
 
 fn draw_panel(frame:&mut ratatui::Frame,s:&DiscBrowserState,panel:ExtractPanel,popup:Rect,
@@ -2147,9 +2420,24 @@ fn draw_panel(frame:&mut ratatui::Frame,s:&DiscBrowserState,panel:ExtractPanel,p
             "Esc  Return to extraction".into()],
         ExtractPanel::Keys=>super::disc_browser_actions::native_key_help(s),
     };
-    if lines.is_empty(){frame.render_widget(Paragraph::new("None"),inner);}else{
-        let rendered=lines.into_iter().skip(s.panel_cursor).take(inner.height as usize).map(|l|Line::from(clip(&l,inner.width))).collect::<Vec<_>>();
-        frame.render_widget(Paragraph::new(rendered),inner);
+    // The Keys sheet is ordinarily read-only. Only help opened from an
+    // Options popup gains a mouse-accessible return action, preserving the
+    // existing global Extract-key help behavior.
+    let return_to_options=panel==ExtractPanel::Keys && s.option_help_return.is_some();
+    let content=if return_to_options {
+        Rect::new(inner.x,inner.y,inner.width,inner.height.saturating_sub(2))
+    } else {inner};
+    if lines.is_empty(){frame.render_widget(Paragraph::new("None"),content);}else{
+        let rendered=lines.into_iter().skip(s.panel_cursor).take(content.height as usize)
+            .map(|l|Line::from(clip(&l,content.width))).collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(rendered),content);
+    }
+    if return_to_options && inner.height>0 && inner.width>=6 {
+        let done=Rect::new(inner.right()-6,inner.bottom()-1,6,1);
+        fill(frame,done,theme.chip_go);
+        frame.render_widget(Paragraph::new(" Done ").style(Style::default()
+            .bg(theme.chip_go).fg(readable_word(theme.panel_bg,theme.chip_go))),done);
+        buttons.record_button(TuiButton::DiscBrowserOptionOutside,done);
     }
 }
 
@@ -3655,4 +3943,230 @@ mod extract_r3_render_tests {
         assert_eq!(extract_option_display(&state,ExtractOptionControl::CueFiles).1,original);
     }
 
+
+    /// Locate exact visible cells, not byte indices in a UTF-8 screen dump.
+    fn r4f_text_position(buffer:&ratatui::buffer::Buffer,width:u16,height:u16,
+        text:&str) -> (u16,u16) {
+        for y in 0..height {
+            let row=(0..width).map(|x|buffer.get(x,y).symbol().to_owned())
+                .collect::<Vec<_>>().concat();
+            if let Some(byte)=row.find(text) {
+                return (row[..byte].chars().count() as u16,y);
+            }
+        }
+        panic!("no visible text {text:?}");
+    }
+
+    #[test]
+    fn r4_options_mockup_has_sections_descriptions_buttons_and_separate_footer() {
+        let theme=crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        let mut state=sacd_state(false,false);
+        state.panel=Some(ExtractPanel::Options);
+        let mut terminal=Terminal::new(TestBackend::new(154,40)).unwrap();
+        let mut buttons=ButtonRenderMap::new();
+        terminal.draw(|frame|draw(frame,&state,Path::new("/tmp"),&mut buttons,theme)).unwrap();
+        let lines=(0..40).map(|y|(0..154).map(|x|
+            terminal.backend().buffer().get(x,y).symbol().to_owned())
+            .collect::<Vec<_>>().concat()).collect::<Vec<_>>();
+        let row=|needle:&str|lines.iter().position(|line|line.contains(needle))
+            .unwrap_or_else(||panic!("missing {needle:?}: {lines:#?}"));
+        assert!(row("▸ Options")<row("OUTPUT"));
+        assert!(row("OUTPUT")<row("Write extraction.log"));
+        assert_eq!(row("Verify after extraction"),row("reads each file back and checks its audio"));
+        assert_eq!(row("Write extraction.log"),row("in destination folder, beside the tracks"));
+        assert_eq!(row("Chapters…"),row("chapters.txt on"));
+        assert_eq!(row("CUE files…"),row("create on"));
+        assert!(lines.iter().any(|line|line.contains("embed off") && line.contains("pre on")));
+        assert!(lines.iter().any(|line|line.contains("7 of 10 types")));
+        assert!(row("Copy folder contents…")<row("DEFAULTS"));
+        assert!(row("DEFAULTS")<row("Use these settings next time"));
+        assert_eq!(row("Use these settings next time"),row("saved when you press Extract"));
+        assert!(row("? all keys")<40 && row("Done")<40);
+        assert!(!lines.iter().any(|line|line.contains("↑↓ / Tab focus")));
+        let chapter=buttons.button_rect(TuiButton::DiscBrowserOptionControl(2)).unwrap();
+        assert_eq!(terminal.backend().buffer().get(chapter.x,chapter.y).bg,theme.pill_neutral_bg);
+        let done=buttons.button_rect(TuiButton::DiscBrowserOptionControl(6)).unwrap();
+        assert_eq!(terminal.backend().buffer().get(done.x,done.y).bg,theme.chip_go);
+        assert_eq!(buttons.find_button_at(done.x,done.y),Some(TuiButton::DiscBrowserOptionControl(6)));
+        let log=buttons.button_rect(TuiButton::DiscBrowserOptionControl(0)).unwrap();
+        assert_eq!(terminal.backend().buffer().get(log.x,log.y).bg,theme.pill_active_bg);
+        assert_eq!(terminal.backend().buffer().get(log.right()+3,log.y).bg,theme.dropdown_bg,
+            "form focus must not highlight the whole row");
+        let buffer=terminal.backend().buffer();
+        let value_x=r4f_text_position(buffer,154,40,"in destination folder, beside the tracks").0;
+        for description in ["reads each file back and checks its audio",
+            "against a checksum taken while extracting", "chapters.txt on",
+            "create on", "7 of 10 types", "saved when you press Extract"] {
+            assert_eq!(r4f_text_position(buffer,154,40,description).0,value_x,
+                "description column drifted: {description}");
+        }
+        let modal=buttons.button_rect(TuiButton::DiscBrowserOptionPassive).unwrap();
+        // Blank rows between OUTPUT, the three popup controls, and DEFAULTS.
+        for y in [row("against a checksum taken while extracting")+1,
+            row("Chapters…")+1,row("CUE files…")+1,row("Copy folder contents…")+1] {
+            assert!((modal.x+2..modal.right()-2).all(|x|
+                buffer.get(x,y as u16).symbol()==" "),"group spacer missing at y={y}");
+        }
+        assert_eq!(done.right(),modal.right()-3,"Done must hug the footer's right edge");
+        assert_eq!(done.y,modal.bottom()-2,"Done must sit on the footer row");
+        let help=crate::tui::disc_browser_actions::native_key_hints(&state)
+            .iter().position(|hint|*hint=="? all keys").unwrap();
+        let hint=buttons.button_rect(TuiButton::DiscBrowserHint(help)).unwrap();
+        assert_eq!(hint.y,done.y);
+        assert_eq!(buttons.find_button_at(hint.x+2,hint.y),
+            Some(TuiButton::DiscBrowserHint(help)));
+    }
+
+    #[test]
+    fn r4_chapters_cue_and_copy_popups_draw_mockup_rows_and_controls() {
+        let theme=crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        let mut state=sacd_state(false,false);
+        for panel in [ExtractPanel::Chapters,ExtractPanel::CueFiles,ExtractPanel::CopyFolder] {
+            state.panel=Some(panel);
+            state.panel_cursor=0;
+            let mut terminal=Terminal::new(TestBackend::new(154,40)).unwrap();
+            let mut buttons=ButtonRenderMap::new();
+            terminal.draw(|frame|draw(frame,&state,Path::new("/tmp"),&mut buttons,theme)).unwrap();
+            let lines=(0..40).map(|y|(0..154).map(|x|
+                terminal.backend().buffer().get(x,y).symbol().to_owned())
+                .collect::<Vec<_>>().concat()).collect::<Vec<_>>();
+            let row=|needle:&str|lines.iter().position(|line|line.contains(needle))
+                .unwrap_or_else(||panic!("{panel:?} missing {needle:?}: {lines:#?}"));
+            match panel {
+                ExtractPanel::Chapters => {
+                    assert!(row("▸ Chapters")<row("Write chapters.txt"));
+                    assert!(lines.iter().any(|line|line.contains("Used when chapters from an ISO or container can't be kept in the output.")));
+                    assert_eq!(row("Write chapters.txt"),row("beside the output file"));
+                    assert!(row("marks where each chapter starts")<row("mkvmerge and MP4Box read it."));
+                },
+                ExtractPanel::CueFiles => {
+                    assert!(row("NEW CUE FILE")<row("Create CUE file"));
+                    assert!(row("Create CUE file")<row("Embed CUE in the file"));
+                    assert!(row("Embed CUE in the file")<row("Keep pre-emphasis flags"));
+                    assert!(row("Keep pre-emphasis flags")<row("SPLITTING A CUE IMAGE"));
+                    assert!(lines.iter().any(|line|line.contains("For SACD ISOs and DFF files")));
+                    assert!(lines.iter().any(|line|line.contains("For FLAC and WavPack saved as one file.")));
+                    assert!(lines.iter().any(|line|line.contains("Gaps are the audio between a track's INDEX 00 and INDEX 01.")));
+                    let between=row("Between tracks");
+                    assert!(lines[between].contains("Append to previous") &&
+                        lines[between].contains("Prepend to next") && lines[between].contains("Drop"));
+                    assert!(lines[between+1].contains("Albums play gaplessly."));
+                    let first=row("Before track 1");
+                    assert!(lines[first].contains("Prepend to track 1") &&
+                        lines[first].contains("Own track 00") && lines[first].contains("Drop"));
+                    assert!(lines[first+1].contains("A hidden track before track 1 becomes track 00."));
+                    let group=|first:usize| (first..first+3).map(|i|
+                        buttons.button_rect(TuiButton::DiscBrowserOptionControl(i)).unwrap())
+                        .collect::<Vec<_>>();
+                    let between=group(3);
+                    let initial=group(6);
+                    for radios in [&between,&initial] {
+                        assert!(radios.iter().all(|r|r.y==radios[0].y));
+                        assert!(radios.windows(2).all(|pair|
+                            pair[0].right()<pair[1].x),"radios must be side by side with gaps");
+                    }
+                    assert_eq!(between[0].x,initial[0].x,
+                        "radio groups must share a choice column");
+                },
+                ExtractPanel::CopyFolder => {
+                    assert!(row("▸ Copy folder contents")<row("☒ Artwork"));
+                    let first=row("☒ Artwork");
+                    assert!(lines[first].contains("☒ Art folders") &&
+                        lines[first].contains("☒ .log") && lines[first].contains("☐ .cue"));
+                    let second=row("☒ .txt");
+                    assert_eq!(second,first+1);
+                    assert!(lines[second].contains("☒ .nfo") && lines[second].contains("☒ .md") &&
+                        lines[second].contains("☒ .pdf"));
+                    assert!(lines[second+1].contains("☐ .md5") &&
+                        lines[second+1].contains("☐ Everything else"));
+                    assert!(row("Artwork: image files beside the CUE image.")>second+1);
+                    assert!(lines.iter().any(|line|line.contains("Art folders: Artwork, Art, Scans, Covers and Booklet, in any case.")));
+                    assert!(lines.iter().any(|line|line.contains(".cue and .md5 describe the source image, not the new tracks.")));
+                    let grid=(0..10).map(|index|
+                        buttons.button_rect(TuiButton::DiscBrowserOptionControl(index)).unwrap())
+                        .collect::<Vec<_>>();
+                    assert!(grid[..4].windows(2).all(|r|r[0].x<r[1].x));
+                    let spacing=grid[1].x-grid[0].x;
+                    assert!(spacing>0);
+                    assert_eq!(grid[2].x-grid[1].x,spacing);
+                    assert_eq!(grid[3].x-grid[2].x,spacing);
+                    assert!(grid[..4].iter().all(|r|r.y==grid[0].y));
+                    for i in 0..4 {
+                        assert_eq!(grid[i+4].x,grid[i].x,"second grid row lost its columns");
+                        assert_eq!(grid[i+4].y,grid[i].y+1);
+                    }
+                    for i in 0..2 {
+                        assert_eq!(grid[i+8].x,grid[i].x,"third grid row lost its columns");
+                        assert_eq!(grid[i+8].y,grid[i].y+2);
+                    }
+                },
+                _=>unreachable!(),
+            }
+            let done_index=state.option_controls().len()-1;
+            let done=buttons.button_rect(TuiButton::DiscBrowserOptionControl(done_index)).unwrap();
+            assert_eq!(terminal.backend().buffer().get(done.x,done.y).bg,theme.chip_go);
+            assert!(lines[done.y as usize].contains("? all keys"));
+            for index in 0..state.option_controls().len() {
+                let target=TuiButton::DiscBrowserOptionControl(index);
+                let rect=buttons.button_rect(target).expect("all options have mouse targets");
+                assert_eq!(buttons.find_button_at(rect.x,rect.y),Some(target));
+            }
+        }
+    }
+
+    #[test]
+    fn r4_mockup_controls_remain_reachable_in_compact_terminals() {
+        let theme=crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        for (width,height) in [(64,20),(72,24)] {
+            let mut state=sacd_state(false,false);
+            for panel in [ExtractPanel::Options,ExtractPanel::Chapters,
+                ExtractPanel::CueFiles,ExtractPanel::CopyFolder] {
+                state.panel=Some(panel);
+                let mut terminal=Terminal::new(TestBackend::new(width,height)).unwrap();
+                let mut buttons=ButtonRenderMap::new();
+                terminal.draw(|frame|draw(frame,&state,Path::new("/tmp"),&mut buttons,theme)).unwrap();
+                for (index,_) in state.option_controls().iter().enumerate() {
+                    let target=TuiButton::DiscBrowserOptionControl(index);
+                    let rect=buttons.button_rect(target).expect("compact control has visible hit box");
+                    assert!(rect.width>0 && rect.bottom()<=height && rect.right()<=width);
+                    assert_eq!(buttons.find_button_at(rect.x,rect.y),Some(target));
+                    if panel==ExtractPanel::CueFiles && (3..9).contains(&index) {
+                        assert!(matches!(terminal.backend().buffer().get(rect.x,rect.y).symbol(),"●"|"○"),
+                            "compact radio must remain visible in front of the footer rule");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn r4f_option_summary_value_and_qualifier_use_distinct_theme_tiers() {
+        for slug in ["tokyo-night","one-light"] {
+            let theme=crate::tui::theme::theme_by_slug_or_default(slug);
+            let mut state=sacd_state(false,false);
+            state.panel=Some(ExtractPanel::Options);
+            let mut terminal=Terminal::new(TestBackend::new(154,40)).unwrap();
+            let mut buttons=ButtonRenderMap::new();
+            terminal.draw(|frame|draw(frame,&state,Path::new("/tmp"),&mut buttons,theme)).unwrap();
+            let buffer=terminal.backend().buffer();
+            for (value,qualifier) in [
+                ("chapters.txt on","· for single-file output"),
+                ("create on","· for new CUEs and images"),
+                ("7 of 10 types","· for CUE images"),
+            ] {
+                let (value_x,value_y)=r4f_text_position(buffer,154,40,value);
+                let (qualifier_x,qualifier_y)=r4f_text_position(buffer,154,40,qualifier);
+                assert_eq!(value_y,qualifier_y,"{slug} summary unexpectedly wrapped");
+                assert!(qualifier_x>value_x);
+                let value_color=buffer.get(value_x,value_y).fg;
+                let qualifier_color=buffer.get(qualifier_x,qualifier_y).fg;
+                assert_eq!(value_color,readable_word(theme.value,theme.dropdown_bg),
+                    "{slug} value tier for {value}");
+                assert_eq!(qualifier_color,readable_word(theme.label,theme.dropdown_bg),
+                    "{slug} qualifier tier for {qualifier}");
+                assert_ne!(value_color,qualifier_color,
+                    "{slug} summary must distinguish value from qualifier");
+            }
+        }
+    }
 }

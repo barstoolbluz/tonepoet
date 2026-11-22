@@ -291,6 +291,8 @@ pub struct DiscBrowserState {
     /// Focused control in the Tags sheet (index into tag_sheet_controls).
     pub panel_cursor: usize,
     pub option_parent_cursor: usize,
+    /// Return to the exact Options popup and focus after viewing Extract keys.
+    pub option_help_return: Option<(ExtractPanel, usize)>,
     pub tag_source_open: bool,
     pub tag_source_cursor: usize,
     /// A MusicBrainz match was accepted and committed through the existing
@@ -452,6 +454,7 @@ impl DiscBrowserState {
             panel: None,
             panel_cursor: 0,
             option_parent_cursor: 0,
+            option_help_return: None,
             tag_source_open: false,
             tag_source_cursor: 0,
             tag_mb_available: false,
