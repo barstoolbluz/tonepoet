@@ -1911,7 +1911,7 @@ mod output_options_companion_render_tests {
                     let planned = &plan.entries[1].final_path;
                     assert_eq!(Path::new(&displayed), planned.as_path(),
                         "second member must use its own {pattern} metadata");
-                    assert_eq!(displayed, "Second Track -.flac");
+                    assert_eq!(Path::new(&displayed), root.join("Second Track -.flac"));
                 }
             }
         }
