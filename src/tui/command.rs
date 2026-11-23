@@ -10431,6 +10431,13 @@ fn execute_commit_with_source_options_transform(
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
         .map(|value| value.to_string());
+    super::convert_actions::apply_optional_naming_folder_for_source(
+        &mut options,
+        &app.convert.output_options,
+        &app.convert.format,
+        &app.convert.source.mode,
+        &app.convert.metadata,
+    );
     let format_name = options.output_format.name();
 
     // Build the exact post-admission PipelineRequest projection before queue
@@ -10495,6 +10502,33 @@ fn execute_commit_with_source_options_transform(
     // The output-channel intent now owns downmixing on every source family;
     // DVD-Auto is not a second hidden matrix in the DVD-A reader.
     commit_source.dvda_downmix_policy = DvdaDownmixPolicy::None;
+
+    // The batch cursor does not establish the metadata authority of another
+    // member. Resolve optional album-folder naming from the *same* exact CUE
+    // decision used by commit_batch_with_cue_metadata_artifacts. Keep this
+    // bounded preflight outside the queue transaction and off the redraw path.
+    let batch_naming_flat_output = if matches!(&app.convert.source.mode, SourceMode::Batch { .. }) {
+        super::convert_actions::batch_optional_naming_flat_output_policies(
+            &batch,
+            &app.convert.output_options,
+            &app.convert.format,
+            &app.convert.metadata,
+            |path| {
+                let authority = super::app::resolve_convert_preview_authority(
+                    path,
+                    &app.convert.source.cue_artifact_audio,
+                    &app.convert.source.cue_artifact_metadata,
+                    &app.config.conversion.aggregate_metadata_target_priority,
+                    Some(commit_source.cue_sidecar),
+                );
+                super::app::read_convert_naming_metadata_for_cue_decision(
+                    path, &authority,
+                )
+            },
+        )
+    } else {
+        Default::default()
+    };
 
     let rg_enabled = options.calculate_replaygain;
     let companion_policy = companion_copy_policy_from_conversion_options(&options);
@@ -10563,6 +10597,9 @@ fn execute_commit_with_source_options_transform(
         &source_synthetic_cue_artifacts,
         &options,
         |item| {
+            let item_flat_output = batch_naming_flat_output.get(&item.input_path)
+                .copied().unwrap_or(options.flat_output);
+            item.options.flat_output = item_flat_output;
             if item.input_path == batch[0] {
                 item.pre_extracted_staging = archive_preview_staging.clone();
                 item.archive_metadata_overrides = archive_metadata_overrides.clone();
@@ -10632,6 +10669,7 @@ fn execute_commit_with_source_options_transform(
                 existing_req.archive_metadata_overrides = item.archive_metadata_overrides.clone();
                 existing_req.naming.template = canonical_naming_template.clone();
                 existing_req.naming.folder_template = options.folder_template.clone();
+                existing_req.naming.per_album_subdir = !item_flat_output;
                 existing_req.naming.windows_portable = windows_portable_naming;
                 existing_req.settings = pipeline_settings.clone();
                 existing_req.merge = options.merge_to_single;
@@ -10682,7 +10720,7 @@ fn execute_commit_with_source_options_transform(
                     naming: NamingPolicy {
                         template: canonical_naming_template.clone(),
                         folder_template: options.folder_template.clone(),
-                        per_album_subdir: true,
+                        per_album_subdir: !item_flat_output,
                         collision_policy: NamingCollisionPolicy::Fail,
                         windows_portable: windows_portable_naming,
                     },

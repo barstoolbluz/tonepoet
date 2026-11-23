@@ -496,11 +496,12 @@ fn open_native_naming_picker(app: &mut AppState) {
     focus_native_row(&mut state,"Naming");
     let templates=super::template_builder::list_templates(TemplateTarget::Filename);
     let preview=templates.first().map(|template|
-        super::template_builder::render_template_preview(template)).unwrap_or_default();
+        super::template_builder::preview_for_context(template, Some(&state))).unwrap_or_default();
     let active_template=Some(state.naming_template.clone());
+    let active_capitalization=state.capitalize_naming;
     app.active_overlay=ActiveOverlay::TemplatePicker {
         target:TemplateTarget::Filename,templates,selected:0,scroll:0,preview,
-        active_template,return_to_extract:Some(state),
+        active_template,active_capitalization,return_to_extract:Some(state),return_to_builder:None,
     };
 }
 
@@ -516,6 +517,7 @@ fn open_native_naming_builder(app: &mut AppState) {
     let mut builder=TemplateBuilderState::new(TemplateTarget::Filename,
         &state.naming_template,TemplateBuilderFocus::TemplateInput);
     builder.disc_format=Some(state.contents.format);
+    builder.capitalize=state.capitalize_naming;
     builder.return_to_extract=Some(state);
     app.active_overlay=ActiveOverlay::TemplateBuilder(Box::new(builder));
 }
@@ -886,6 +888,15 @@ pub fn handle_disc_browser_button_click_with_shift(
             let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { return false; };
             focus_native_row(state, "Overwrite");
             cycle_native_option(state,-1);
+            true
+        }
+        TuiButton::DiscBrowserDownmixNext | TuiButton::DiscBrowserDownmixPrev => {
+            let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { return false; };
+            if !state.output_rows().contains(&"Downmix") { return false; }
+            focus_native_row(state, "Downmix");
+            cycle_native_option(state, if matches!(button,TuiButton::DiscBrowserDownmixPrev) {
+                -1
+            } else { 1 });
             true
         }
         TuiButton::DiscBrowserOverwriteHelp => {
@@ -1287,9 +1298,17 @@ pub(super) fn selected_sacd_has_dst(state: &DiscBrowserState) -> bool {
             && presentation_has_dst(program))
 }
 
+// The renderer uses this same policy list to size the Downmix cycler.
+// Order is the established keyboard/Enter cycle and must remain unchanged.
+pub(super) const NATIVE_DVDA_DOWNMIX_POLICIES: [crate::convert::pipeline::DvdaDownmixPolicy; 4] = [
+    crate::convert::pipeline::DvdaDownmixPolicy::None,
+    crate::convert::pipeline::DvdaDownmixPolicy::FooInputDvdaCompatible,
+    crate::convert::pipeline::DvdaDownmixPolicy::FfmpegDefault,
+    crate::convert::pipeline::DvdaDownmixPolicy::Auto,
+];
+
 fn cycle_native_option(state: &mut DiscBrowserState, step: i32) {
     use crate::convert::pipeline::native_extract::NativeWavContainer;
-    use crate::convert::pipeline::DvdaDownmixPolicy;
     match state.output_rows().get(state.output_cursor).copied() {
         _ if state.focus == crate::tui::disc_browser::ExtractFocus::Programs => {
             state.cycle_angle_for(state.cursor, step);
@@ -1311,8 +1330,7 @@ fn cycle_native_option(state: &mut DiscBrowserState, step: i32) {
         },
         Some("Files") => set_native_files(state,usize::from(!state.file_per_program)),
         Some("Downmix") => {
-            let all = [DvdaDownmixPolicy::None, DvdaDownmixPolicy::FooInputDvdaCompatible,
-                DvdaDownmixPolicy::FfmpegDefault, DvdaDownmixPolicy::Auto];
+            let all = &NATIVE_DVDA_DOWNMIX_POLICIES;
             let index = all.iter().position(|value| *value == state.downmix).unwrap_or(0);
             state.downmix = all[(index as i32 + step).rem_euclid(all.len() as i32) as usize];
         }
@@ -1409,7 +1427,7 @@ fn native_key_bindings(state: &DiscBrowserState) -> Vec<NativeKeyBinding> {
                 "Keep DST" =>
                     add(KeyCode::Char(' '), M::NONE, "Space toggle", A::Space),
                 "Naming" => {
-                    add(KeyCode::Char('l'),M::NONE,"l presets",A::NamingLoad);
+                    add(KeyCode::Char('l'),M::NONE,"l templates",A::NamingLoad);
                     add(KeyCode::Char('b'),M::NONE,"b builder",A::NamingCustom);
                 },
                 _ => {}
@@ -1427,11 +1445,16 @@ fn native_key_bindings(state: &DiscBrowserState) -> Vec<NativeKeyBinding> {
                 _ => "↵ settings",
             }, A::Enter);
             }
-            if native_form_has_neighbor(state, -1) {
-                add(KeyCode::Left, M::NONE, "← move", A::FormLeft);
-            }
-            if native_form_has_neighbor(state, 1) {
-                add(KeyCode::Right, M::NONE, "→ move", A::FormRight);
+            if row == "Downmix" {
+                add(KeyCode::Left, M::NONE, "←→ choose", A::Previous);
+                add(KeyCode::Right, M::NONE, "←→ choose", A::Next);
+            } else {
+                if native_form_has_neighbor(state, -1) {
+                    add(KeyCode::Left, M::NONE, "← move", A::FormLeft);
+                }
+                if native_form_has_neighbor(state, 1) {
+                    add(KeyCode::Right, M::NONE, "→ move", A::FormRight);
+                }
             }
         }
         ExtractFocus::Footer => {
@@ -2729,7 +2752,7 @@ mod tests {
         assert!(matches!(&app.active_overlay,ActiveOverlay::TemplatePicker{
             return_to_extract:Some(_),..}));
         if let ActiveOverlay::TemplatePicker{templates,selected,..}=&mut app.active_overlay {
-            *templates=vec!["%TRACKNN% - %TITLE%".into()];
+            *templates=vec![super::super::template_builder::NamingTemplate::plain("%TRACKNN% - %TITLE%")];
             *selected=0;
         }
         crate::tui::keybindings::handle_key(&mut app,KeyEvent::new(KeyCode::Enter,M::NONE),&tx);
@@ -2741,6 +2764,133 @@ mod tests {
         crate::tui::keybindings::handle_key(&mut app,KeyEvent::new(KeyCode::Esc,M::NONE),&tx);
         assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
             if s.naming_template=="%TRACKNN% - %TITLE%"));
+    }
+
+    #[test]
+    fn naming_custom_capitalization_keyboard_toggle_commits_to_extract_job() {
+        use crate::tui::app::TemplateBuilderFocus;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers as M};
+        let contents = selectable_disc_contents(
+            PathBuf::from("disc.iso"), FolderDiscMarkerKind::Sacd);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::DiscBrowser(Box::new(
+            DiscBrowserState::new(contents, PathBuf::from("disc.iso"))));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        handle_disc_browser_button_click(
+            &mut app, &TuiButton::DiscBrowserNamingCustom, 1, &tx);
+        crate::tui::keybindings::handle_key(
+            &mut app, KeyEvent::new(KeyCode::Tab, M::NONE), &tx);
+        assert!(matches!(&app.active_overlay, ActiveOverlay::TemplateBuilder(builder)
+            if builder.focus == TemplateBuilderFocus::Capitalization && !builder.capitalize));
+        crate::tui::keybindings::handle_key(
+            &mut app, KeyEvent::new(KeyCode::Char(' '), M::NONE), &tx);
+        assert!(matches!(&app.active_overlay, ActiveOverlay::TemplateBuilder(builder)
+            if builder.capitalize));
+        crate::tui::keybindings::handle_key(
+            &mut app, KeyEvent::new(KeyCode::BackTab, M::NONE), &tx);
+        crate::tui::keybindings::handle_key(
+            &mut app, KeyEvent::new(KeyCode::Enter, M::NONE), &tx);
+        let ActiveOverlay::DiscBrowser(browser) = &app.active_overlay else {
+            panic!("naming builder must restore Extract on apply");
+        };
+        assert!(browser.capitalize_naming);
+        assert!(browser.native_job(PathBuf::new()).capitalize_naming);
+    }
+
+    #[test]
+    fn round_2_editor_and_extract_have_no_preview_pager() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers as M};
+        let contents=selectable_disc_contents(
+            PathBuf::from("disc.iso"),FolderDiscMarkerKind::Sacd);
+        let mut state=DiscBrowserState::new(contents,PathBuf::from("disc.iso"));
+        state.naming_template="%ALBUM_ARTIST%/%TRACKNUMBER% - %TITLE%".into();
+        focus_native_row(&mut state,"Naming");
+        let mut app=AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay=ActiveOverlay::DiscBrowser(Box::new(state));
+        let (tx,_rx)=tokio::sync::mpsc::channel(8);
+        handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Right,M::ALT),&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(browser)
+            if browser.naming_template=="%ALBUM_ARTIST%/%TRACKNUMBER% - %TITLE%"));
+        handle_disc_browser_button_click(&mut app,&TuiButton::DiscBrowserNamingCustom,1,&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::TemplateBuilder(_)));
+        crate::tui::keybindings::handle_key(
+            &mut app,KeyEvent::new(KeyCode::Right,M::ALT),&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::TemplateBuilder(builder)
+            if builder.template_input.text=="%ALBUM_ARTIST%/%TRACKNUMBER% - %TITLE%"));
+    }
+
+    #[test]
+    fn round_2_saved_picker_from_builder_loads_for_editing_without_applying() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers as M,
+            MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{backend::TestBackend, Terminal};
+        use crate::tui::app::TemplateSaveFocus;
+        let contents=selectable_disc_contents(PathBuf::from("disc.iso"),FolderDiscMarkerKind::Sacd);
+        let mut state=DiscBrowserState::new(contents,PathBuf::from("disc.iso"));
+        state.naming_template="%TRACKNN% - %TITLE%".into();
+        let original=state.naming_template.clone();
+        let mut app=AppState::new_for_test(TonepoetConfig::default());
+        let convert_before=app.convert.output_options.filename_template.clone();
+        app.active_overlay=ActiveOverlay::DiscBrowser(Box::new(state));
+        let (tx,_rx)=tokio::sync::mpsc::channel(8);
+        handle_disc_browser_button_click(&mut app,&TuiButton::DiscBrowserNamingCustom,1,&tx);
+        crate::tui::keybindings::handle_key(
+            &mut app,KeyEvent::new(KeyCode::Char('l'),M::ALT),&tx);
+        let pattern="%ALBUM_ARTIST%/%TRACKNUMBER% - %TITLE%";
+        let choice=super::super::template_builder::NamingTemplate {
+            name:"Album ordering (ALTERNATE)".into(),pattern:pattern.into(),capitalize:true,
+        };
+        if let ActiveOverlay::TemplatePicker{templates,return_to_builder,..}=&mut app.active_overlay {
+            assert!(return_to_builder.is_some(),"picker must own the unfinished editor");
+            *templates=vec![choice.clone()];
+        } else {panic!("Custom did not open the saved picker");}
+
+        // A mouse click loads the selected pattern and its capitalization
+        // into Custom. Neither Extract nor Convert may be updated here.
+        let theme=crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        let mut terminal=Terminal::new(TestBackend::new(80,24)).unwrap();
+        app.button_map=crate::tui::button_map::ButtonRenderMap::new();
+        if let ActiveOverlay::TemplatePicker{target,templates,selected,scroll,preview,
+            active_template,active_capitalization,..}=&app.active_overlay {
+            terminal.draw(|frame|crate::tui::template_builder::draw_template_picker(
+                frame,*target,templates,*selected,*scroll,preview,
+                active_template.as_deref(),*active_capitalization,&mut app.button_map,theme)).unwrap();
+        }
+        let row=app.button_map.button_rect(TuiButton::TemplatePickerRow(0)).unwrap();
+        crate::tui::keybindings::handle_mouse(&mut app, MouseEvent {
+            kind:MouseEventKind::Down(MouseButton::Left),column:row.x+1,row:row.y,modifiers:M::NONE,
+        },&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::TemplateBuilder(builder)
+            if builder.template_input.text==pattern && builder.capitalize
+                && builder.loaded_template.as_ref()==Some(&choice)
+                && builder.return_to_extract.as_deref().is_some_and(|s|s.naming_template==original)));
+        assert_eq!(app.convert.output_options.filename_template,convert_before);
+
+        // Saving after loading must ask for an affirmative decision, retaining
+        // a mutable alternate name. Cancel does not write or apply anything.
+        crate::tui::keybindings::handle_key(
+            &mut app,KeyEvent::new(KeyCode::Char('s'),M::ALT),&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::TemplateBuilder(builder)
+            if builder.save_dialog.as_ref().is_some_and(|d|
+                d.original_name.as_deref()==Some("Album ordering (ALTERNATE)")
+                && d.name_input.text=="Album ordering (ALTERNATE)")));
+        crate::tui::keybindings::handle_key(&mut app,KeyEvent::new(KeyCode::Tab,M::NONE),&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::TemplateBuilder(builder)
+            if builder.save_dialog.as_ref().is_some_and(|d|d.focus==TemplateSaveFocus::Overwrite)));
+        crate::tui::keybindings::handle_key(&mut app,KeyEvent::new(KeyCode::Tab,M::NONE),&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::TemplateBuilder(builder)
+            if builder.save_dialog.as_ref().is_some_and(|d|d.focus==TemplateSaveFocus::SaveNew)));
+        crate::tui::keybindings::handle_key(&mut app,KeyEvent::new(KeyCode::Esc,M::NONE),&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::TemplateBuilder(builder)
+            if builder.save_dialog.is_none() && builder.template_input.text==pattern));
+
+        // Esc from the nested picker restores the same unfinished editor.
+        crate::tui::keybindings::handle_key(
+            &mut app,KeyEvent::new(KeyCode::Char('l'),M::ALT),&tx);
+        crate::tui::keybindings::handle_key(&mut app,KeyEvent::new(KeyCode::Esc,M::NONE),&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::TemplateBuilder(builder)
+            if builder.loaded_template.as_ref()==Some(&choice) && builder.capitalize));
+        assert_eq!(app.convert.output_options.filename_template,convert_before);
     }
 
     #[test]
@@ -2760,12 +2910,12 @@ mod tests {
         handle_disc_browser_button_click(&mut app,&TuiButton::DiscBrowserNamingLoad,1,&tx);
         let saved="%DISC%/%ALBUM% {%TITLE_EXTRA%}/%TRACKNN% - %TITLE%.%EXTENSION%";
         if let ActiveOverlay::TemplatePicker{templates,selected,..}=&mut app.active_overlay {
-            *templates=vec![saved.into()];
+            *templates=vec![super::super::template_builder::NamingTemplate::plain(saved)];
             *selected=0;
-        } else {panic!("shared Convert preset picker not opened");}
+        } else {panic!("shared naming template picker not opened");}
         crate::tui::keybindings::handle_key(&mut app,KeyEvent::new(KeyCode::Enter,M::NONE),&tx);
         let ActiveOverlay::DiscBrowser(loaded)=&app.active_overlay else {
-            panic!("preset picker did not return to Extract");
+            panic!("template picker did not return to Extract");
         };
         assert_eq!(loaded.naming_template,saved);
         assert_eq!(loaded.native_preview_path().unwrap(),PathBuf::from(
@@ -2774,7 +2924,6 @@ mod tests {
 
         handle_disc_browser_button_click(&mut app,&TuiButton::DiscBrowserNamingCustom,1,&tx);
         if let ActiveOverlay::TemplateBuilder(builder)=&mut app.active_overlay {
-            builder.saved_templates=(0..4).map(|n|format!("%ARTIST% - {n}")).collect();
             builder.template_input=crate::tui::text_input::TextInputState::new(
                 "%DISC%/%TRACKNN% - %TITLE%".into());
         } else {panic!("shared Convert builder not opened");}
@@ -2786,7 +2935,7 @@ mod tests {
                 frame,builder,&mut app.button_map,theme)).unwrap();
         }
         let apply=app.button_map.button_rect(TuiButton::TemplateBuilderApply)
-            .expect("Apply must be mouse-visible at 80x24 with four saved presets");
+            .expect("Apply must be mouse-visible at 80x24 with four saved templates");
         assert!(apply.y<24);
         crate::tui::keybindings::handle_mouse(&mut app, MouseEvent {
             kind:MouseEventKind::Down(MouseButton::Left),
@@ -3810,6 +3959,51 @@ mod tests {
         press(&mut app,KeyCode::Esc);
         assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if
             !s.overwrite_open && s.overwrite_policy==Policy::Replace));
+    }
+
+    #[test]
+    fn round_5_downmix_mouse_and_keyboard_cycle_without_moving_row_focus() {
+        use crossterm::event::KeyModifiers as M;
+        use crate::convert::pipeline::DvdaDownmixPolicy as Policy;
+        let source=PathBuf::from("dvda.iso");
+        let mut state=DiscBrowserState::new(
+            selectable_disc_contents(source.clone(),FolderDiscMarkerKind::DvdAudio),source);
+        state.contents.presentations[0].format.channels=Some(6);
+        state.downmix=Policy::None;
+        focus_native_row(&mut state,"Downmix");
+        let mut app=AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay=ActiveOverlay::DiscBrowser(Box::new(state));
+        let (tx,_rx)=tokio::sync::mpsc::channel(8);
+        let press=|app:&mut AppState,key|handle_disc_browser_key(app,
+            KeyEvent::new(key,M::NONE),&tx);
+        for (button,expected) in [
+            (TuiButton::DiscBrowserDownmixPrev,Policy::Auto),
+            (TuiButton::DiscBrowserDownmixNext,Policy::None),
+            (TuiButton::DiscBrowserDownmixNext,Policy::FooInputDvdaCompatible),
+            (TuiButton::DiscBrowserDownmixNext,Policy::FfmpegDefault),
+            (TuiButton::DiscBrowserDownmixNext,Policy::Auto),
+            (TuiButton::DiscBrowserDownmixNext,Policy::None),
+        ] {
+            assert!(handle_disc_browser_button_click(&mut app,&button,1,&tx));
+            assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if
+                s.downmix==expected && s.current_output_row()=="Downmix"));
+        }
+        for (key,expected) in [
+            (KeyCode::Left,Policy::Auto),
+            (KeyCode::Right,Policy::None),
+            (KeyCode::Char('['),Policy::Auto),
+            (KeyCode::Char(']'),Policy::None),
+        ] {
+            press(&mut app,key);
+            assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if
+                s.downmix==expected && s.current_output_row()=="Downmix"));
+        }
+        press(&mut app,KeyCode::Up);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if
+            s.current_output_row()=="Naming" && s.downmix==Policy::None));
+        press(&mut app,KeyCode::Down);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if
+            s.current_output_row()=="Downmix" && s.downmix==Policy::None));
     }
 
     /// Locate a character in the rendered terminal cell buffer, not by

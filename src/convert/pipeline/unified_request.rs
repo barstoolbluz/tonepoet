@@ -154,7 +154,9 @@ pub fn build_pipeline_request_from_settings(
                 .clone()
                 .unwrap_or_else(|| "%NN% - %TITLE%".to_string()),
             folder_template: item.options.folder_template.clone(),
-            per_album_subdir: true,
+            // Only the TUI's explicit slash-free Naming choice requests a flat
+            // root. Default ConversionOptions retain the CLI's existing rule.
+            per_album_subdir: !item.options.flat_output,
             collision_policy: if item.options.overwrite {
                 NamingCollisionPolicy::Fail
             } else {
@@ -797,6 +799,24 @@ mod cue_sidecar_override_request_tests {
         item.options.pipeline_settings = Some(PipelineSettings::default());
         item.pipeline_settings = Some(PipelineSettings::default());
         item
+    }
+
+    #[test]
+    fn flat_tui_naming_flag_selects_the_flat_publish_contract_only_when_requested() {
+        let mut item = item_with_settings("/tmp/album/01.flac");
+        let unchanged = build_pipeline_request(&item).expect("default request");
+        assert!(unchanged.naming.per_album_subdir);
+
+        item.options.folder_template = Some(String::new());
+        item.options.naming_template = Some("%TITLE%".into());
+        item.options.flat_output = true;
+        let flat = build_pipeline_request(&item).expect("TUI flat request");
+        assert!(!flat.naming.per_album_subdir);
+        assert_eq!(flat.naming.folder_template.as_deref(), Some(""));
+        assert_eq!(flat.naming.template, "%TITLE%");
+
+        item.options.flat_output = false;
+        assert!(build_pipeline_request(&item).expect("CLI default").naming.per_album_subdir);
     }
 
     #[test]

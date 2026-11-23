@@ -166,7 +166,7 @@ pub(super) fn native_folder_preview_caret(path: &Path, field_width: u16, cell: u
     raw_index.min(path.to_string_lossy().chars().count())
 }
 
-fn check(checked: bool) -> &'static str { if checked { "[✓]" } else { "[ ]" } }
+fn check(checked: bool) -> &'static str { if checked { "☑" } else { "☐" } }
 fn program_check(s: &DiscBrowserState, i: usize) -> &'static str {
     if !s.is_extractable(i) { "×" } else { check(s.selected[i]) }
 }
@@ -747,7 +747,7 @@ fn draw_programs(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, butt
             } else { name };
             display_rows.push((Some(i),name,s.cursor==i,None));
             if !is_title {
-                display_rows.push((None,format!("      {}",program_info(p,s.contents.format)),false,None));
+                display_rows.push((None,format!("    {}",program_info(p,s.contents.format)),false,None));
             }
         }
     }
@@ -778,8 +778,18 @@ fn draw_programs(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, butt
             Rect::new(inner.x,y,inner.width,1));
         if let Some(i)=index {
             buttons.record_button(TuiButton::DiscBrowserStream(*i),Rect::new(inner.x,y,inner.width,1));
-            buttons.record_button(TuiButton::DiscBrowserExpand(*i),
-                Rect::new(inner.x+2,y,4.min(inner.width.saturating_sub(2)),1));
+            // The one-cell box and the start of its caption toggle selection.
+            // The rest of the row still focuses on a single click, as before.
+            // Every row has a two-cell focus gutter; title and playlist
+            // child streams add two cells before the checkbox.
+            let indent = if matches!(s.contents.format, DiscFormat::DvdVideo | DiscFormat::BluRay) {
+                4
+            } else { 2 };
+            let start = inner.x + indent;
+            if start < inner.right() {
+                buttons.record_button(TuiButton::DiscBrowserExpand(*i),
+                    Rect::new(start, y, 6.min(inner.right() - start), 1));
+            }
         }
         let words=word_tiers(theme,colors,bg);
         let mut text = label.as_str();
@@ -812,22 +822,15 @@ fn draw_programs(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, butt
         let mut spans = Vec::new();
         spans.push(Span::styled(if *focused { "▌ " } else { "  " },
             Style::default().fg(if active{theme.info}else{colors.dim})));
-        if let Some(mark) = text.find('[') {
-            let prefix=&text[..mark];
-            spans.push(Span::styled(prefix.to_owned(),Style::default().fg(colors.dim)));
-            if text[mark..].starts_with("[✓]") || text[mark..].starts_with("[ ]") {
-                spans.push(Span::styled("[",Style::default().fg(if active{words.soft}else{words.label})));
-                spans.push(Span::styled(if text[mark..].starts_with("[✓]") {"✓"}else{" "},
-                    Style::default().fg(theme.success)));
-                spans.push(Span::styled("]",Style::default().fg(if active{words.soft}else{words.label})));
-                let marker_bytes=if text[mark..].starts_with("[✓]") {5}else{3};
-                spans.push(Span::styled(text[mark+marker_bytes..].to_owned(),
-                    Style::default().fg(if active {words.value}
-                        else if index.is_some_and(|i|!s.is_extractable(i)) {theme.error}
-                        else {words.value})));
-            } else {
-                spans.push(Span::styled(text[mark..].to_owned(),Style::default().fg(words.value)));
-            }
+        if let Some(mark) = text.find(|ch| matches!(ch, '☑' | '☐')) {
+            spans.push(Span::styled(text[..mark].to_owned(),Style::default().fg(colors.dim)));
+            let glyph = &text[mark..mark + '☑'.len_utf8()];
+            spans.push(Span::styled(glyph.to_owned(),Style::default().fg(
+                if glyph == "☑" { readable_word(theme.success, bg) } else { words.label })));
+            spans.push(Span::styled(text[mark + '☑'.len_utf8()..].to_owned(),
+                Style::default().fg(if active {words.value}
+                    else if index.is_some_and(|i|!s.is_extractable(i)) {theme.error}
+                    else {words.value})));
         } else {
             spans.push(Span::styled(text.to_owned(),Style::default().fg(if active{words.value}else{words.soft})));
         }
@@ -923,13 +926,11 @@ fn draw_items(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect,
             Rect::new(x,y,1,1));
         x+=2;
         let checked=s.items_checked.get(s.cursor).and_then(|v|v.get(i))==Some(&true);
-        frame.render_widget(Paragraph::new(Line::from(vec![
-            Span::styled("[",style.fg(if focused{words.soft}else{words.label})),
-            Span::styled(if checked {"✓"}else{" "},style.fg(theme.success)),
-            Span::styled("]",style.fg(if focused{words.soft}else{words.label})),
-        ])).style(style),Rect::new(x,y,3,1));
+        frame.render_widget(Paragraph::new(check(checked)).style(style.fg(
+            if checked { readable_word(theme.success, bg) } else { words.label })),
+            Rect::new(x,y,1,1));
         let check_x=x;
-        x+=4;
+        x+=2;
         let number_width=if track.number>99 {4}else{3};
         frame.render_widget(Paragraph::new(format!("{:02}",track.number))
             .style(style.fg(colors.dim)),Rect::new(x,y,number_width,1));
@@ -961,7 +962,7 @@ fn draw_items(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect,
         }
         start_secs=start_secs.and_then(|secs|track.duration_secs.map(|duration|secs+duration));
         buttons.record_button(TuiButton::DiscBrowserTrack(i),Rect::new(inner.x,y,inner.width,1));
-        buttons.record_button(TuiButton::DiscBrowserTrackCheck(i),Rect::new(check_x,y,3,1));
+        buttons.record_button(TuiButton::DiscBrowserTrackCheck(i),Rect::new(check_x,y,1,1));
     }
     if more_below {
         let hidden = remaining.saturating_sub(visible as usize);
@@ -1226,7 +1227,7 @@ fn draw_native_radio(frame: &mut ratatui::Frame, buttons: &mut ButtonRenderMap,
 fn draw_native_toggle(frame:&mut ratatui::Frame, buttons:&mut ButtonRenderMap,
     field:Rect, text:&str, enabled:bool, focused:bool, index:usize,
     theme:Theme, bg:Color) -> u16 {
-    let text=format!("{} {text}",if enabled {"[✓]"}else{"[ ]"});
+    let text=format!("{} {text}",check(enabled));
     let width=(text.chars().count() as u16).min(field.width);
     if width==0 {return field.x;}
     let control_bg=if focused {theme.input_focused_bg}else{bg};
@@ -1474,7 +1475,7 @@ fn draw_output_with_hover(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
             "Naming" => {
                 let editing=s.editing_destination && s.editing_template;
                 let value=s.naming_template.as_str();
-                let load=" Load preset ▾ ";
+                let load=" Load template ▾ ";
                 let custom=" Custom… ";
                 let load_width=load.chars().count() as u16;
                 let custom_width=custom.chars().count() as u16;
@@ -1496,13 +1497,42 @@ fn draw_output_with_hover(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
                         hover==Some(TuiButton::DiscBrowserNamingCustom),theme);
                 }
             }
-            "Downmix" | "Assume decrypted" => {
-                let value=if *name=="Downmix" {option_value(s,"Downmix")}
-                    else {format!("{} Assume decrypted",check(s.assume_decrypted))};
-                let fbg=if focused {theme.input_focused_bg}else{theme.input_unfocused_bg};
-                let text=clip_end(&value,field.width);
-                frame.render_widget(Paragraph::new(text).style(Style::default()
-                    .fg(readable_word(theme.value,fbg)).bg(fbg)),field);
+            "Downmix" => {
+                // Reserve the longest policy name, regardless of the active
+                // value. On narrow screens keep both arrows visible and clip
+                // only the label; the mouse targets do not move as it cycles.
+                let maximum = super::disc_browser_actions::NATIVE_DVDA_DOWNMIX_POLICIES.iter()
+                    .map(|policy| super::display_width::width(policy.as_str()) as u16)
+                    .max().unwrap_or(0);
+                let well=if focused {theme.input_focused_bg}else{theme.input_unfocused_bg};
+                buttons.record_button(TuiButton::DiscBrowserToggle(i),field);
+                if field.width>=5 {
+                    let value_width=maximum.min(field.width.saturating_sub(4));
+                    let next_x=field.x+value_width+3;
+                    fill(frame,Rect::new(field.x,field.y,value_width+4,1),well);
+                    frame.render_widget(Paragraph::new("◂").style(Style::default()
+                        .fg(if focused {theme.info}else{theme.label}).bg(well)),
+                        Rect::new(field.x,field.y,1,1));
+                    frame.render_widget(Paragraph::new(clip_end(s.downmix.as_str(),value_width))
+                        .style(Style::default().fg(readable_word(theme.value,well)).bg(well)),
+                        Rect::new(field.x+2,field.y,value_width,1));
+                    frame.render_widget(Paragraph::new("▸").style(Style::default()
+                        .fg(if focused {theme.info}else{theme.label}).bg(well)),
+                        Rect::new(next_x,field.y,1,1));
+                    buttons.record_button(TuiButton::DiscBrowserDownmixPrev,
+                        Rect::new(field.x,field.y,1,1));
+                    buttons.record_button(TuiButton::DiscBrowserDownmixNext,
+                        Rect::new(next_x,field.y,1,1));
+                } else {
+                    frame.render_widget(Paragraph::new(clip_end(s.downmix.as_str(),field.width))
+                        .style(Style::default().fg(readable_word(theme.value,well)).bg(well)),field);
+                }
+            }
+            "Assume decrypted" => {
+                let value=format!("{} Assume decrypted",check(s.assume_decrypted));
+                let well=if focused {theme.input_focused_bg}else{theme.input_unfocused_bg};
+                frame.render_widget(Paragraph::new(clip_end(&value,field.width))
+                    .style(Style::default().fg(readable_word(theme.value,well)).bg(well)),field);
                 buttons.record_button(TuiButton::DiscBrowserToggle(i),field);
             }
             _ => {},
@@ -1556,8 +1586,8 @@ fn draw_output_with_hover(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
                 .style(Style::default().bg(bg).fg(color)),Rect::new(x,y,width,1));
         }
     }
-    // Read-only full destination preview, below Naming and using exactly the
-    // worker's resolved path, not a second token-replacement implementation.
+    // The worker-resolved destination remains authoritative. On overflow the
+    // author's folder and filename take priority over the absolute root.
     if let Some(index)=rows.iter().position(|name|*name=="Naming") {
         if let Some(naming)=output_cell("Naming",index,&rows,r,wide,s.output_cursor) {
             let y=naming.y.saturating_add(1);
@@ -1570,12 +1600,16 @@ fn draw_output_with_hover(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
                 // Neither a collision nor an invalid token may replace the
                 // highlighted item's live destination path. The separate
                 // result caption communicates the warning/blocker.
-                let preview=if let Some(path)=s.native_preview_path_for_template(template) {
-                    format!("→ {}",compact_folder_path(&path,naming.width.saturating_sub(2)))
-                } else { "→ Select a playable track to preview its path".into() };
+                let preview=s.native_preview_path_for_template(template)
+                    .map(|path|super::template_builder::destination_path_preview(
+                        &path,&s.destination,naming.width.saturating_sub(2) as usize,
+                        || s.native_preview_naming_for_template_case(
+                            template,s.capitalize_naming)))
+                    .unwrap_or_else(|| "Select a playable track to preview its path".into());
                 let color=if invalid.is_some() {theme.warning} else {colors.soft};
-                frame.render_widget(Paragraph::new(preview).style(Style::default()
-                    .bg(bg).fg(color)),Rect::new(naming.x,naming.y+1,naming.width,1));
+                super::template_builder::draw_naming_preview(frame,
+                    Rect::new(naming.x,naming.y+1,naming.width,1),
+                    &preview,Style::default().bg(bg).fg(color));
             }
         }
     }
@@ -1915,7 +1949,7 @@ fn extract_option_display(s:&DiscBrowserState,control:ExtractOptionControl) -> (
     use ExtractOptionControl as C;
     use crate::convert::pipeline::native_extract::{NativeCueBetweenGap as B,NativeCueFirstGap as F};
     let settings=&s.extract_settings;
-    let mark=|on:bool| if on {"☒"} else {"☐"};
+    let mark=check;
     let radio=|on:bool| if on {"●"} else {"○"};
     match control {
         C::WriteLog => (format!("{} Write extraction.log",mark(s.extraction_log)),
@@ -2015,11 +2049,11 @@ fn option_draw_control(frame:&mut ratatui::Frame,buttons:&mut ButtonRenderMap,
     let clipped=clip_end(label,rect.width);
     let mut chars=clipped.chars();
     let first=chars.next();
-    let mark=matches!(first,Some('☒'|'☐'|'●'|'○'));
+    let mark=matches!(first,Some('☑'|'☐'|'●'|'○'));
     if mark && !matches!(visual,ExtractOptionVisual::Button) {
         let glyph=first.unwrap_or(' ');
         let mark_fg=if focused {fg}
-            else if glyph=='☒' {readable_word(theme.success,bg)}
+            else if glyph=='☑' {readable_word(theme.success,bg)}
             else if glyph=='●' {readable_word(theme.info,bg)}
             else {readable_word(theme.label,bg)};
         let text=Line::from(vec![
@@ -2505,6 +2539,157 @@ mod extract_r3_render_tests {
             genre: None, year: None,
         };
         DiscBrowserState::new(contents, "disc.iso".into())
+    }
+
+    #[test]
+    fn r6_program_and_track_boxes_use_one_cell_and_preserve_click_targets() {
+        let theme = crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        let mut state = sacd_state(false, false);
+        let mut second = state.contents.presentations[0].tracks[0].clone();
+        second.number = 2;
+        second.title = Some("Second".into());
+        state.contents.presentations[0].tracks.push(second);
+        state.items_checked[0] = vec![true, false];
+
+        for (selected, mark) in [(false, "☐"), (true, "☑")] {
+            state.selected[0] = selected;
+            let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+            let mut buttons = ButtonRenderMap::new();
+            terminal.draw(|frame| draw_programs(frame, &state,
+                Rect::new(2, 3, 104, 8), &mut buttons, theme)).unwrap();
+            let target = TuiButton::DiscBrowserExpand(0);
+            let hit = buttons.button_rect(target).expect("program checkbox hit target");
+            assert_eq!(terminal.backend().buffer().get(hit.x, hit.y).symbol(), mark);
+            assert_eq!(buttons.find_button_at(hit.x, hit.y), Some(target));
+            assert_eq!(buttons.find_button_at(hit.x + 2, hit.y), Some(target),
+                "caption next to program checkbox remains clickable");
+            assert_eq!(buttons.find_button_at(hit.right(), hit.y),
+                Some(TuiButton::DiscBrowserStream(0)),
+                "rest of program row still focuses without toggling");
+        }
+
+        // A secondary details row stays one cell right of its program heading.
+        // Both SACD and DVD-Audio use the ordinary (non-title) layout.
+        for format in [DiscFormat::Sacd, DiscFormat::DvdAudio] {
+            let mut program = sacd_state(false, false);
+            program.contents.format = format;
+            if format == DiscFormat::DvdAudio {
+                program.contents.presentations[0].id = PresentationId::DvdAudioGroup(1);
+                program.contents.presentations[0].format.codec = Some("MLP".into());
+            }
+            let area = Rect::new(2, 3, 104, 8);
+            let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+            let mut buttons = ButtonRenderMap::new();
+            terminal.draw(|frame| draw_programs(frame, &program, area,
+                &mut buttons, theme)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let row = |y| (area.x..area.right()).map(|x|
+                buffer.get(x, y).symbol().to_owned()).collect::<Vec<_>>().concat();
+            let heading = header_for(program.contents.presentations[0].id,
+                &program.contents.presentations[0], 0);
+            let details = program_info(&program.contents.presentations[0], format);
+            let heading_row = row(area.y + 1);
+            let details_row = row(area.y + 2);
+            let heading_at = heading_row.find(heading.as_str()).expect("program heading rendered");
+            let details_at = details_row.find(details.as_str()).expect("program details rendered");
+            let heading_col = heading_row[..heading_at].chars().count();
+            let details_col = details_row[..details_at].chars().count();
+            assert_eq!(details_col, heading_col + 1,
+                "{format:?}: details remain one cell deeper than the heading");
+        }
+
+        state.focus = ExtractFocus::Items;
+        let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+        let mut buttons = ButtonRenderMap::new();
+        terminal.draw(|frame| draw_items(frame, &state,
+            Rect::new(2, 3, 104, 8), &mut buttons, theme, true)).unwrap();
+        for (index, mark) in [(0, "☑"), (1, "☐")] {
+            let target = TuiButton::DiscBrowserTrackCheck(index);
+            let hit = buttons.button_rect(target).expect("track checkbox hit target");
+            assert_eq!(hit.width, 1, "one-cell track tick box");
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer.get(hit.x, hit.y).symbol(), mark);
+            assert_eq!(buffer.get(hit.x + 2, hit.y).symbol(), "0",
+                "track numbers align after the narrow checkbox");
+            assert_eq!(buttons.find_button_at(hit.x, hit.y), Some(target));
+            assert_eq!(buttons.find_button_at(hit.x + 2, hit.y),
+                Some(TuiButton::DiscBrowserTrack(index)),
+                "track caption keeps the row's existing click behavior");
+        }
+
+        let mut title = chapter_state(1);
+        title.focus = ExtractFocus::Programs;
+        let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+        let mut buttons = ButtonRenderMap::new();
+        terminal.draw(|frame| draw_programs(frame, &title,
+            Rect::new(2, 3, 104, 8), &mut buttons, theme)).unwrap();
+        let target = TuiButton::DiscBrowserExpand(0);
+        let hit = buttons.button_rect(target).expect("indented stream checkbox hit target");
+        assert_eq!(terminal.backend().buffer().get(hit.x, hit.y).symbol(), "☑");
+        assert_eq!(buttons.find_button_at(hit.x, hit.y), Some(target));
+        assert_eq!(buttons.find_button_at(hit.x + 2, hit.y), Some(target));
+    }
+
+    #[test]
+    fn r6_options_and_tags_tick_boxes_keep_mouse_hits_on_glyph_and_caption() {
+        let theme = crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        let mut state = sacd_state(false, false);
+        for (width, height) in [(72, 24), (154, 40)] {
+            for panel in [ExtractPanel::Options, ExtractPanel::Chapters,
+                ExtractPanel::CueFiles, ExtractPanel::CopyFolder] {
+                state.panel = Some(panel);
+                let choices = state.option_controls();
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                let mut buttons = ButtonRenderMap::new();
+                terminal.draw(|frame| draw(frame, &state, Path::new("/tmp"),
+                    &mut buttons, theme)).unwrap();
+                let mut tick_count = 0;
+                for (index, control) in choices.iter().enumerate() {
+                    let (text, _) = extract_option_display(&state, *control);
+                    let Some(mark) = text.chars().next().filter(|mark|
+                        matches!(*mark, '☐' | '☑')) else { continue; };
+                    let target = TuiButton::DiscBrowserOptionControl(index);
+                    let hit = buttons.button_rect(target).expect("option checkbox target");
+                    assert!(hit.width >= 3, "{panel:?} checkbox caption has a hit target");
+                    let expected = if mark == '☑' { "☑" } else { "☐" };
+                    assert_eq!(terminal.backend().buffer().get(hit.x, hit.y).symbol(),
+                        expected, "{panel:?} {control:?}");
+                    assert_eq!(buttons.find_button_at(hit.x, hit.y), Some(target));
+                    assert_eq!(buttons.find_button_at(hit.x + 2, hit.y), Some(target));
+                    tick_count += 1;
+                }
+                assert!(tick_count > 0, "{panel:?} has visible tick boxes");
+            }
+        }
+
+        for transfer in [false, true] {
+            state.tags = transfer;
+            state.tag_fields = 0b010101010;
+            state.panel = Some(ExtractPanel::Tags);
+            let controls = state.tag_sheet_controls();
+            let mut terminal = Terminal::new(TestBackend::new(132, 44)).unwrap();
+            let mut buttons = ButtonRenderMap::new();
+            terminal.draw(|frame| draw_tags_sheet(frame, &state,
+                Rect::new(6, 5, 116, 33), &mut buttons, theme)).unwrap();
+            let checked = if transfer {
+                vec![TagSheetControl::Transfer, TagSheetControl::Field(0),
+                    TagSheetControl::Field(1), TagSheetControl::Artwork]
+            } else { vec![TagSheetControl::Transfer] };
+            for control in checked {
+                let index = controls.iter().position(|entry| *entry == control).unwrap();
+                let target = TuiButton::DiscBrowserTagSheetControl(index);
+                let hit = buttons.button_rect(target).expect("Tags checkbox target");
+                let on = match control {
+                    TagSheetControl::Transfer => transfer,
+                    TagSheetControl::Field(i) => state.tag_fields & (1u16 << i) != 0,
+                    TagSheetControl::Artwork => state.tag_artwork,
+                    _ => unreachable!(),
+                };
+                assert_eq!(terminal.backend().buffer().get(hit.x, hit.y).symbol(), check(on));
+                assert_eq!(buttons.find_button_at(hit.x, hit.y), Some(target));
+                assert_eq!(buttons.find_button_at(hit.x + 2, hit.y), Some(target));
+            }
+        }
     }
 
     fn render_header(state: &DiscBrowserState, width: u16, small: bool) -> (Vec<String>, Terminal<TestBackend>) {
@@ -3163,6 +3348,56 @@ mod extract_r3_render_tests {
     }
 
     #[test]
+    fn round_5_downmix_arrows_have_stable_positions_and_click_targets() {
+        use crate::convert::pipeline::DvdaDownmixPolicy as Policy;
+        let theme=crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        let mut state=sacd_state(false,false);
+        state.contents.format=DiscFormat::DvdAudio;
+        state.contents.presentations[0].format.channels=Some(6);
+        state.focus=ExtractFocus::Output;
+        let index=state.output_rows().iter().position(|name|*name=="Downmix")
+            .expect("DVD-A multichannel Downmix row");
+        state.output_cursor=index;
+        let max_value=crate::tui::disc_browser_actions::NATIVE_DVDA_DOWNMIX_POLICIES.iter()
+            .map(|policy|policy.as_str().len() as u16).max().unwrap();
+        for (area,wide) in [(Rect::new(2,3,150,10),true),
+            (Rect::new(2,3,78,12),false),
+            (Rect::new(2,3,36,12),false)] {
+            let mut positions=None;
+            for policy in [Policy::None,Policy::Auto,
+                Policy::FooInputDvdaCompatible,Policy::FfmpegDefault] {
+                state.downmix=policy;
+                let mut terminal=Terminal::new(TestBackend::new(155,20)).unwrap();
+                let mut buttons=ButtonRenderMap::new();
+                terminal.draw(|frame|draw_output(frame,&state,area,&mut buttons,theme,wide)).unwrap();
+                let prev=buttons.button_rect(TuiButton::DiscBrowserDownmixPrev)
+                    .expect("left Downmix arrow");
+                let next=buttons.button_rect(TuiButton::DiscBrowserDownmixNext)
+                    .expect("right Downmix arrow");
+                let field=buttons.button_rect(TuiButton::DiscBrowserToggle(index))
+                    .expect("Downmix value field");
+                assert_eq!(next.x-prev.x,max_value.min(field.width-4)+3);
+                assert!(next.right()<=field.right());
+                assert_eq!(prev.y,next.y);
+                assert_eq!(terminal.backend().buffer().get(prev.x,prev.y).symbol(),"◂");
+                assert_eq!(terminal.backend().buffer().get(next.x,next.y).symbol(),"▸");
+                assert_eq!(buttons.find_button_at(prev.x,prev.y),
+                    Some(TuiButton::DiscBrowserDownmixPrev));
+                assert_eq!(buttons.find_button_at(next.x,next.y),
+                    Some(TuiButton::DiscBrowserDownmixNext));
+                if field.width>=max_value+4 {
+                    let rendered=(prev.x+2..prev.x+2+policy.as_str().len() as u16)
+                        .map(|x|terminal.backend().buffer().get(x,prev.y).symbol().to_owned())
+                        .collect::<Vec<_>>().concat();
+                    assert_eq!(rendered,policy.as_str());
+                }
+                if let Some(previous)=positions { assert_eq!((prev,next),previous); }
+                else {positions=Some((prev,next));}
+            }
+        }
+    }
+
+    #[test]
     fn r22_optional_dvda_controls_fit_the_wide_form() {
         let theme = crate::tui::theme::theme_by_slug_or_default("tokyo-night");
         let mut state = sacd_state(false, false);
@@ -3182,6 +3417,149 @@ mod extract_r3_render_tests {
         state.contents.presentations[0].format.channels = Some(6);
         assert_eq!(state.wide_output_height(), 9);
         assert!(state.output_rows().contains(&"Downmix"));
+    }
+
+    #[test]
+    fn round_2_naming_result_prefers_authored_name_without_paging() {
+        use crate::tui::app::{TemplateBuilderFocus, TemplateBuilderState, TemplateTarget};
+        let theme = crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        let mut state = sacd_state(false, false);
+        state.destination = std::path::PathBuf::from(
+            "/home/user/Music/Extracted/A Carefully Organized Listening Library");
+        state.contents.album_artist = Some("pink floyd and the very long ensemble name".into());
+        state.contents.album_title = Some("wish you were here and other remarkable recordings".into());
+        state.contents.year = Some("1975".into());
+        state.contents.presentations[0].tracks[0].title = Some(
+            "shine on you crazy diamond parts one through nine and a long bonus title".into());
+        state.naming_template =
+            "%ALBUM_ARTIST% - %ALBUM% (%YEAR%)/%TRACKNUMBER% - %TITLE%".into();
+        state.focus = ExtractFocus::Output;
+        state.output_cursor = state.output_rows().iter().position(|row| *row == "Naming").unwrap();
+        for (width, height) in [(80u16, 24u16), (100, 30)] {
+            for capitalize in [false, true] {
+                state.capitalize_naming = capitalize;
+                let full_path = state.native_preview_path_for_template_case(
+                    &state.naming_template, capitalize).unwrap();
+                let name = state.native_preview_naming_for_template_case(
+                    &state.naming_template, capitalize).unwrap();
+                assert!(full_path.starts_with(&state.destination));
+                assert!(name.ends_with(".dsf"));
+                assert!(!name.contains("/home/user/"));
+
+                let display = crate::tui::template_builder::destination_path_preview(
+                    &full_path, &state.destination, width.saturating_sub(8) as usize,
+                    || Some(name.clone()));
+                assert!(!display.starts_with("/home/user/Music/Extracted/"),
+                    "a long destination should give priority to the generated name");
+                let name_prefix = name.chars().take(12).collect::<String>();
+                assert!(display.contains(name_prefix.as_str()));
+                assert!(crate::tui::display_width::width(&display)
+                    <= width.saturating_sub(8) as usize);
+
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                let mut builder = TemplateBuilderState::new(
+                    TemplateTarget::Filename, &state.naming_template,
+                    TemplateBuilderFocus::TemplateInput);
+                builder.return_to_extract = Some(Box::new(state.clone()));
+                builder.capitalize = capitalize;
+                let popup = crate::tui::template_builder::builder_popup(
+                    Rect::new(0, 0, width, height), &builder).unwrap();
+                let mut buttons = ButtonRenderMap::new();
+                terminal.draw(|frame|crate::tui::template_builder::draw_template_builder(
+                    frame, &builder, &mut buttons, theme)).unwrap();
+                let row_y = popup.y + 4;
+                let row = (popup.x+1..popup.x+popup.width-1)
+                    .map(|x| terminal.backend().buffer().get(x,row_y).symbol().to_owned())
+                    .collect::<Vec<_>>().join("");
+                assert!(row.contains(name_prefix.as_str()),
+                    "Custom preview shows the name rather than destination: {row}");
+                assert!(!row.contains("/home/user/"), "Custom must not show the destination");
+                for button in [TuiButton::TemplateBuilderApply, TuiButton::TemplateBuilderSave,
+                    TuiButton::TemplateBuilderSavedTemplates, TuiButton::TemplateBuilderClear] {
+                    let rect = buttons.button_rect(button).expect("Custom footer must remain visible");
+                    assert_eq!(buttons.find_button_at(rect.x, rect.y), Some(button));
+                }
+
+                // Check the real Extract popup as well as its standalone Naming row:
+                // responsive tabs and the rest of its footer retain their hitboxes.
+                buttons.clear();
+                terminal.draw(|frame|draw(frame, &state, Path::new("/tmp"), &mut buttons, theme)).unwrap();
+                for button in [TuiButton::DiscBrowserConvert, TuiButton::DiscBrowserOptions,
+                    TuiButton::DiscBrowserClose] {
+                    let rect = buttons.button_rect(button).expect("Extract footer must remain visible");
+                    assert_eq!(buttons.find_button_at(rect.x, rect.y), Some(button));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn round_2_two_sacd_areas_keep_complete_authored_name_on_overflow() {
+        // Use the same two-area SACD layout as the draft-folder regression.
+        let mut contents = sacd_state(false, false).contents;
+        contents.presentations[0].label = "Stereo".into();
+        let mut multi = contents.presentations[0].clone();
+        multi.id = PresentationId::SacdArea(SacdAreaId::MultiChannel);
+        multi.label = "Multichannel".into();
+        contents.presentations.push(multi);
+        contents.album_title = Some("wish you were here".into());
+        for presentation in &mut contents.presentations {
+            presentation.tracks[0].title = Some("shine on you crazy diamond".into());
+        }
+        let mut state = DiscBrowserState::new(contents, "disc.iso".into());
+        state.destination = "/home/user/Music/Extracted/Long Collection".into();
+        state.naming_template = "%ALBUM%/%TRACKNUMBER% - %TITLE%".into();
+        state.cursor = 1;
+        state.focus = ExtractFocus::Output;
+        state.output_cursor = state.output_rows().iter().position(|row| *row == "Naming").unwrap();
+        assert_eq!(state.native_job(std::path::PathBuf::new()).programs.len(), 2);
+
+        use crate::tui::display_width::width;
+        let theme = crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        let mut uncased = None;
+        for capitalize in [false, true] {
+            state.capitalize_naming = capitalize;
+            let path = state.native_preview_path().unwrap();
+            let authored = state.native_preview_naming_for_template_case(
+                &state.naming_template, capitalize).unwrap();
+            if !capitalize { uncased = Some(authored.clone()); }
+            else { assert_ne!(Some(&authored), uncased.as_ref()); }
+            assert!(path.starts_with(state.destination.join("Multichannel")), "{}", path.display());
+            assert!(path.ends_with(Path::new(&authored)), "{} vs {authored}", path.display());
+
+            let relative = path.strip_prefix(&state.destination).unwrap().to_string_lossy();
+            let cells = width(&authored) + 6;
+            assert!(width(&relative) > cells);
+            let visible = crate::tui::template_builder::destination_path_preview(
+                &path, &state.destination, cells, || Some(authored.clone()));
+            assert!(visible.ends_with(&authored), "{visible}");
+            assert!(visible.contains(".../"), "{visible}");
+            assert!(width(&visible) <= cells);
+
+            // The actual Naming row uses the same overflow path. Its width
+            // is chosen to fit the authored result but not the program folder.
+            let area = Rect::new(2, 2, (cells + 6) as u16, 18);
+            let rows = state.output_rows();
+            let naming = output_cell("Naming", state.output_cursor, &rows, area, false,
+                state.output_cursor).unwrap();
+            assert_eq!(naming.width as usize - 2, cells);
+            let mut terminal = Terminal::new(TestBackend::new(area.right() + 2, 23)).unwrap();
+            terminal.draw(|frame| draw_output_with_hover(frame, &state, area,
+                &mut ButtonRenderMap::new(), theme, false, None)).unwrap();
+            let caption = (naming.x..naming.right())
+                .map(|x| terminal.backend().buffer().get(x, naming.y + 1).symbol().to_owned())
+                .collect::<Vec<_>>().concat();
+            assert!(caption.contains(&authored), "{caption}");
+            assert!(caption.contains(".../"), "{caption}");
+        }
+
+        // An explicit area token removes automatic program folders; the
+        // authored result remains the actual worker-relative path.
+        let explicit = "%AREA%/%ALBUM%/%TRACKNUMBER% - %TITLE%";
+        let actual = state.native_preview_path_for_template(explicit).unwrap();
+        let authored = state.native_preview_naming_for_template_case(
+            explicit, state.capitalize_naming).unwrap();
+        assert_eq!(actual.strip_prefix(&state.destination).unwrap(), Path::new(&authored));
     }
 
     #[test]
@@ -3334,7 +3712,7 @@ mod extract_r3_render_tests {
         terminal.draw(|frame| draw_output_with_hover(frame, &state, area,
             &mut buttons, theme, true, Some(TuiButton::DiscBrowserNamingLoad))).unwrap();
         let hovered = buttons.button_rect(TuiButton::DiscBrowserNamingLoad)
-            .expect("Load preset visible");
+            .expect("Load template visible");
         assert_eq!(buttons.find_button_at(hovered.x, hovered.y),
             Some(TuiButton::DiscBrowserNamingLoad));
         assert_eq!(terminal.backend().buffer().get(hovered.x, hovered.y).bg,
@@ -4069,14 +4447,14 @@ mod extract_r3_render_tests {
                         "radio groups must share a choice column");
                 },
                 ExtractPanel::CopyFolder => {
-                    assert!(row("▸ Copy folder contents")<row("☒ Artwork"));
-                    let first=row("☒ Artwork");
-                    assert!(lines[first].contains("☒ Art folders") &&
-                        lines[first].contains("☒ .log") && lines[first].contains("☐ .cue"));
-                    let second=row("☒ .txt");
+                    assert!(row("▸ Copy folder contents")<row("☑ Artwork"));
+                    let first=row("☑ Artwork");
+                    assert!(lines[first].contains("☑ Art folders") &&
+                        lines[first].contains("☑ .log") && lines[first].contains("☐ .cue"));
+                    let second=row("☑ .txt");
                     assert_eq!(second,first+1);
-                    assert!(lines[second].contains("☒ .nfo") && lines[second].contains("☒ .md") &&
-                        lines[second].contains("☒ .pdf"));
+                    assert!(lines[second].contains("☑ .nfo") && lines[second].contains("☑ .md") &&
+                        lines[second].contains("☑ .pdf"));
                     assert!(lines[second+1].contains("☐ .md5") &&
                         lines[second+1].contains("☐ Everything else"));
                     assert!(row("Artwork: image files beside the CUE image.")>second+1);

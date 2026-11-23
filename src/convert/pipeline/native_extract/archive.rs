@@ -45,9 +45,12 @@ pub(super) fn proposed_archive_destination(
     // member's own catalog only for this naming call; no other source changes.
     let mut identity=job.disc_identity.clone();
     identity.catalog=named_track.tags.catalog.clone();
-    let stem = render_naming_template_for_extension(
+    let mut stem = render_naming_template_for_extension(
         &job.naming_template, &named_program, &named_track, extension, &identity,
     );
+    if job.capitalize_naming {
+        stem = crate::convert::renaming::capitalize_naming_path(&stem, Some(extension));
+    }
     job.destination.join(parent).join(with_native_extension(stem, extension))
 }
 
@@ -280,6 +283,23 @@ mod tests {
         job.archive_members[0].tagged_audio = false;
         assert_eq!(proposed_archive_destination(&job, &job.programs[0],
             &job.programs[0].tracks[0]), job.destination.join("Disc 1/01 - original.mp3"));
+    }
+
+    #[test]
+    fn round_2_archive_builder_preview_excludes_original_member_parent() {
+        let (_root, mut job)=archive_job();
+        job.transfer_tags=true;
+        job.tag_fields=0x1ff;
+        job.naming_template="%TRACKNUMBER%/%TITLE%".into();
+        let program=&job.programs[0];
+        let track=&program.tracks[0];
+        assert_eq!(proposed_archive_destination(&job,program,track),
+            job.destination.join("Disc 1/07/From embedded tags.mp3"));
+        assert_eq!(super::super::authored_template_name_for_archive(&job,program,track),
+            "07/From embedded tags.mp3");
+        job.transfer_tags=false;
+        assert_eq!(super::super::authored_template_name_for_archive(
+            &job,&job.programs[0],&job.programs[0].tracks[0]),"01 - original.mp3");
     }
 
     #[test]

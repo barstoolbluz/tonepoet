@@ -6545,10 +6545,14 @@ impl CachedProbeRow {
         let metadata = SourceMetadata {
             title: self.title.clone(),
             artist: self.artist.clone(),
+            album_artist: None, // Existing on-disk probe cache has no extended tag fields.
+            composer: None,
             album: self.album.clone(),
             genre: self.genre.clone(),
             year: self.year.clone(),
             track_number: self.track_number,
+            disc_number: None, // The existing probe cache does not store disc evidence.
+            disc_total: None,
             catalog_number: self.catalog_number.clone(),
             convert_preemphasis: Default::default(), // Narrow Convert evidence is not persisted in this cache row.
             rg_track_gain: self.rg_track_gain.clone(),

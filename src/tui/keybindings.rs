@@ -3961,7 +3961,7 @@ fn convert_output_options_field_value(
                 .unwrap_or_default(),
         ),
         OutputOptionsField::FolderTemplate => Some(output.folder_template.clone()),
-        OutputOptionsField::FilenameTemplate => Some(output.filename_template.clone()),
+        OutputOptionsField::FilenameTemplate => Some(output.naming_template()),
         OutputOptionsField::MergeMode => Some(output.merge.selected_label().to_string()),
         OutputOptionsField::CompanionExtensions => Some(output.companion_extensions.clone()),
         OutputOptionsField::CompanionFolders => Some(output.companion_folders.clone()),
@@ -4938,7 +4938,7 @@ fn output_options_field_value(app: &AppState, field: OutputOptionsField) -> Stri
             .map(|p| p.display().to_string())
             .unwrap_or_default(),
         OutputOptionsField::FolderTemplate => app.convert.output_options.folder_template.clone(),
-        OutputOptionsField::FilenameTemplate => app.convert.output_options.filename_template.clone(),
+        OutputOptionsField::FilenameTemplate => app.convert.output_options.naming_template(),
         OutputOptionsField::CompanionExtensions => app.convert.output_options.companion_extensions.clone(),
         OutputOptionsField::CompanionFolders => app.convert.output_options.companion_folders.clone(),
         OutputOptionsField::ExcludeFiles => app.convert.output_options.companion_exclude_files.clone(),
@@ -4995,7 +4995,8 @@ fn commit_output_options_inline_edit(app: &mut AppState) {
             app.preset.mark_modified();
         }
         OutputOptionsField::FilenameTemplate => {
-            app.convert.output_options.filename_template = trimmed.to_string();
+            let capitalize = app.convert.output_options.filename_template_capitalize;
+            app.convert.output_options.set_naming_template(trimmed, capitalize);
             app.preset.mark_modified();
         }
         OutputOptionsField::CompanionExtensions => {
@@ -7186,14 +7187,15 @@ mod inline_edit_behavior_tests {
     fn output_inline_escape_cancels_without_mutating_value() {
         let (tx, _rx) = channel();
         let mut app = convert_output_app();
-        app.convert.output_options.folder_template = "original".to_string();
-        begin_output_options_inline_edit(&mut app, OutputOptionsField::FolderTemplate, None);
+        app.convert.output_options.set_naming_template("original/track", true);
+        begin_output_options_inline_edit(&mut app, OutputOptionsField::FilenameTemplate, None);
         app.convert.output_options.edit_input.set_text_and_cursor("edited".to_string(), "edited".len());
 
         handle_key(&mut app, key(KeyCode::Esc), &tx);
 
         assert_eq!(app.convert.output_options.editing, None);
-        assert_eq!(app.convert.output_options.folder_template, "original");
+        assert_eq!(app.convert.output_options.naming_template(), "original/track");
+        assert!(app.convert.output_options.filename_template_capitalize);
     }
 
     #[test]
@@ -12900,232 +12902,213 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             }
         }
         ActiveOverlay::TemplateBuilder(mut state) => {
+            use super::app::TemplateSaveFocus as SF;
+            if let Some(dialog)=state.save_dialog.as_mut() {
+                let mut requested_save=None;
+                let mut close_dialog=false;
+                match key.code {
+                    KeyCode::Esc => {close_dialog=true;},
+                    KeyCode::Tab | KeyCode::BackTab => {
+                        let backward=key.code==KeyCode::BackTab;
+                        dialog.focus=match (dialog.focus,backward,dialog.original_name.is_some()) {
+                            (SF::Name,false,true)=>SF::Overwrite,
+                            (SF::Name,false,false)=>SF::SaveNew,
+                            (SF::Overwrite,false,_)=>SF::SaveNew,
+                            (SF::SaveNew,false,_)=>SF::Cancel,
+                            (SF::Cancel,false,_)=>SF::Name,
+                            (SF::Name,true,_)=>SF::Cancel,
+                            (SF::Cancel,true,_)=>SF::SaveNew,
+                            (SF::SaveNew,true,true)=>SF::Overwrite,
+                            (SF::SaveNew,true,false)=>SF::Name,
+                            (SF::Overwrite,true,_)=>SF::Name,
+                        };
+                    },
+                    KeyCode::Enter => match dialog.focus {
+                        SF::Name | SF::SaveNew => requested_save=Some(false),
+                        SF::Overwrite => requested_save=Some(true),
+                        SF::Cancel => close_dialog=true,
+                    },
+                    KeyCode::Char(' ') if dialog.focus!=SF::Name => match dialog.focus {
+                        SF::Overwrite=>requested_save=Some(true),
+                        SF::SaveNew=>requested_save=Some(false),
+                        SF::Cancel=>close_dialog=true,
+                        SF::Name=>{},
+                    },
+                    _ if dialog.focus==SF::Name => {
+                        super::text_input::handle_text_input_key(&mut dialog.name_input,&key);
+                        dialog.error=None;
+                    },
+                    _=>{},
+                }
+                if close_dialog { state.save_dialog=None; }
+                if let Some(overwrite)=requested_save {submit_builder_save(app,&mut state,overwrite);}
+                app.active_overlay=ActiveOverlay::TemplateBuilder(state);
+                return;
+            }
+            if key.modifiers==KeyModifiers::ALT {
+                match key.code {
+                    KeyCode::Char('s' | 'S')=>{
+                        activate_builder_footer(app,state,1);return;
+                    },
+                    KeyCode::Char('l' | 'L')=>{
+                        activate_builder_footer(app,state,2);return;
+                    },
+                    KeyCode::Char('a' | 'A')=>{
+                        activate_builder_footer(app,state,0);return;
+                    },
+                    KeyCode::Char('c' | 'C')=>{
+                        activate_builder_footer(app,state,3);return;
+                    },
+                    _=>{},
+                }
+            }
+            if key.modifiers==KeyModifiers::CONTROL && key.code==KeyCode::Char('s') {
+                activate_builder_footer(app,state,1);
+                return;
+            }
             match state.focus {
                 TemplateBuilderFocus::TemplateInput => match key.code {
-                    KeyCode::Esc => {
-                        close_shared_template(app, state.return_to_extract.take());
-                    }
+                    KeyCode::Esc => close_shared_template(app,state.return_to_extract.take()),
                     KeyCode::Tab => {
-                        state.focus = TemplateBuilderFocus::SavedList;
-                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
-                    }
-                    KeyCode::Enter => {
-                        let text = state.template_input.text.clone();
-                        apply_shared_template(app, state.target, text,
-                            state.return_to_extract.take());
-                    }
-                    _ => {
-                        super::text_input::handle_text_input_key(&mut state.template_input, &key);
-                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
-                    }
-                },
-                TemplateBuilderFocus::SavedList => match key.code {
-                    KeyCode::Esc => {
-                        close_shared_template(app, state.return_to_extract.take());
-                    }
-                    KeyCode::Tab => {
-                        state.focus = TemplateBuilderFocus::TokenGrid;
-                        let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
-                        state.reveal_grid_cursor(ratatui::layout::Rect::new(0, 0, w, h));
-                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
-                    }
+                        state.focus=TemplateBuilderFocus::Capitalization;
+                        app.active_overlay=ActiveOverlay::TemplateBuilder(state);
+                    },
                     KeyCode::BackTab => {
-                        state.focus = TemplateBuilderFocus::TemplateInput;
-                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        if state.saved_selected > 0 {
-                            state.saved_selected -= 1;
-                        }
-                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if state.saved_selected + 1 < state.saved_templates.len() {
-                            state.saved_selected += 1;
-                        }
-                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
-                    }
-                    KeyCode::Enter => {
-                        // Load selected template into the input line
-                        if let Some(tmpl) = state.saved_templates.get(state.saved_selected).cloned()
-                        {
-                            state.template_input = super::text_input::TextInputState::new(tmpl);
-                            state.template_input.cursor = state.template_input.text.len();
-                            state.focus = TemplateBuilderFocus::TemplateInput;
-                        }
-                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
-                    }
-                    KeyCode::Char('x') | KeyCode::Delete => {
-                        // Delete selected saved template
-                        if let Some(tmpl) = state.saved_templates.get(state.saved_selected).cloned()
-                        {
-                            let _ = super::template_builder::delete_template(state.target, &tmpl);
-                            state.saved_templates =
-                                super::template_builder::list_templates(state.target);
-                            if state.saved_selected >= state.saved_templates.len()
-                                && state.saved_selected > 0
-                            {
-                                state.saved_selected -= 1;
-                            }
-                            app.set_status("Template deleted");
-                        }
-                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
-                    }
-                    _ => {
-                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
-                    }
+                        state.focus=TemplateBuilderFocus::Footer(3);
+                        app.active_overlay=ActiveOverlay::TemplateBuilder(state);
+                    },
+                    KeyCode::Enter => apply_shared_template(app,state.target,
+                        state.template_input.text.clone(),state.capitalize,state.return_to_extract.take()),
+                    _=>{
+                        super::text_input::handle_text_input_key(&mut state.template_input,&key);
+                        app.active_overlay=ActiveOverlay::TemplateBuilder(state);
+                    },
+                },
+                TemplateBuilderFocus::Capitalization => match key.code {
+                    KeyCode::Esc => close_shared_template(app,state.return_to_extract.take()),
+                    KeyCode::Tab => {
+                        state.focus=TemplateBuilderFocus::TokenGrid;
+                        let (w,h)=crossterm::terminal::size().unwrap_or((80,24));
+                        state.reveal_grid_cursor(ratatui::layout::Rect::new(0,0,w,h));
+                        app.active_overlay=ActiveOverlay::TemplateBuilder(state);
+                    },
+                    KeyCode::BackTab => {
+                        state.focus=TemplateBuilderFocus::TemplateInput;
+                        app.active_overlay=ActiveOverlay::TemplateBuilder(state);
+                    },
+                    KeyCode::Enter | KeyCode::Char(' ') => {
+                        state.capitalize=!state.capitalize;
+                        app.active_overlay=ActiveOverlay::TemplateBuilder(state);
+                    },
+                    _=>app.active_overlay=ActiveOverlay::TemplateBuilder(state),
                 },
                 TemplateBuilderFocus::TokenGrid => match key.code {
-                    KeyCode::Esc => {
-                        close_shared_template(app, state.return_to_extract.take());
-                    }
+                    KeyCode::Esc => close_shared_template(app,state.return_to_extract.take()),
                     KeyCode::Tab => {
-                        state.focus = TemplateBuilderFocus::TemplateInput;
-                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
-                    }
+                        state.focus=TemplateBuilderFocus::Footer(0);
+                        app.active_overlay=ActiveOverlay::TemplateBuilder(state);
+                    },
                     KeyCode::BackTab => {
-                        state.focus = TemplateBuilderFocus::SavedList;
-                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
-                    }
-                    KeyCode::Left => {
-                        state.grid_cursor = state.grid_cursor.saturating_sub(1);
-                        let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
-                        state.reveal_grid_cursor(ratatui::layout::Rect::new(0, 0, w, h));
-                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
-                    }
-                    KeyCode::Right => {
-                        state.grid_cursor = (state.grid_cursor + 1).min(state.total_grid_items().saturating_sub(1));
-                        let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
-                        state.reveal_grid_cursor(ratatui::layout::Rect::new(0, 0, w, h));
-                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
-                    }
+                        state.focus=TemplateBuilderFocus::Capitalization;
+                        app.active_overlay=ActiveOverlay::TemplateBuilder(state);
+                    },
+                    KeyCode::Left | KeyCode::Right => {
+                        if key.code==KeyCode::Left {state.grid_cursor=state.grid_cursor.saturating_sub(1);}
+                        else {state.grid_cursor=(state.grid_cursor+1).min(state.total_grid_items().saturating_sub(1));}
+                        let (w,h)=crossterm::terminal::size().unwrap_or((80,24));
+                        state.reveal_grid_cursor(ratatui::layout::Rect::new(0,0,w,h));
+                        app.active_overlay=ActiveOverlay::TemplateBuilder(state);
+                    },
                     KeyCode::Enter => {
                         state.insert_current_grid_item();
-                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
-                    }
-                    _ => {
-                        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
-                    }
+                        app.active_overlay=ActiveOverlay::TemplateBuilder(state);
+                    },
+                    _=>app.active_overlay=ActiveOverlay::TemplateBuilder(state),
+                },
+                TemplateBuilderFocus::Footer(index) => match key.code {
+                    KeyCode::Esc => close_shared_template(app,state.return_to_extract.take()),
+                    KeyCode::Tab => {
+                        state.focus=if index==3 {TemplateBuilderFocus::TemplateInput}
+                            else {TemplateBuilderFocus::Footer(index+1)};
+                        app.active_overlay=ActiveOverlay::TemplateBuilder(state);
+                    },
+                    KeyCode::BackTab => {
+                        state.focus=if index==0 {TemplateBuilderFocus::TokenGrid}
+                            else {TemplateBuilderFocus::Footer(index-1)};
+                        app.active_overlay=ActiveOverlay::TemplateBuilder(state);
+                    },
+                    KeyCode::Left => {
+                        state.focus=TemplateBuilderFocus::Footer(index.saturating_sub(1));
+                        app.active_overlay=ActiveOverlay::TemplateBuilder(state);
+                    },
+                    KeyCode::Right => {
+                        state.focus=TemplateBuilderFocus::Footer((index+1).min(3));
+                        app.active_overlay=ActiveOverlay::TemplateBuilder(state);
+                    },
+                    KeyCode::Enter | KeyCode::Char(' ') => activate_builder_footer(app,state,index),
+                    _=>app.active_overlay=ActiveOverlay::TemplateBuilder(state),
                 },
             }
         }
         ActiveOverlay::TemplatePicker {
-            target,
-            templates,
-            mut selected,
-            mut scroll,
-            active_template,
-            mut return_to_extract,
-            ..
+            target,mut templates,mut selected,mut scroll,
+            mut preview,active_template,active_capitalization,
+            mut return_to_extract,mut return_to_builder,
         } => {
-            let count = templates.len();
-            match key.code {
+            let count=templates.len();
+            let refresh=match key.code {
                 KeyCode::Esc => {
-                    close_shared_template(app, return_to_extract.take());
-                }
+                    if let Some(builder)=return_to_builder.take() {
+                        app.active_overlay=ActiveOverlay::TemplateBuilder(builder);
+                    } else {close_shared_template(app,return_to_extract.take());}
+                    return;
+                },
                 KeyCode::Up | KeyCode::Char('k') => {
-                    if selected > 0 {
-                        selected -= 1;
-                        if selected < scroll {
-                            scroll = selected;
-                        }
-                    }
-                    let preview = if let Some(tmpl) = templates.get(selected) {
-                        super::template_builder::render_template_preview(tmpl)
-                    } else {
-                        String::new()
-                    };
-                    app.active_overlay = ActiveOverlay::TemplatePicker {
-                        target,
-                        templates,
-                        selected,
-                        scroll,
-                        preview,
-                        active_template,
-                        return_to_extract,
-                    };
-                }
+                    selected=selected.saturating_sub(1);
+                    if selected<scroll {scroll=selected;}
+                    true
+                },
                 KeyCode::Down | KeyCode::Char('j') => {
-                    if count > 0 && selected + 1 < count {
-                        selected += 1;
-                        // Scroll follows selection: assume ~10 visible rows
-                        let visible = 10_usize;
-                        if selected >= scroll + visible {
-                            scroll = selected.saturating_sub(visible - 1);
-                        }
-                    }
-                    let preview = if let Some(tmpl) = templates.get(selected) {
-                        super::template_builder::render_template_preview(tmpl)
-                    } else {
-                        String::new()
-                    };
-                    app.active_overlay = ActiveOverlay::TemplatePicker {
-                        target,
-                        templates,
-                        selected,
-                        scroll,
-                        preview,
-                        active_template,
-                        return_to_extract,
-                    };
-                }
+                    if selected+1<count {selected+=1;}
+                    let height=crossterm::terminal::size().map(|(_,h)|h).unwrap_or(24);
+                    let content_h=(9+count.max(1)) as u16;
+                    let window_h=content_h.min(height*60/100).max(8);
+                    let visible=window_h.saturating_sub(7).max(1) as usize;
+                    if selected>=scroll+visible {scroll=selected+1-visible;}
+                    true
+                },
                 KeyCode::Enter => {
-                    if let Some(tmpl) = templates.get(selected).cloned() {
-                        apply_shared_template(app,target,tmpl,return_to_extract.take());
-                    } else {
-                        // Empty preset library is not an Apply operation.
-                        app.active_overlay=ActiveOverlay::TemplatePicker {
-                            target,templates,selected,scroll,preview:String::new(),
-                            active_template,return_to_extract,
-                        };
+                    if let Some(tmpl)=templates.get(selected).cloned() {
+                        select_shared_template(app,target,tmpl,return_to_extract.take(),
+                            return_to_builder.take());
+                        return;
                     }
-                }
+                    false
+                },
                 KeyCode::Delete => {
-                    if let Some(tmpl) = templates.get(selected).cloned() {
-                        let _ =
-                            super::template_builder::delete_template(target, &tmpl);
-                        let new_templates =
-                            super::template_builder::list_templates(target);
-                        if selected >= new_templates.len() && selected > 0 {
-                            selected -= 1;
+                    if let Some(tmpl)=templates.get(selected) {
+                        match super::template_builder::delete_template(target,&tmpl.name) {
+                            Ok(())=>{
+                                templates=super::template_builder::list_templates(target);
+                                selected=selected.min(templates.len().saturating_sub(1));
+                                scroll=scroll.min(selected);
+                                app.set_status("Template deleted");
+                            },
+                            Err(error)=>app.set_status(format!("Delete failed: {error}")),
                         }
-                        if scroll > 0 && scroll >= new_templates.len() {
-                            scroll = new_templates.len().saturating_sub(1);
-                        }
-                        let preview = if let Some(tmpl) = new_templates.get(selected) {
-                            super::template_builder::render_template_preview(tmpl)
-                        } else {
-                            String::new()
-                        };
-                        app.set_status("Template deleted");
-                        app.active_overlay = ActiveOverlay::TemplatePicker {
-                            target,
-                            templates: new_templates,
-                            selected,
-                            scroll,
-                            preview,
-                            active_template,
-                            return_to_extract,
-                        };
-                    } else {
-                        app.active_overlay = ActiveOverlay::TemplatePicker {
-                            target, templates, selected, scroll,
-                            preview: String::new(), active_template, return_to_extract,
-                        };
                     }
-                }
-                _ => {
-                    app.active_overlay = ActiveOverlay::TemplatePicker {
-                        target,
-                        templates,
-                        selected,
-                        scroll,
-                        preview: String::new(),
-                        active_template,
-                        return_to_extract,
-                    };
-                }
+                    true
+                },
+                _=>false,
+            };
+            if refresh {
+                preview=picker_preview(&templates,selected,return_to_extract.as_deref(),
+                    return_to_builder.as_deref(),app.convert.format.selected_extension());
             }
+            app.active_overlay=ActiveOverlay::TemplatePicker {
+                target,templates,selected,scroll,preview,active_template,
+                active_capitalization,return_to_extract,return_to_builder,
+            };
         }
         ActiveOverlay::MetadataEditor(_) => {
             unreachable!("metadata editor is handled by the owned fast path above")
@@ -49934,15 +49917,21 @@ fn close_shared_template(app:&mut AppState,
         .unwrap_or(ActiveOverlay::None);
 }
 
-fn apply_shared_template(app:&mut AppState,target:TemplateTarget,template:String,
+fn apply_shared_template(app:&mut AppState,target:TemplateTarget,template:String,capitalize:bool,
     return_to_extract:Option<Box<crate::tui::disc_browser::DiscBrowserState>>) {
     if let Some(mut browser)=return_to_extract {
         browser.naming_template=template;
+        browser.capitalize_naming=capitalize;
         app.active_overlay=ActiveOverlay::DiscBrowser(browser);
     } else {
         match target {
-            TemplateTarget::Folder=>app.convert.output_options.folder_template=template,
-            TemplateTarget::Filename=>app.convert.output_options.filename_template=template,
+            TemplateTarget::Folder=>{
+                app.convert.output_options.folder_template=template;
+                app.convert.output_options.folder_template_capitalize=capitalize;
+            },
+            TemplateTarget::Filename=>{
+                app.convert.output_options.set_naming_template(&template, capitalize);
+            },
         }
         app.preset.mark_modified();
         app.active_overlay=ActiveOverlay::None;
@@ -49950,21 +49939,92 @@ fn apply_shared_template(app:&mut AppState,target:TemplateTarget,template:String
     app.set_status("Template applied");
 }
 
-fn close_current_template_picker(app:&mut AppState) {
-    let overlay=std::mem::replace(&mut app.active_overlay,ActiveOverlay::None);
-    if let ActiveOverlay::TemplatePicker{return_to_extract,..}=overlay {
-        close_shared_template(app,return_to_extract);
-    }else {app.active_overlay=overlay;}
+fn select_shared_template(app:&mut AppState,target:TemplateTarget,
+    template:super::template_builder::NamingTemplate,
+    return_to_extract:Option<Box<crate::tui::disc_browser::DiscBrowserState>>,
+    return_to_builder:Option<Box<super::app::TemplateBuilderState>>) {
+    if let Some(mut builder)=return_to_builder {
+        builder.load_template(template);
+        app.active_overlay=ActiveOverlay::TemplateBuilder(builder);
+    } else {
+        apply_shared_template(app,target,template.pattern,template.capitalize,return_to_extract);
+    }
+}
+
+fn picker_preview(templates:&[super::template_builder::NamingTemplate],selected:usize,
+    return_to_extract:Option<&crate::tui::disc_browser::DiscBrowserState>,
+    return_to_builder:Option<&super::app::TemplateBuilderState>,
+    extension:&str) -> String {
+    let browser=return_to_builder.and_then(|builder|builder.return_to_extract.as_deref())
+        .or(return_to_extract);
+    let extension=return_to_builder.map_or(extension,|builder|builder.output_extension.as_str());
+    templates.get(selected).map(|template|
+        super::template_builder::preview_for_context_with_extension(template,browser,extension))
+        .unwrap_or_default()
+}
+
+fn open_builder_saved_picker(app:&mut AppState,builder:Box<super::app::TemplateBuilderState>) {
+    let target=builder.target;
+    let templates=super::template_builder::list_templates(target);
+    let preview=picker_preview(&templates,0,None,Some(&builder),app.convert.format.selected_extension());
+    let active_template=Some(builder.template_input.text.clone());
+    let active_capitalization=builder.capitalize;
+    app.active_overlay=ActiveOverlay::TemplatePicker {
+        target,templates,selected:0,scroll:0,preview,active_template,active_capitalization,
+        return_to_extract:None,return_to_builder:Some(builder),
+    };
+}
+
+fn submit_builder_save(app:&mut AppState,state:&mut super::app::TemplateBuilderState,
+    overwrite:bool) {
+    let Some(dialog)=state.save_dialog.as_ref() else {return;};
+    let name=if overwrite {
+        let Some(name)=dialog.original_name.as_deref() else {return;};
+        name.to_owned()
+    } else {dialog.name_input.text.trim().to_owned()};
+    match super::template_builder::save_template(state.target,&name,
+        &state.template_input.text,state.capitalize,overwrite) {
+        Ok(())=>{
+            state.loaded_template=Some(super::template_builder::NamingTemplate {
+                name,pattern:state.template_input.text.clone(),capitalize:state.capitalize,
+            });
+            state.save_dialog=None;
+            app.set_status("Template saved");
+        },
+        Err(message)=>{
+            if let Some(dialog)=state.save_dialog.as_mut() {dialog.error=Some(message);}
+        },
+    }
+}
+
+fn activate_builder_footer(app:&mut AppState,
+    mut state:Box<super::app::TemplateBuilderState>,action:usize) {
+    match action {
+        0 => apply_shared_template(app,state.target,state.template_input.text.clone(),
+            state.capitalize,state.return_to_extract.take()),
+        1 => {
+            state.begin_save();
+            app.active_overlay=ActiveOverlay::TemplateBuilder(state);
+        },
+        2 => open_builder_saved_picker(app,state),
+        3 => {
+            state.template_input=super::text_input::TextInputState::empty();
+            state.focus=TemplateBuilderFocus::TemplateInput;
+            app.active_overlay=ActiveOverlay::TemplateBuilder(state);
+        },
+        _ => {app.active_overlay=ActiveOverlay::TemplateBuilder(state);},
+    }
 }
 
 fn open_template_picker(app: &mut AppState, target: TemplateTarget) {
     let templates = super::template_builder::list_templates(target);
     let active = match target {
         TemplateTarget::Folder => Some(app.convert.output_options.folder_template.clone()),
-        TemplateTarget::Filename => Some(app.convert.output_options.filename_template.clone()),
+        TemplateTarget::Filename => Some(app.convert.output_options.naming_template()),
     };
     let preview = if let Some(tmpl) = templates.first() {
-        super::template_builder::render_template_preview(tmpl)
+        super::template_builder::preview_for_context_with_extension(
+            tmpl, None, app.convert.format.selected_extension())
     } else {
         String::new()
     };
@@ -49975,105 +50035,74 @@ fn open_template_picker(app: &mut AppState, target: TemplateTarget) {
         scroll: 0,
         preview,
         active_template: active,
+        active_capitalization: match target {
+            TemplateTarget::Folder => app.convert.output_options.folder_template_capitalize,
+            TemplateTarget::Filename => app.convert.output_options.filename_template_capitalize,
+        },
         return_to_extract:None,
+        return_to_builder:None,
     };
 }
 
 /// Mouse handler for the template picker overlay.
 fn handle_template_picker_mouse(app: &mut AppState, mouse: MouseEvent) {
     use crossterm::event::{MouseButton, MouseEventKind};
-    let mx = mouse.column;
-    let my = mouse.row;
-
-    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
-        return;
-    }
-
-    match app.button_map.find_button_at(mx, my) {
+    if mouse.kind!=MouseEventKind::Down(MouseButton::Left) {return;}
+    let click=app.button_map.find_button_at(mouse.column,mouse.row);
+    let overlay=std::mem::replace(&mut app.active_overlay,ActiveOverlay::None);
+    let ActiveOverlay::TemplatePicker {
+        target,mut templates,mut selected,mut scroll,mut preview,
+        active_template,active_capitalization,mut return_to_extract,mut return_to_builder,
+    }=overlay else {app.active_overlay=overlay;return;};
+    match click {
         Some(TuiButton::TemplatePickerRow(_)) | Some(TuiButton::TemplatePickerApply) => {
-            let click_idx = match app.button_map.find_button_at(mx, my) {
-                Some(TuiButton::TemplatePickerRow(i)) => Some(i),
-                _ => None, // Apply pill → use selected
-            };
-            if let ActiveOverlay::TemplatePicker {
-                target,
-                ref templates,
-                selected,
-                ref mut return_to_extract,
-                ..
-            } = app.active_overlay
-            {
-                let idx = click_idx.unwrap_or(selected);
-                if let Some(tmpl) = templates.get(idx).cloned() {
-                    let owner=return_to_extract.take();
-                    apply_shared_template(app,target,tmpl,owner);
-                }
+            if let Some(TuiButton::TemplatePickerRow(index))=click {selected=index;}
+            if let Some(template)=templates.get(selected).cloned() {
+                select_shared_template(app,target,template,return_to_extract.take(),
+                    return_to_builder.take());
+                return;
             }
-        }
+        },
         Some(TuiButton::TemplatePickerDelete) => {
-            if let ActiveOverlay::TemplatePicker {
-                target,
-                ref templates,
-                mut selected,
-                mut scroll,
-                ref active_template,
-                ref mut return_to_extract,
-                ..
-            } = app.active_overlay
-            {
-                if let Some(tmpl) = templates.get(selected).cloned() {
-                    let _ = super::template_builder::delete_template(target, &tmpl);
-                    let new_templates = super::template_builder::list_templates(target);
-                    if selected >= new_templates.len() && selected > 0 {
-                        selected -= 1;
-                    }
-                    if scroll > 0 && scroll >= new_templates.len() {
-                        scroll = new_templates.len().saturating_sub(1);
-                    }
-                    let preview = if let Some(tmpl) = new_templates.get(selected) {
-                        super::template_builder::render_template_preview(tmpl)
-                    } else {
-                        String::new()
-                    };
-                    let active_template = active_template.clone();
-                    let owner = return_to_extract.take();
-                    app.set_status("Template deleted");
-                    app.active_overlay = ActiveOverlay::TemplatePicker {
-                        target,
-                        templates: new_templates,
-                        selected,
-                        scroll,
-                        preview,
-                        active_template,
-                        return_to_extract:owner,
-                    };
+            if let Some(template)=templates.get(selected) {
+                match super::template_builder::delete_template(target,&template.name) {
+                    Ok(())=>{
+                        templates=super::template_builder::list_templates(target);
+                        selected=selected.min(templates.len().saturating_sub(1));
+                        scroll=scroll.min(selected);
+                        preview=picker_preview(&templates,selected,return_to_extract.as_deref(),
+                            return_to_builder.as_deref(),app.convert.format.selected_extension());
+                        app.set_status("Template deleted");
+                    },
+                    Err(error)=>app.set_status(format!("Delete failed: {error}")),
                 }
             }
-        }
+        },
         Some(TuiButton::TemplatePickerClose) => {
-            close_current_template_picker(app);
-        }
+            if let Some(builder)=return_to_builder.take() {
+                app.active_overlay=ActiveOverlay::TemplateBuilder(builder);
+            } else {close_shared_template(app,return_to_extract.take());}
+            return;
+        },
         _ => {
-            // Click outside or on non-button area — compute bounds and close if outside
-            let area = crossterm::terminal::size().unwrap_or((80, 24));
-            let w = (area.0 * 75 / 100).max(50).min(area.0.saturating_sub(2));
-            let template_count = if let ActiveOverlay::TemplatePicker { ref templates, .. } =
-                app.active_overlay
-            {
-                templates.len()
-            } else {
-                0
-            };
-            let list_rows = template_count.max(1) as u16;
-            let content_h = 2 + 1 + list_rows + 1 + 1 + 1 + 1 + 1 + 1;
-            let h = content_h.min(area.1 * 60 / 100).max(8);
-            let px = (area.0.saturating_sub(w)) / 2;
-            let py = (area.1.saturating_sub(h)) / 2;
-            if mx < px || mx >= px + w || my < py || my >= py + h {
-                close_current_template_picker(app);
+            let (w,h)=crossterm::terminal::size().unwrap_or((80,24));
+            let width=(w*75/100).max(50).min(w.saturating_sub(2));
+            let content_h=9+templates.len().max(1) as u16;
+            let height=content_h.min(h*60/100).max(8);
+            let x=(w.saturating_sub(width))/2;
+            let y=(h.saturating_sub(height))/2;
+            if mouse.column<x || mouse.column>=x+width || mouse.row<y || mouse.row>=y+height {
+                if let Some(builder)=return_to_builder.take() {
+                    app.active_overlay=ActiveOverlay::TemplateBuilder(builder);
+                } else {close_shared_template(app,return_to_extract.take());}
+                return;
             }
-        }
+        },
     }
+    app.active_overlay=ActiveOverlay::TemplatePicker {
+        target,templates,selected,scroll,preview,active_template,active_capitalization,
+        return_to_extract,return_to_builder,
+    };
 }
 
 /// Commit format settings overlay values to FormatState.
@@ -51027,95 +51056,66 @@ fn handle_format_settings_mouse(
 
 fn handle_template_builder_mouse(app: &mut AppState, mouse: MouseEvent) {
     use crossterm::event::{MouseButton, MouseEventKind};
-    let mx = mouse.column;
-    let my = mouse.row;
-
-    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)
-        | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) { return; }
-
-    let mut state = match std::mem::replace(&mut app.active_overlay, ActiveOverlay::None) {
-        ActiveOverlay::TemplateBuilder(s) => s,
-        other => {
-            app.active_overlay = other;
-            return;
-        }
+    if !matches!(mouse.kind,MouseEventKind::Down(MouseButton::Left)
+        | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {return;}
+    let mut state=match std::mem::replace(&mut app.active_overlay,ActiveOverlay::None) {
+        ActiveOverlay::TemplateBuilder(state)=>state,
+        other=>{app.active_overlay=other;return;},
     };
-
-    let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
-    let screen = ratatui::layout::Rect::new(0, 0, w, h);
-    if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
-        if super::template_builder::builder_token_viewport(screen, &state)
-            .is_some_and(|r| mx >= r.x && mx < r.x + r.width && my >= r.y && my < r.y + r.height) {
-            let limit = super::template_builder::builder_token_scroll_limit(screen, &state);
-            state.token_scroll = if mouse.kind == MouseEventKind::ScrollUp {
-                state.token_scroll.saturating_sub(3)
-            } else { (state.token_scroll + 3).min(limit) };
+    let (w,h)=crossterm::terminal::size().unwrap_or((80,24));
+    let screen=ratatui::layout::Rect::new(0,0,w,h);
+    let clicked=app.button_map.find_button_at(mouse.column,mouse.row);
+    if let Some(dialog)=state.save_dialog.as_mut() {
+        if mouse.kind==MouseEventKind::Down(MouseButton::Left) {
+            match clicked {
+                Some(TuiButton::TemplateSaveName)=>dialog.focus=super::app::TemplateSaveFocus::Name,
+                Some(TuiButton::TemplateSaveOverwrite)=>submit_builder_save(app,&mut state,true),
+                Some(TuiButton::TemplateSaveNew)=>submit_builder_save(app,&mut state,false),
+                Some(TuiButton::TemplateSaveCancel)=>state.save_dialog=None,
+                _=>{},
+            }
         }
-        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
+        app.active_overlay=ActiveOverlay::TemplateBuilder(state);
         return;
     }
-
-    match app.button_map.find_button_at(mx, my) {
-        Some(TuiButton::TemplateBuilderToken(idx)) => {
-            state.grid_cursor = idx;
-            state.insert_current_grid_item();
-            state.focus = TemplateBuilderFocus::TemplateInput;
+    if matches!(mouse.kind,MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
+        if super::template_builder::builder_token_viewport(screen,&state).is_some_and(|r|
+            mouse.column>=r.x && mouse.column<r.x+r.width &&
+            mouse.row>=r.y && mouse.row<r.y+r.height) {
+            let limit=super::template_builder::builder_token_scroll_limit(screen,&state);
+            state.token_scroll=if mouse.kind==MouseEventKind::ScrollUp {
+                state.token_scroll.saturating_sub(3)
+            } else {(state.token_scroll+3).min(limit)};
         }
-        Some(TuiButton::TemplateBuilderSavedItem(idx)) => {
-            if let Some(tmpl) = state.saved_templates.get(idx).cloned() {
-                state.template_input = super::text_input::TextInputState::new(tmpl);
-                state.template_input.cursor = state.template_input.text.len();
-                state.saved_selected = idx;
-                state.focus = TemplateBuilderFocus::TemplateInput;
-            }
-        }
-        Some(TuiButton::TemplateBuilderApply) => {
-            let text = state.template_input.text.clone();
-            apply_shared_template(app,state.target,text,state.return_to_extract.take());
-            return; // overlay already set to None
-        }
-        Some(TuiButton::TemplateBuilderSave) => {
-            let text = state.template_input.text.clone();
-            match super::template_builder::save_template(state.target, &text) {
-                Ok(()) => {
-                    state.saved_templates = super::template_builder::list_templates(state.target);
-                    app.set_status("Template saved");
-                }
-                Err(e) => {
-                    app.set_status(format!("Save failed: {}", e));
-                }
-            }
-        }
-        Some(TuiButton::TemplateBuilderClear) => {
-            state.template_input = super::text_input::TextInputState::empty();
-        }
-        Some(TuiButton::TemplateBuilderDelete) => {
-            if let Some(tmpl) = state.saved_templates.get(state.saved_selected).cloned() {
-                let _ = super::template_builder::delete_template(state.target, &tmpl);
-                state.saved_templates = super::template_builder::list_templates(state.target);
-                if state.saved_selected >= state.saved_templates.len() && state.saved_selected > 0 {
-                    state.saved_selected -= 1;
-                }
-                app.set_status("Template deleted");
-            }
-        }
-        _ => {
-            // The same popup geometry drives painting and dismissal.
-            let Some(popup) = super::template_builder::builder_popup(screen, &state) else {
-                close_shared_template(app, state.return_to_extract.take());
-                return;
-            };
-            if mx < popup.x || mx >= popup.x + popup.width
-                || my < popup.y || my >= popup.y + popup.height {
-                close_shared_template(app, state.return_to_extract.take());
-                return;
-            }
-            // Click inside but not on a button — switch focus to template input
-            state.focus = TemplateBuilderFocus::TemplateInput;
-        }
+        app.active_overlay=ActiveOverlay::TemplateBuilder(state);
+        return;
     }
-
-    app.active_overlay = ActiveOverlay::TemplateBuilder(state);
+    match clicked {
+        Some(TuiButton::TemplateBuilderToken(index))=>{
+            state.grid_cursor=index;
+            state.insert_current_grid_item();
+            state.focus=TemplateBuilderFocus::TemplateInput;
+        },
+        Some(TuiButton::TemplateBuilderCapitalization)=>{
+            state.capitalize=!state.capitalize;
+            state.focus=TemplateBuilderFocus::Capitalization;
+        },
+        Some(TuiButton::TemplateBuilderApply)=>{activate_builder_footer(app,state,0);return;},
+        Some(TuiButton::TemplateBuilderSave)=>{activate_builder_footer(app,state,1);return;},
+        Some(TuiButton::TemplateBuilderSavedTemplates)=>{activate_builder_footer(app,state,2);return;},
+        Some(TuiButton::TemplateBuilderClear)=>{activate_builder_footer(app,state,3);return;},
+        _=>{
+            let Some(popup)=super::template_builder::builder_popup(screen,&state) else {
+                close_shared_template(app,state.return_to_extract.take());return;
+            };
+            if mouse.column<popup.x || mouse.column>=popup.x+popup.width ||
+                mouse.row<popup.y || mouse.row>=popup.y+popup.height {
+                close_shared_template(app,state.return_to_extract.take());return;
+            }
+            state.focus=TemplateBuilderFocus::TemplateInput;
+        },
+    }
+    app.active_overlay=ActiveOverlay::TemplateBuilder(state);
 }
 
 /// Mouse handler for the CuePreview overlay.
@@ -55231,7 +55231,8 @@ fn apply_text_edit(
             app.preset.mark_modified();
         }
         TextEditTarget::FilenameTemplate => {
-            app.convert.output_options.filename_template = trimmed.to_string();
+            let capitalize = app.convert.output_options.filename_template_capitalize;
+            app.convert.output_options.set_naming_template(trimmed, capitalize);
             app.preset.mark_modified();
         }
         TextEditTarget::CompanionExtensions => {
@@ -74752,21 +74753,19 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             // ── Template builder: open pills ──
             TuiButton::TemplateBuildFolderButton => {
                 let initial = app.convert.output_options.folder_template.clone();
-                app.active_overlay =
-                    ActiveOverlay::TemplateBuilder(Box::new(TemplateBuilderState::new(
-                        TemplateTarget::Folder,
-                        &initial,
-                        TemplateBuilderFocus::TemplateInput,
-                    )));
+                let mut builder = TemplateBuilderState::new(TemplateTarget::Folder,
+                    &initial, TemplateBuilderFocus::TemplateInput);
+                builder.capitalize = app.convert.output_options.folder_template_capitalize;
+                builder.output_extension = app.convert.format.selected_extension().to_string();
+                app.active_overlay = ActiveOverlay::TemplateBuilder(Box::new(builder));
             }
             TuiButton::TemplateBuildFilenameButton => {
-                let initial = app.convert.output_options.filename_template.clone();
-                app.active_overlay =
-                    ActiveOverlay::TemplateBuilder(Box::new(TemplateBuilderState::new(
-                        TemplateTarget::Filename,
-                        &initial,
-                        TemplateBuilderFocus::TemplateInput,
-                    )));
+                let initial = app.convert.output_options.naming_template();
+                let mut builder = TemplateBuilderState::new(TemplateTarget::Filename,
+                    &initial, TemplateBuilderFocus::TemplateInput);
+                builder.capitalize = app.convert.output_options.filename_template_capitalize;
+                builder.output_extension = app.convert.format.selected_extension().to_string();
+                app.active_overlay = ActiveOverlay::TemplateBuilder(Box::new(builder));
             }
             TuiButton::TemplateLoadFolderButton => {
                 open_template_picker(app, TemplateTarget::Folder);
@@ -74777,11 +74776,15 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
 
             // ── Template builder overlay buttons (handled by dedicated mouse handler) ──
             TuiButton::TemplateBuilderToken(_)
-            | TuiButton::TemplateBuilderSavedItem(_)
+            | TuiButton::TemplateBuilderCapitalization
             | TuiButton::TemplateBuilderApply
             | TuiButton::TemplateBuilderSave
+            | TuiButton::TemplateBuilderSavedTemplates
             | TuiButton::TemplateBuilderClear
-            | TuiButton::TemplateBuilderDelete
+            | TuiButton::TemplateSaveName
+            | TuiButton::TemplateSaveOverwrite
+            | TuiButton::TemplateSaveNew
+            | TuiButton::TemplateSaveCancel
             | TuiButton::TemplatePickerRow(_)
             | TuiButton::TemplatePickerApply
             | TuiButton::TemplatePickerDelete
@@ -74816,6 +74819,8 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::DiscBrowserFilesChoice(_)
             | TuiButton::DiscBrowserOverwritePrev
             | TuiButton::DiscBrowserOverwriteNext
+            | TuiButton::DiscBrowserDownmixPrev
+            | TuiButton::DiscBrowserDownmixNext
             | TuiButton::DiscBrowserOverwriteHelp
             | TuiButton::DiscBrowserOverwriteHelpOutside
             | TuiButton::DiscBrowserOverwriteHelpPassive

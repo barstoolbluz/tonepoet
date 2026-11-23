@@ -1115,6 +1115,49 @@ fn transferred_sidecar_metadata_for_preview(
     Ok(metadata)
 }
 
+/// Resolve optional batch Naming fields from the metadata authority already
+/// chosen by the queue/preview selector. This is admission-time work only:
+/// no audio probe or filesystem operation runs in a screen redraw.
+///
+/// A failed carrier-tag read is not evidence that its tags are absent. A
+/// validated CUE can nevertheless supply authoritative metadata on its own;
+/// unresolved or invalid CUE authority remains unknown rather than flat.
+pub(crate) fn read_convert_naming_metadata_for_cue_decision(
+    path: &Path,
+    decision: &crate::convert::queue_expansion::CueArtifactCommitDecision,
+) -> Option<SourceMetadata> {
+    use crate::convert::pipeline::CueSidecarPolicy;
+
+    let cue_source = decision.sidecar_cue_track_metadata.as_ref();
+    let policy = decision.cue_sidecar_override?;
+    let carrier = crate::tui::probe::read_metadata(path).ok();
+    if let Some(source) = cue_source {
+        return transferred_sidecar_metadata_for_preview(
+            source, carrier.unwrap_or_default(),
+        ).ok();
+    }
+    match policy {
+        CueSidecarPolicy::IgnoreCue => carrier,
+        CueSidecarPolicy::SidecarOnly | CueSidecarPolicy::EmbeddedOnly => {
+            match crate::convert::pipeline::materializer_cue::
+                validated_cue_sheet_for_exact_policy(path, policy)
+            {
+                Some(sheet) => Some(cue_sheet_metadata(&sheet, carrier.unwrap_or_default())),
+                // Queue expansion also uses EmbeddedOnly to suppress a rejected
+                // sibling CUE. With no usable embedded sheet, ordinary audio
+                // still owns its carrier tags for optional Naming folders.
+                None if policy == CueSidecarPolicy::EmbeddedOnly
+                    && matches!(
+                        crate::convert::source_admission::direct_source_kind(path),
+                        Some(crate::convert::source_admission::DirectSourceKind::Audio)
+                    ) => carrier,
+                None => None,
+            }
+        }
+        CueSidecarPolicy::PreferEmbedded | CueSidecarPolicy::PreferSidecar => None,
+    }
+}
+
 pub(crate) fn probe_convert_source_for_message(
     path: &Path,
     cue_policy: Option<crate::convert::pipeline::CueSidecarPolicy>,
@@ -1356,10 +1399,13 @@ pub(crate) fn archive_preview_album_metadata(tracks: &[PreviewTrack]) -> SourceM
 
     let same_album = common_nonempty_metadata_value(tracks, |metadata| metadata.album.as_ref());
     let same_artist = common_nonempty_metadata_value(tracks, |metadata| metadata.artist.as_ref());
+    let same_album_artist = common_nonempty_metadata_value(tracks,
+        |metadata| metadata.album_artist.as_ref());
     let same_year = common_nonempty_metadata_value(tracks, |metadata| metadata.year.as_ref());
     let same_genre = common_nonempty_metadata_value(tracks, |metadata| metadata.genre.as_ref());
 
     metadata.album = same_album;
+    metadata.album_artist = same_album_artist.or_else(|| same_artist.clone());
     metadata.artist = same_artist;
     metadata.year = same_year;
     metadata.genre = same_genre;
@@ -1370,15 +1416,89 @@ fn common_nonempty_metadata_value<F>(tracks: &[PreviewTrack], f: F) -> Option<St
 where
     F: for<'a> Fn(&'a SourceMetadata) -> Option<&'a String>,
 {
-    let mut values = tracks
-        .iter()
-        .filter_map(|track| f(&track.metadata))
+    // In the archive's source/metadata panes, missing tags do not defeat a
+    // value shared by all members that carry it. Convert's Naming preview
+    // separately uses the materializer's stricter selected-track rule.
+    let mut values = tracks.iter().filter_map(|track| f(&track.metadata))
         .filter(|value| !value.trim().is_empty());
-    let first = values.next()?.clone();
-    if values.all(|value| value == &first) {
-        Some(first)
-    } else {
-        None
+    let first = values.next()?;
+    values.all(|value| value == first).then(|| first.clone())
+}
+
+#[cfg(test)]
+mod archive_preview_album_metadata_tests {
+    use super::*;
+
+    fn member(metadata: SourceMetadata) -> PreviewTrack {
+        PreviewTrack {
+            path: PathBuf::from("/preview/track.flac"),
+            original_name: "track".to_owned(),
+            info: SourceInfo {
+                format_name: "FLAC".to_owned(), codec: "flac".to_owned(),
+                bit_depth: Some(24), sample_format_is_float: Some(false),
+                compression_is_lossless: Some(true), sample_rate: 44_100,
+                channels: 2, channel_layout: "stereo".to_owned(),
+                duration_secs: 1.0, file_size: 100,
+            },
+            original_metadata: metadata.clone(), metadata,
+        }
+    }
+
+    #[test]
+    fn archive_album_tags_allow_untagged_members_but_reject_disagreement() {
+        let tagged = SourceMetadata {
+            album: Some("Live Album".into()), artist: Some("Quartet".into()),
+            album_artist: Some("Ensemble".into()), year: Some("1971".into()),
+            genre: Some("Jazz".into()), ..Default::default()
+        };
+        let mut tracks = vec![member(tagged.clone()); 11];
+        tracks.push(member(SourceMetadata::default()));
+        let assert_common = |tracks: &[PreviewTrack]| {
+            let result = archive_preview_album_metadata(tracks);
+            assert_eq!(result.album.as_deref(), Some("Live Album"));
+            assert_eq!(result.artist.as_deref(), Some("Quartet"));
+            assert_eq!(result.album_artist.as_deref(), Some("Ensemble"));
+            assert_eq!(result.year.as_deref(), Some("1971"));
+            assert_eq!(result.genre.as_deref(), Some("Jazz"));
+        };
+        assert_common(&tracks);
+        tracks.rotate_right(1); // First member also may lack every tag.
+        assert_common(&tracks);
+
+        let preview = ArchivePreview {
+            archive_path: PathBuf::from("/music/archive.zip"),
+            staging_dir: PathBuf::from("/preview"),
+            tracks: tracks.clone(),
+            album_metadata: archive_preview_album_metadata(&tracks),
+            mount_lease: None,
+        };
+        let SourceMode::MultiTrack { metadata, album_title, album_artist, .. } =
+            source_mode_from_archive_preview(preview) else { panic!("archive source"); };
+        assert_eq!(metadata.year.as_deref(), Some("1971"));
+        assert_eq!(metadata.genre.as_deref(), Some("Jazz"));
+        assert_eq!(album_title.as_deref(), Some("Live Album"));
+        assert_eq!(album_artist.as_deref(), Some("Quartet"));
+
+        let mut conflicting = tracks.clone();
+        conflicting[1].metadata.year = Some("1990".into());
+        conflicting[1].metadata.genre = Some("Rock".into());
+        conflicting[1].metadata.album = Some("Different Album".into());
+        conflicting[1].metadata.artist = Some("Soloist".into());
+        conflicting[1].metadata.album_artist = Some("Different Ensemble".into());
+        let result = archive_preview_album_metadata(&conflicting);
+        assert!(result.album.is_none());
+        assert!(result.artist.is_none());
+        assert!(result.album_artist.is_none());
+        assert!(result.year.is_none());
+        assert!(result.genre.is_none());
+        let empty = archive_preview_album_metadata(&[member(SourceMetadata::default())]);
+        assert!(empty.album.is_none() && empty.year.is_none() && empty.genre.is_none());
+
+        let without_album_artist = vec![member(SourceMetadata {
+            artist: Some("Quartet".into()), ..Default::default()
+        }), member(SourceMetadata::default())];
+        let result = archive_preview_album_metadata(&without_album_artist);
+        assert_eq!(result.album_artist.as_deref(), Some("Quartet"));
     }
 }
 
@@ -3339,6 +3459,21 @@ impl SourceMode {
         }
     }
 
+    /// Borrow the selected source metadata for live read-only previews.
+    /// Unlike current_metadata(), this does not clone artwork inventories on
+    /// every Convert frame.
+    pub fn current_metadata_ref(&self) -> Option<&SourceMetadata> {
+        match self {
+            Self::Empty => None,
+            Self::Single { metadata, .. } => Some(metadata),
+            Self::MultiTrack { metadata, archive_preview, cursor, .. } => archive_preview
+                .as_ref()
+                .and_then(|preview| preview.tracks.get(*cursor).map(|track| &track.metadata))
+                .or(Some(metadata)),
+            Self::Batch { cursor_metadata, .. } => Some(cursor_metadata),
+        }
+    }
+
     /// The currently previewed `SourceMetadata`. Returns an owned default
     /// for the Empty variant so the caller can always have something to
     /// display without extra matching.
@@ -5052,15 +5187,13 @@ pub enum OutputOptionsField {
 }
 
 impl OutputOptionsField {
-    const COLLAPSED_FIELDS: [Self; 4] = [
+    const COLLAPSED_FIELDS: [Self; 3] = [
         Self::DestPath,
-        Self::FolderTemplate,
         Self::FilenameTemplate,
         Self::MergeMode,
     ];
-    const MAXIMIZED_FIELDS: [Self; 13] = [
+    const MAXIMIZED_FIELDS: [Self; 12] = [
         Self::DestPath,
-        Self::FolderTemplate,
         Self::FilenameTemplate,
         Self::MergeMode,
         Self::CompanionExtensions,
@@ -5073,9 +5206,8 @@ impl OutputOptionsField {
         Self::IfExists,
         Self::Actions,
     ];
-    const MAXIMIZED_FIELDS_WITHOUT_ACTIONS: [Self; 12] = [
+    const MAXIMIZED_FIELDS_WITHOUT_ACTIONS: [Self; 11] = [
         Self::DestPath,
-        Self::FolderTemplate,
         Self::FilenameTemplate,
         Self::MergeMode,
         Self::CompanionExtensions,
@@ -5088,23 +5220,21 @@ impl OutputOptionsField {
         Self::IfExists,
     ];
     // Height 17/18: keep old three pills reachable; new rows need >= 19.
-    const MAXIMIZED_FIELDS_WITHOUT_NEW_OR_ACTIONS: [Self; 10] = [
-        Self::DestPath, Self::FolderTemplate, Self::FilenameTemplate,
+    const MAXIMIZED_FIELDS_WITHOUT_NEW_OR_ACTIONS: [Self; 9] = [
+        Self::DestPath, Self::FilenameTemplate,
         Self::MergeMode, Self::CompanionExtensions, Self::CompanionFolders,
         Self::ExcludeFiles, Self::ForceEncode, Self::DiscSubfolders, Self::WriteLog,
     ];
-    const MAXIMIZED_FIELDS_WITHOUT_CONVERSION_OR_ACTIONS: [Self; 7] = [
+    const MAXIMIZED_FIELDS_WITHOUT_CONVERSION_OR_ACTIONS: [Self; 6] = [
         Self::DestPath,
-        Self::FolderTemplate,
         Self::FilenameTemplate,
         Self::MergeMode,
         Self::CompanionExtensions,
         Self::CompanionFolders,
         Self::ExcludeFiles,
     ];
-    const MAXIMIZED_FIELDS_WITHOUT_EXCLUDE_CONVERSION_OR_ACTIONS: [Self; 6] = [
+    const MAXIMIZED_FIELDS_WITHOUT_EXCLUDE_CONVERSION_OR_ACTIONS: [Self; 5] = [
         Self::DestPath,
-        Self::FolderTemplate,
         Self::FilenameTemplate,
         Self::MergeMode,
         Self::CompanionExtensions,
@@ -8250,6 +8380,8 @@ pub struct OutputOptionsState {
     pub dest_path: Option<PathBuf>,
     pub folder_template: String,
     pub filename_template: String,
+    pub folder_template_capitalize: bool,
+    pub filename_template_capitalize: bool,
     pub merge: PillState<MergeMode>,
     pub companion_extensions: String,
     pub companion_folders: String,
@@ -8268,6 +8400,111 @@ pub struct OutputOptionsState {
 }
 
 impl OutputOptionsState {
+    /// The one visible Naming pattern. The two stored segments are an adapter
+    /// to Convert's existing album-directory and track-file planner fields.
+    pub fn naming_template(&self) -> String {
+        if self.folder_template.is_empty() {
+            self.filename_template.clone()
+        } else {
+            format!("{}/{}", self.folder_template, self.filename_template)
+        }
+    }
+
+    /// Resolve one authored Naming pattern into the existing two planner
+    /// scopes. Album-scoped tokens (including optional genre and year) stay
+    /// in the album renderer; track-scoped tokens stay in the track renderer.
+    /// An optional album prefix can still render empty, in which case the
+    /// queue admission projection selects the planner's flat-output policy.
+    pub(crate) fn split_naming_pattern(template: &str) -> (&str, &str) {
+        let track_tokens = [
+            "%TITLE%", "%TRACK%", "%TRACKN%", "%TRACKNN%", "%TRACKNUMBER%",
+            "%N%", "%NN%", "%COMPOSER%", "%ISRC%",
+            // The album renderer does not supply raw %DISC%, and the
+            // evidence-gated disc numbers require a track to resolve.
+            "%DISC%", "%DISC_FOLDER%", "%DISCNUMBER%", "%NNDISCNUMBER%",
+            "%NNNDISCNUMBER%", "%DISCTOTAL%",
+        ];
+        let mut in_conditional = false;
+        let mut safe_boundary = None;
+        for (index, ch) in template.char_indices() {
+            match ch {
+                '{' => in_conditional = true,
+                '}' => in_conditional = false,
+                '/' if !in_conditional && !template[..index].trim().is_empty()
+                    && !track_tokens.iter()
+                        .any(|token| template[..index].contains(token)) => {
+                    // Use the deepest album-scoped boundary. If later folders
+                    // need per-track tags, keep them in the filename renderer.
+                    safe_boundary = Some(index);
+                }
+                _ => {}
+            }
+        }
+        if let Some(index) = safe_boundary {
+            (&template[..index], &template[index + 1..])
+        } else {
+            ("", template)
+        }
+    }
+
+    /// Detect a folder component that does not depend on optional tags. Such
+    /// album prefixes retain the planner's album root without a source probe.
+    /// Optional-only prefixes use cached source evidence at queue admission.
+    pub(crate) fn has_stable_album_prefix(prefix: &str) -> bool {
+        let mut guaranteed = String::new();
+        let mut chars = prefix.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '{' => {
+                    // An optional block may disappear completely.
+                    for next in chars.by_ref() {
+                        if next == '}' { break; }
+                    }
+                }
+                '%' => {
+                    let mut token = String::new();
+                    for next in chars.by_ref() {
+                        if next == '%' { break; }
+                        token.push(next);
+                    }
+                    // These album-scope tokens have nonempty standard values.
+                    // Unknown and optional metadata tokens are not guarantees.
+                    if matches!(token.as_str(), "ARTIST" | "ALBUM_ARTIST" | "ALBUM" | "FORMAT") {
+                        guaranteed.push('x');
+                    }
+                }
+                _ => guaranteed.push(ch),
+            }
+        }
+        guaranteed.split('/').any(|part| !part.trim().is_empty())
+    }
+
+    /// Preserve the full editable text as two independent planner scopes.
+    /// Both sections receive the one visible capitalization choice.
+    pub fn set_naming_template(&mut self, template: &str, capitalize: bool) {
+        let (folder, filename) = Self::split_naming_pattern(template);
+        self.folder_template = folder.to_owned();
+        self.filename_template = filename.to_owned();
+        self.folder_template_capitalize = capitalize;
+        self.filename_template_capitalize = capitalize;
+    }
+
+    /// Accept the shared Extract token spellings at the TUI projection only.
+    /// The CLI and the backend's established token grammar are unchanged.
+    pub fn conversion_folder_template(&self) -> String {
+        Self::conversion_tokens(&self.folder_template)
+    }
+
+    pub fn conversion_filename_template(&self) -> String {
+        Self::conversion_tokens(&self.filename_template)
+    }
+
+    fn conversion_tokens(template: &str) -> String {
+        template.replace("%TRACKNUMBER%", "%TRACKNN%")
+            .replace("%EXTENSION%", "%EXT%")
+            .replace("%PERFORMER%", "%ARTIST%")
+    }
+
     pub fn new() -> Self {
         let merge = PillState::new(vec![
             (MergeMode::MultiFile, "multi-file"),
@@ -8293,6 +8530,8 @@ impl OutputOptionsState {
             dest_path: None,
             folder_template: "%ARTIST%/%ALBUM% (%YEAR%)".to_string(),
             filename_template: "%TRACKNN% - %TITLE%.%EXT%".to_string(),
+            folder_template_capitalize: false,
+            filename_template_capitalize: false,
             merge,
             companion_extensions: crate::convert::formats::default_companion_extensions().join(", "),
             companion_folders: String::new(),
@@ -8379,6 +8618,91 @@ mod output_options_companion_projection_tests {
     use super::OutputOptionsState;
 
     #[test]
+    fn convert_naming_projects_author_separators_and_one_capitalization_flag() {
+        let mut state = OutputOptionsState::new();
+        assert_eq!(state.naming_template(),
+            "%ARTIST%/%ALBUM% (%YEAR%)/%TRACKNN% - %TITLE%.%EXT%");
+        state.set_naming_template("%ARTIST%/%ALBUM%/%TRACKNN% - %TITLE%", true);
+        assert_eq!(state.folder_template, "%ARTIST%/%ALBUM%");
+        assert_eq!(state.filename_template, "%TRACKNN% - %TITLE%");
+        assert!(state.folder_template_capitalize);
+        assert!(state.filename_template_capitalize);
+        assert_eq!(state.naming_template(),
+            "%ARTIST%/%ALBUM%/%TRACKNN% - %TITLE%");
+
+        // No separator: the destination itself is the parent. A metadata
+        // value containing '/' never enters this authored-template parser.
+        state.set_naming_template("%TITLE%", false);
+        assert!(state.folder_template.is_empty());
+        assert_eq!(state.naming_template(), "%TITLE%");
+        assert!(!state.folder_template_capitalize);
+        assert!(!state.filename_template_capitalize);
+    }
+
+    #[test]
+    fn convert_naming_keeps_track_tokens_and_conditional_disc_folders_in_track_scope() {
+        let mut state = OutputOptionsState::new();
+        state.set_naming_template("{%DISCNUMBER%/}%TRACKNN% - %TITLE%", true);
+        assert_eq!(state.folder_template, "");
+        assert_eq!(state.filename_template,
+            "{%DISCNUMBER%/}%TRACKNN% - %TITLE%");
+        state.set_naming_template("%TRACKNN%/%TITLE%", true);
+        assert_eq!(state.folder_template, "");
+        assert_eq!(state.filename_template, "%TRACKNN%/%TITLE%");
+        state.set_naming_template("%ARTIST%/%TRACKNN%/%TITLE%", true);
+        assert_eq!(state.folder_template, "%ARTIST%");
+        assert_eq!(state.filename_template, "%TRACKNN%/%TITLE%");
+        state.set_naming_template("%ALBUM%/{%DISCNUMBER%/}%TITLE%", true);
+        assert_eq!(state.folder_template, "%ALBUM%");
+        assert_eq!(state.filename_template, "{%DISCNUMBER%/}%TITLE%");
+    }
+
+    #[test]
+    fn convert_disc_components_stay_track_scoped_and_album_metadata_stays_album_scoped() {
+        for pattern in [
+            "%DISC%/%TRACKNN% - %TITLE%",
+            "%DISCNUMBER%/%TRACKNN% - %TITLE%",
+            "%NNDISCNUMBER%/%TITLE%",
+            "%NNNDISCNUMBER%/%TITLE%",
+            "%DISC_FOLDER%/%TITLE%",
+            "{%DISCTOTAL%}/%TRACKNN% - %TITLE%",
+        ] {
+            let mut state = OutputOptionsState::new();
+            state.set_naming_template(pattern, false);
+            assert_eq!(state.folder_template, "", "{pattern}");
+            assert_eq!(state.filename_template, pattern, "{pattern}");
+            assert_eq!(state.naming_template(), pattern, "{pattern}");
+        }
+        for (pattern, folder, track) in [
+            ("{%YEAR%}/%TRACKNN% - %TITLE%", "{%YEAR%}", "%TRACKNN% - %TITLE%"),
+            ("%YEAR%/%TRACKNN% - %TITLE%", "%YEAR%", "%TRACKNN% - %TITLE%"),
+            ("%GENRE%/%TRACKNN% - %TITLE%", "%GENRE%", "%TRACKNN% - %TITLE%"),
+            ("%ALBUM%/%DISC%/%TITLE%", "%ALBUM%", "%DISC%/%TITLE%"),
+            ("%ALBUM%/{%YEAR%}/%TRACKNN% - %TITLE%",
+                "%ALBUM%/{%YEAR%}", "%TRACKNN% - %TITLE%"),
+            ("%ALBUM%/{%DISCNUMBER%}/%TITLE%", "%ALBUM%", "{%DISCNUMBER%}/%TITLE%"),
+            ("Disc Set/{%YEAR%}/%TITLE%", "Disc Set/{%YEAR%}", "%TITLE%"),
+        ] {
+            let mut state = OutputOptionsState::new();
+            state.set_naming_template(pattern, true);
+            assert_eq!(state.folder_template, folder, "{pattern}");
+            assert_eq!(state.filename_template, track, "{pattern}");
+            assert_eq!(state.naming_template(), pattern, "{pattern}");
+        }
+    }
+
+    #[test]
+    fn convert_shared_token_aliases_stay_at_the_tui_projection_boundary() {
+        let mut state = OutputOptionsState::new();
+        state.set_naming_template("%PERFORMER%/%TRACKNUMBER% - %TITLE%.%EXTENSION%", true);
+        assert_eq!(state.conversion_folder_template(), "%ARTIST%");
+        assert_eq!(state.conversion_filename_template(),
+            "%TRACKNN% - %TITLE%.%EXT%");
+        assert_eq!(state.naming_template(),
+            "%PERFORMER%/%TRACKNUMBER% - %TITLE%.%EXTENSION%");
+    }
+
+    #[test]
     fn output_options_project_custom_companion_values_into_conversion_options() {
         let mut state = OutputOptionsState::new();
         state.companion_extensions = "jpg, .PDF, .jpg".to_string();
@@ -8420,8 +8744,8 @@ mod output_options_companion_projection_tests {
     fn output_options_field_cycle_skips_below_fold_fields_when_collapsed() {
         use super::OutputOptionsField::*;
 
-        assert_eq!(DestPath.next_for(false), FolderTemplate);
-        assert_eq!(FolderTemplate.next_for(false), FilenameTemplate);
+        assert_eq!(DestPath.next_for(false), FilenameTemplate);
+        assert_eq!(FolderTemplate.clamp_for(false), MergeMode);
         assert_eq!(FilenameTemplate.next_for(false), MergeMode);
         assert_eq!(MergeMode.next_for(false), DestPath);
         assert_eq!(DestPath.prev_for(false), MergeMode);
@@ -9024,15 +9348,18 @@ pub enum ActiveOverlay {
     /// Template picker overlay for loading saved templates.
     TemplatePicker {
         target: TemplateTarget,
-        templates: Vec<String>,
+        templates: Vec<super::template_builder::NamingTemplate>,
         selected: usize,
         scroll: usize,
         /// Precomputed preview of the selected template.
         preview: String,
         /// Current field value (for "active" badge).
         active_template: Option<String>,
+        active_capitalization: bool,
         /// Return to the extract form, not Convert, when opened from Naming.
         return_to_extract: Option<Box<crate::tui::disc_browser::DiscBrowserState>>,
+        /// A picker launched inside Custom returns the choice to that editor.
+        return_to_builder: Option<Box<TemplateBuilderState>>,
     },
     /// Advanced file-operation settings opened from the Config screen. The
     /// overlay owns a draft and commits all values together on Enter.
@@ -9084,8 +9411,26 @@ pub enum TemplateTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TemplateBuilderFocus {
     TemplateInput,
-    SavedList,
+    Capitalization,
     TokenGrid,
+    /// The four footer actions, in their displayed order.
+    Footer(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateSaveFocus {
+    Name,
+    Overwrite,
+    SaveNew,
+    Cancel,
+}
+
+#[derive(Debug, Clone)]
+pub struct TemplateSaveDialog {
+    pub name_input: crate::tui::text_input::TextInputState,
+    pub original_name: Option<String>,
+    pub focus: TemplateSaveFocus,
+    pub error: Option<String>,
 }
 
 /// State for the template builder overlay.
@@ -9093,18 +9438,20 @@ pub enum TemplateBuilderFocus {
 pub struct TemplateBuilderState {
     /// The editable template line.
     pub template_input: crate::tui::text_input::TextInputState,
+    pub capitalize: bool,
+    /// Convert's selected container extension, captured when the editor opens.
+    /// Native extraction obtains its extension from the extraction planner.
+    pub output_extension: String,
     /// Whether this builds a folder or filename template.
     pub target: TemplateTarget,
     /// Which section has keyboard focus.
     pub focus: TemplateBuilderFocus,
     /// Cursor position in the token/separator grid.
     pub grid_cursor: usize,
-    /// Saved template strings loaded from disk.
-    pub saved_templates: Vec<String>,
-    /// Selected index in the saved templates list.
-    pub saved_selected: usize,
-    /// Scroll offset for the saved templates list.
-    pub saved_scroll: usize,
+    /// Identity of the template last loaded or saved; edits never auto-save it.
+    pub loaded_template: Option<super::template_builder::NamingTemplate>,
+    /// A decision and editable name, shown before any write.
+    pub save_dialog: Option<TemplateSaveDialog>,
     /// Scroll position for the shared token palette; the action footer stays fixed.
     pub token_scroll: usize,
     /// Shared Convert builder may also edit a native extraction template.
@@ -21579,6 +21926,99 @@ mod cue_proxy_probe_tests {
         assert_eq!(merged.genre.as_deref(), Some("Cue Genre"));
         assert_eq!(merged.year.as_deref(), Some("Tagged Year"));
         assert_eq!(merged.catalog_number.as_deref(), Some("0123456789012"));
+    }
+
+    #[test]
+    fn suppressed_invalid_cue_keeps_carrier_tags_for_batch_optional_folders() {
+        use crate::convert::pipeline::CueSidecarPolicy;
+        use crate::tui::convert_actions::batch_optional_naming_flat_output_policies;
+
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
+        let temp = tempfile::tempdir().expect("temporary batch folder");
+        let undated = temp.path().join("01.flac");
+        let dated = temp.path().join("02.flac");
+        let invalid_cue = temp.path().join("broken.cue");
+        for path in [&undated, &dated] {
+            std::fs::write(path, include_bytes!("../../tests/fixtures/silence.flac"))
+                .expect("copy playable FLAC carrier");
+        }
+        crate::tui::probe::write_all_tags(
+            &dated,
+            &[
+                (lofty::tag::ItemKey::Year, Some("2001".into())),
+                (lofty::tag::ItemKey::Genre, Some("Jazz".into())),
+            ],
+        )
+        .expect("tag one carrier");
+        std::fs::write(&invalid_cue, "this is not a cue sheet")
+            .expect("write rejected sibling CUE");
+        assert!(crate::tui::probe::read_metadata(&undated).unwrap().year.is_none());
+        assert_eq!(
+            crate::tui::probe::read_metadata(&dated).unwrap().year.as_deref(),
+            Some("2001")
+        );
+
+        let expanded = crate::convert::queue_expansion::expand_paths_to_audio_with_metadata(
+            &[temp.path().to_path_buf()],
+        );
+        let paths = [undated.clone(), dated.clone()];
+        assert!(!expanded.paths.contains(&invalid_cue), "invalid CUE must be suppressed");
+        assert!(expanded.cue_artifact_metadata.is_empty(), "no CUE mapping is admitted");
+        let config = crate::config::TonepoetConfig::default();
+        for (path, year, genre) in [
+            (&undated, None, None),
+            (&dated, Some("2001"), Some("Jazz")),
+        ] {
+            assert!(expanded.paths.contains(path), "audio carrier must stay queued");
+            assert!(expanded.cue_artifact_audio.contains(path), "suppression evidence retained");
+            let decision = resolve_convert_preview_authority(
+                path,
+                &expanded.cue_artifact_audio,
+                &expanded.cue_artifact_metadata,
+                &config.conversion.aggregate_metadata_target_priority,
+                Some(CueSidecarPolicy::PreferSidecar),
+            );
+            assert_eq!(decision.cue_sidecar_override, Some(CueSidecarPolicy::EmbeddedOnly));
+            let metadata = read_convert_naming_metadata_for_cue_decision(path, &decision)
+                .expect("suppressed CUE must not discard readable carrier tags");
+            assert_eq!(metadata.year.as_deref(), year);
+            assert_eq!(metadata.genre.as_deref(), genre);
+        }
+
+        let format = FormatState::new();
+        for disc_dirs in [false, true] {
+            let mut output = OutputOptionsState::new();
+            output.disc_subfolders.select_value(&disc_dirs);
+            for template in [
+                "{%YEAR%}/%TRACKNN% - %TITLE%",
+                "%GENRE%/%TRACKNN% - %TITLE%",
+            ] {
+                output.set_naming_template(template, false);
+                let policies = batch_optional_naming_flat_output_policies(
+                    &paths, &output, &format, &MetadataState::default(), |path| {
+                        let decision = resolve_convert_preview_authority(
+                            path,
+                            &expanded.cue_artifact_audio,
+                            &expanded.cue_artifact_metadata,
+                            &config.conversion.aggregate_metadata_target_priority,
+                            Some(CueSidecarPolicy::PreferSidecar),
+                        );
+                        read_convert_naming_metadata_for_cue_decision(path, &decision)
+                    },
+                );
+                assert_eq!(policies.get(&undated), Some(&true), "{template}, {disc_dirs}");
+                assert_eq!(policies.get(&dated), Some(&false), "{template}, {disc_dirs}");
+            }
+        }
+
+        // A failed carrier-tag read still leaves the policy unresolved.
+        let unreadable = temp.path().join("unreadable.flac");
+        std::fs::write(&unreadable, b"invalid FLAC").unwrap();
+        let suppressed = crate::convert::queue_expansion::CueArtifactCommitDecision {
+            cue_sidecar_override: Some(CueSidecarPolicy::EmbeddedOnly),
+            ..Default::default()
+        };
+        assert!(read_convert_naming_metadata_for_cue_decision(&unreadable, &suppressed).is_none());
     }
 
     #[test]

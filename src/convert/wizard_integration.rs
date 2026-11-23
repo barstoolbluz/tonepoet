@@ -208,6 +208,7 @@ pub fn extract_wizard_settings(
         replaygain_mode,
         naming_template: None, // Use default naming
         folder_template: None, // Use default folder naming
+        flat_output: false,
         overwrite: false,      // Don't overwrite by default
         output_if_exists: None,
         partial_output: None,
@@ -587,6 +588,7 @@ pub fn preset_to_conversion_options(
         }),
         naming_template: None,
         folder_template: None,
+        flat_output: false,
         overwrite: settings.overwrite,
         output_if_exists: None,
         partial_output: None,

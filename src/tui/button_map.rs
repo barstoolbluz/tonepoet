@@ -398,6 +398,8 @@ pub enum TuiButton {
     DiscBrowserFilesChoice(usize),
     DiscBrowserOverwritePrev,
     DiscBrowserOverwriteNext,
+    DiscBrowserDownmixPrev,
+    DiscBrowserDownmixNext,
     DiscBrowserOverwriteHelp,
     DiscBrowserOverwriteHelpOutside,
     DiscBrowserOverwriteHelpPassive,
@@ -456,12 +458,16 @@ pub enum TuiButton {
     TemplateLoadFilenameButton,
     // Template builder overlay: clickable elements.
     TemplateBuilderInput,
+    TemplateBuilderCapitalization,
     TemplateBuilderToken(usize),
-    TemplateBuilderSavedItem(usize),
     TemplateBuilderApply,
     TemplateBuilderSave,
+    TemplateBuilderSavedTemplates,
     TemplateBuilderClear,
-    TemplateBuilderDelete,
+    TemplateSaveName,
+    TemplateSaveOverwrite,
+    TemplateSaveNew,
+    TemplateSaveCancel,
 
     /// Bulk rename template input.
     BulkRenameTemplateInput,
@@ -599,6 +605,8 @@ impl TuiButton {
             | Self::DiscBrowserFilesChoice(_)
             | Self::DiscBrowserOverwritePrev
             | Self::DiscBrowserOverwriteNext
+            | Self::DiscBrowserDownmixPrev
+            | Self::DiscBrowserDownmixNext
             | Self::DiscBrowserOverwriteHelp
             | Self::DiscBrowserOverwriteHelpOutside
             | Self::DiscBrowserOverwriteHelpPassive
@@ -643,13 +651,17 @@ impl TuiButton {
             | Self::ActionsConfigPreview
             | Self::ActionsConfigModal
             | Self::TemplateBuilderInput
+            | Self::TemplateBuilderCapitalization
             | Self::TemplateBuilderToken(_)
             | Self::BulkRenameTemplateInput
-            | Self::TemplateBuilderSavedItem(_)
             | Self::TemplateBuilderApply
             | Self::TemplateBuilderSave
+            | Self::TemplateBuilderSavedTemplates
             | Self::TemplateBuilderClear
-            | Self::TemplateBuilderDelete
+            | Self::TemplateSaveName
+            | Self::TemplateSaveOverwrite
+            | Self::TemplateSaveNew
+            | Self::TemplateSaveCancel
             | Self::TemplatePickerRow(_)
             | Self::TemplatePickerApply
             | Self::TemplatePickerDelete

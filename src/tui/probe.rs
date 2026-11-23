@@ -125,6 +125,8 @@ pub struct ConvertPreemphasisEvidence {
 pub struct SourceMetadata {
     pub title: Option<String>,
     pub artist: Option<String>,
+    pub album_artist: Option<String>,
+    pub composer: Option<String>,
     pub album: Option<String>,
     pub genre: Option<String>,
     pub year: Option<String>,
@@ -133,6 +135,11 @@ pub struct SourceMetadata {
     /// Keep this in the cached metadata model so Details does not need to infer
     /// Tool from already-rendered editor rows.
     pub tool: Option<String>,
+
+    /// Disc evidence already read during the source probe. Kept for the
+    /// Convert Naming preview; it never triggers a read during redraw.
+    pub disc_number: Option<u32>,
+    pub disc_total: Option<u32>,
 
     /// Track number from the tag (e.g. 3 for the third track).
     /// Used by the bulk rename wizard for `%N%` / `%NN%` placeholders.
@@ -1262,6 +1269,10 @@ fn read_metadata_sacd(path: &Path) -> Result<SourceMetadata, String> {
 
     meta.album = from_sidecar("ALBUM")
         .or_else(|| md.master_text.as_ref().and_then(|t| t.album_title.clone()));
+    meta.album_artist = from_sidecar("ALBUMARTIST")
+        .or_else(|| from_sidecar("ALBUM ARTIST"))
+        .or_else(|| md.master_text.as_ref().and_then(|t| t.album_artist.clone()));
+    meta.composer = from_sidecar("COMPOSER");
     meta.artist = from_sidecar("ARTIST")
         .or_else(|| from_sidecar("ALBUMARTIST"))
         .or_else(|| from_sidecar("ALBUM ARTIST"))
@@ -8611,6 +8622,10 @@ fn source_metadata_from_dsf(snapshot: &crate::dsf_tags::DsfTagSnapshot) -> Sourc
     SourceMetadata {
         title: snapshot.first("TITLE").map(ToOwned::to_owned),
         artist: snapshot.first("ARTIST").map(ToOwned::to_owned),
+        album_artist: snapshot.first("ALBUMARTIST")
+            .or_else(|| snapshot.first("ALBUM ARTIST"))
+            .map(ToOwned::to_owned),
+        composer: snapshot.first("COMPOSER").map(ToOwned::to_owned),
         album: snapshot.first("ALBUM").map(ToOwned::to_owned),
         genre: snapshot.first("GENRE").map(ToOwned::to_owned),
         year: snapshot.first("DATE").map(ToOwned::to_owned),
@@ -8619,6 +8634,8 @@ fn source_metadata_from_dsf(snapshot: &crate::dsf_tags::DsfTagSnapshot) -> Sourc
             .or_else(|| snapshot.first("ENCODINGTOOL"))
             .map(ToOwned::to_owned),
         track_number: snapshot.parsed_u32("TRACKNUMBER"),
+        disc_number: snapshot.parsed_u32("DISCNUMBER"),
+        disc_total: snapshot.parsed_u32("DISCTOTAL"),
         catalog_number: snapshot.first("CATALOGNUMBER").map(ToOwned::to_owned),
         rg_track_gain: snapshot.first("REPLAYGAIN_TRACK_GAIN").map(ToOwned::to_owned),
         rg_track_peak: snapshot.first("REPLAYGAIN_TRACK_PEAK").map(ToOwned::to_owned),
@@ -9216,6 +9233,30 @@ mod convert_deemphasis_evidence_tests {
     }
 }
 
+#[cfg(test)]
+mod convert_naming_source_metadata_tests {
+    use super::*;
+    use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
+
+    #[test]
+    fn source_probe_reuses_album_artist_and_composer_from_existing_tag_read() {
+        let mut tag = Tag::new(TagType::VorbisComments);
+        for (key, value) in [
+            (ItemKey::TrackTitle, "Title"),
+            (ItemKey::TrackArtist, "Solo Singer"),
+            (ItemKey::AlbumArtist, "Various Artists"),
+            (ItemKey::Composer, "A Composer"),
+        ] {
+            tag.push(TagItem::new(key, ItemValue::Text(value.to_owned())));
+        }
+        let source = source_metadata_from_tags(Path::new("input.flac"), &[tag], false);
+        assert_eq!(source.artist.as_deref(), Some("Solo Singer"));
+        assert_eq!(source.album_artist.as_deref(), Some("Various Artists"));
+        assert_eq!(source.composer.as_deref(), Some("A Composer"));
+        assert_eq!(source.title.as_deref(), Some("Title"));
+    }
+}
+
 fn source_metadata_from_tags(
     path: &Path,
     tags: &[lofty::tag::Tag],
@@ -9237,6 +9278,12 @@ fn source_metadata_from_tags(
         if meta.artist.is_none() {
             meta.artist = tag.artist().map(|s| s.to_string());
         }
+        if meta.album_artist.is_none() {
+            meta.album_artist = tag.get_string(&ItemKey::AlbumArtist).map(str::to_owned);
+        }
+        if meta.composer.is_none() {
+            meta.composer = tag.get_string(&ItemKey::Composer).map(str::to_owned);
+        }
         if meta.album.is_none() {
             meta.album = tag.album().map(|s| s.to_string());
         }
@@ -9248,6 +9295,12 @@ fn source_metadata_from_tags(
         }
         if meta.track_number.is_none() {
             meta.track_number = tag.track();
+        }
+        if meta.disc_number.is_none() {
+            meta.disc_number = tag.disk();
+        }
+        if meta.disc_total.is_none() {
+            meta.disc_total = tag.disk_total();
         }
         if meta.isrc.is_none() {
             meta.isrc = tag.get_string(&ItemKey::Isrc).map(|s| s.to_string());
@@ -9412,11 +9465,15 @@ fn source_metadata_from_canonical_fields(
     SourceMetadata {
         title: value("TITLE"),
         artist: value("ARTIST"),
+        album_artist: value("ALBUMARTIST"),
+        composer: value("COMPOSER"),
         album: value("ALBUM"),
         genre: value("GENRE"),
         year: value("DATE"),
         tool: value("ENCODER").or_else(|| value("ENCODINGTOOL")),
         track_number: value("TRACKNUMBER").and_then(|value| value.parse().ok()),
+        disc_number: value("DISCNUMBER").and_then(|value| value.parse().ok()),
+        disc_total: value("DISCTOTAL").and_then(|value| value.parse().ok()),
         catalog_number: value("CATALOGNUMBER"),
         rg_track_gain: value("REPLAYGAIN_TRACK_GAIN"),
         rg_track_peak: value("REPLAYGAIN_TRACK_PEAK"),

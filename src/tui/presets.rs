@@ -130,6 +130,10 @@ pub struct TuiPreset {
     pub dest_path: Option<String>,
     pub folder_template: String,
     pub filename_template: String,
+    #[serde(default)]
+    pub folder_template_capitalize: bool,
+    #[serde(default)]
+    pub filename_template_capitalize: bool,
     pub merge: String, // "multi-file", "single-image"
     #[serde(default = "default_companion_extensions")]
     pub companion_extensions: String,
@@ -267,6 +271,8 @@ impl PresetWireLegacy {
             dest_path: self.dest_path,
             folder_template: self.folder_template,
             filename_template: self.filename_template,
+            folder_template_capitalize: false,
+            filename_template_capitalize: false,
             merge: self.merge,
             companion_extensions: self.companion_extensions,
             companion_folders: self.companion_folders,
@@ -583,6 +589,8 @@ impl TuiPreset {
                 .map(|p| p.to_string_lossy().to_string()),
             folder_template: output_opts.folder_template.clone(),
             filename_template: output_opts.filename_template.clone(),
+            folder_template_capitalize: output_opts.folder_template_capitalize,
+            filename_template_capitalize: output_opts.filename_template_capitalize,
             merge: match *output_opts.merge.selected_value() {
                 MergeMode::MultiFile => "multi-file".to_string(),
                 MergeMode::SingleImage => "single-image".to_string(),
@@ -1126,6 +1134,8 @@ impl TuiPreset {
         }
         output_opts.folder_template = self.folder_template.clone();
         output_opts.filename_template = self.filename_template.clone();
+        output_opts.folder_template_capitalize = self.folder_template_capitalize;
+        output_opts.filename_template_capitalize = self.filename_template_capitalize;
         output_opts.companion_extensions = self.companion_extensions.clone();
         output_opts.companion_folders = self.companion_folders.clone();
         output_opts.companion_exclude_files = self.companion_exclude_files.clone();
@@ -1903,6 +1913,26 @@ mod companion_preset_tests {
             &OutputOptionsState::new(),
             &MetadataState::default(),
         )
+    }
+
+    #[test]
+    fn conversion_preset_round_trips_the_unified_naming_pattern_and_tick() {
+        for naming in ["%TITLE%", "%ARTIST%/%ALBUM%/%TITLE%"] {
+            let mut output = OutputOptionsState::new();
+            output.set_naming_template(naming, true);
+            output.disc_subfolders.select_value(&true);
+            let preset = TuiPreset::from_pill_state("case", &FormatState::new(),
+                &output, &MetadataState::default());
+            let reloaded: TuiPreset = serde_json::from_str(
+                &serde_json::to_string(&preset).unwrap()).unwrap();
+            let mut restored = OutputOptionsState::new();
+            reloaded.apply_to_pills(&mut FormatState::new(), &mut restored,
+                &mut MetadataState::default());
+            assert_eq!(restored.naming_template(), naming);
+            assert!(restored.folder_template_capitalize);
+            assert!(restored.filename_template_capitalize);
+            assert!(*restored.disc_subfolders.selected_value());
+        }
     }
 
     #[test]

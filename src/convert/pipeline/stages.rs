@@ -59742,6 +59742,8 @@ fn render_template_with_tokens(
     track_extra: Option<&BTreeMap<String, String>>,
     album_extra: &BTreeMap<String, String>,
 ) -> String {
+    let (automatic_prefix, template, capitalize) =
+        crate::convert::renaming::decode_naming_capitalization(template);
     // %EXT% renders empty by design (append_default_extension is the
     // extension authority). Consume the template's `.%EXT%` separator+token
     // TOGETHER: leaving the literal dot behind produced `Title..flac` once
@@ -59750,7 +59752,41 @@ fn render_template_with_tokens(
     let template = template.replace(".%EXT%", "").replace("%EXT%", "");
     let conditional =
         render_conditional_template_blocks(&template, tokens, track_extra, album_extra);
-    render_template_segment(&conditional, tokens, track_extra, album_extra)
+    let rendered = render_template_segment(&conditional, tokens, track_extra, album_extra);
+    if capitalize {
+        // Conversion may insert an automatic disc subfolder before the
+        // filename pattern. Only components authored in this editor are
+        // subject to the filename capitalization setting.
+        let prefix = render_template_segment(
+            automatic_prefix, tokens, track_extra, album_extra);
+        format!("{}{}", prefix,
+            crate::convert::renaming::capitalize_naming_path(&rendered, None))
+    } else {
+        rendered
+    }
+}
+
+#[cfg(test)]
+mod naming_capitalization_tests {
+    use super::*;
+
+    #[test]
+    fn convert_case_only_changes_the_authored_template_segments() {
+        let mut tokens = BTreeMap::new();
+        tokens.insert("DISC_FOLDER".to_owned(), "disc 02".to_owned());
+        tokens.insert("ALBUM".to_owned(), "the dark side of the moon".to_owned());
+        tokens.insert("TITLE".to_owned(), "another brick in the wall".to_owned());
+        let pattern = "%ALBUM%/%TITLE%";
+        let marked = crate::convert::renaming::encode_naming_capitalization(pattern, true);
+        assert_eq!(render_template_with_tokens(
+            &format!("%DISC_FOLDER%/{marked}"), &tokens, None, &BTreeMap::new()),
+            "disc 02/The Dark Side of the Moon/Another Brick in the Wall");
+        assert_eq!(render_template_with_tokens(
+            &format!("%DISC_FOLDER%/{pattern}"), &tokens, None, &BTreeMap::new()),
+            "disc 02/the dark side of the moon/another brick in the wall");
+        assert_eq!(render_template_with_tokens(&marked, &tokens, None, &BTreeMap::new()),
+            "The Dark Side of the Moon/Another Brick in the Wall");
+    }
 }
 
 pub(crate) fn render_conditional_template_blocks(
