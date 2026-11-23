@@ -558,6 +558,8 @@ pub fn parse_companion_exclude_files(input: &str) -> Vec<String> {
     out
 }
 
+fn is_false(value: &bool) -> bool { !*value }
+
 /// Options for audio conversion
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversionOptions {
@@ -590,6 +592,11 @@ pub struct ConversionOptions {
     /// Output album/folder template. The same disc-number tokens are accepted
     /// here for independent per-track album-batch items.
     pub folder_template: Option<String>,
+
+    /// TUI-only flat-output policy for an authored Naming pattern without `/`.
+    /// Defaults to the existing album-folder policy for CLI and other callers.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub flat_output: bool,
 
     /// Whether to overwrite existing files
     pub overwrite: bool,
@@ -730,6 +737,7 @@ impl Default for ConversionOptions {
             replaygain_mode: None,
             naming_template: None,
             folder_template: None,
+            flat_output: false,
             overwrite: false,
             output_if_exists: None,
             partial_output: None,

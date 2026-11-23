@@ -497,7 +497,7 @@ impl TemplateBuilderState {
 
 /// Keep the beginning of a constructed name and mark its clipped end.
 /// The cap is measured in terminal cells, never bytes or Unicode scalars.
-fn clip_result(value: &str, cells: usize) -> String {
+pub(crate) fn clip_result(value: &str, cells: usize) -> String {
     if super::display_width::width(value) <= cells { return value.to_owned(); }
     if cells <= 3 { return ".".repeat(cells); }
     let mut result = String::new();
@@ -602,7 +602,7 @@ pub fn draw_template_builder(
     let (scope, marker) = match (state.target, state.return_to_extract.is_some()) {
         (_, true) => ("to folder and file names", if state.capitalize { "☒" } else { "☐" }),
         (TemplateTarget::Folder, false) => ("to folder names", if state.capitalize { "☒" } else { "☐" }),
-        (TemplateTarget::Filename, false) => ("to file names", if state.capitalize { "☒" } else { "☐" }),
+        (TemplateTarget::Filename, false) => ("to folder and file names", if state.capitalize { "☒" } else { "☐" }),
     };
     let caption = format!("  {marker} Apply TonePoet capitalization {scope}");
     f.render_widget(Paragraph::new(caption).style(Style::default()
@@ -618,7 +618,7 @@ pub fn draw_template_builder(
     }).unwrap_or_else(|| render_template_preview_with_case_and_extension(
         template, state.capitalize, &state.output_extension));
     // Exactly one empty row separates the tick from the resolved name.
-    draw_naming_preview(f, Rect::new(inner.x,inner.y+3,inner.width,1),
+    draw_naming_preview(f, Rect::new(inner.x+2,inner.y+3,inner.width.saturating_sub(2),1),
         &example,Style::default().fg(theme.text_bright));
 
     // The token grid wraps complete pills into rows. Scroll only this region,
@@ -675,7 +675,10 @@ pub fn draw_template_builder(
     ];
     let total_w: u16 = pills.iter().map(|(l, _, _)| super::display_width::width(l) as u16 + 2).sum::<u16>()
         + (pills.len().saturating_sub(1) as u16);
-    let left_pad = inner.width.saturating_sub(total_w) / 2;
+    // Center the complete footer, including Esc close. Centering only the
+    // pills clips the final e at 80-column terminals.
+    let close_label = "Esc close";
+    let left_pad = inner.width.saturating_sub(total_w + 2 + close_label.len() as u16) / 2;
     let mut x = inner.x + left_pad;
     let mut spans = vec![Span::raw(" ".repeat(left_pad as usize))];
     for (index, (label, button, color)) in pills.iter().enumerate() {
@@ -689,7 +692,7 @@ pub fn draw_template_builder(
         x += width;
     }
     spans.push(Span::raw("  "));
-    spans.push(Span::styled("Esc close", theme.muted()));
+    spans.push(Span::styled(close_label, theme.muted()));
     f.render_widget(Paragraph::new(Line::from(spans)),
         Rect::new(inner.x, footer_y, inner.width, 1));
 
@@ -1256,6 +1259,13 @@ mod tests {
             let shown=(popup.x+1..popup.x+popup.width-1)
                 .map(|x|b.get(x,preview_y).symbol().to_owned()).collect::<Vec<_>>().join("");
             assert!(shown.contains("→ ") && shown.contains("Wish"),"{shown:?}");
+            assert_eq!(b.get(popup.x+3, preview_y).symbol(), "→");
+            assert!(shown.starts_with("  → "), "preview left indent: {shown:?}");
+            let footer_y = popup.y + popup.height - 2;
+            let footer = (popup.x+1..popup.x+popup.width-1)
+                .map(|x| b.get(x, footer_y).symbol().to_owned())
+                .collect::<Vec<_>>().join("");
+            assert!(footer.contains("Esc close"), "footer at {width} columns: {footer:?}");
             assert!(!shown.contains("/home/"));
             assert!(buttons.button_rect(TuiButton::TemplateBuilderSavedTemplates).is_some());
             assert!(builder_token_viewport(area,&state).unwrap().y>preview_y);

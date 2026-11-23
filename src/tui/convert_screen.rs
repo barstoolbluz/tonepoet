@@ -15,7 +15,7 @@ use super::draw_header::draw_header;
 use super::draw_metadata::{draw_metadata_pane, draw_metadata_title_bar};
 use super::draw_output::{draw_format_pane, draw_format_title_bar, true_peak_custom_pill_offset, true_peak_info_offset};
 use super::draw_output_options::{
-    draw_output_options_pane, draw_output_options_title_bar,
+    draw_output_options_pane_with_preview, draw_output_options_title_bar, ConvertNamingPreview,
     register_output_options_mouse_targets,
 };
 use super::draw_preset_bar::draw_preset_bar;
@@ -102,7 +102,15 @@ pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme:
     if app.convert.is_collapsed(ConvertFocus::OutputOptions) {
         draw_output_options_title_bar(f, chunks[7], output_focused, theme);
     } else {
-        draw_output_options_pane(
+        let batch_overrides = matches!(&app.convert.source.mode, SourceMode::Batch { .. })
+            .then(|| super::draw_output_options::convert_batch_naming_overrides(
+                &app.convert.metadata));
+        let preview = ConvertNamingPreview::from_source(
+            &app.convert.source.mode,
+            &app.convert.output_options,
+            batch_overrides.as_ref().unwrap_or(&app.convert.metadata),
+        );
+        draw_output_options_pane_with_preview(
             f,
             chunks[7],
             &app.convert.output_options,
@@ -112,6 +120,7 @@ pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme:
             output_focused,
             app.convert.is_maximized(ConvertFocus::OutputOptions),
             app.conversion_actions_ui_enabled(),
+            preview,
             theme,
         );
     }

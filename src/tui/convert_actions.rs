@@ -134,9 +134,10 @@ fn fallback_options(output_opts: &OutputOptionsState, config: &TonepoetConfig) -
         .then_some(format.bit_depth.selected_value().to_backend_depth());
     options.dither_type = Some(*format.dither.selected_value());
     options.naming_template = Some(crate::convert::renaming::encode_naming_capitalization(
-            &output_opts.filename_template, output_opts.filename_template_capitalize));
+            &output_opts.conversion_filename_template(), output_opts.filename_template_capitalize));
     options.folder_template = Some(crate::convert::renaming::encode_naming_capitalization(
-            &output_opts.folder_template, output_opts.folder_template_capitalize));
+            &output_opts.conversion_folder_template(), output_opts.folder_template_capitalize));
+    options.flat_output = output_opts.folder_template.is_empty();
     options.output_dir = output_opts.dest_path.clone();
     options.merge_to_single = matches!(*output_opts.merge.selected_value(), MergeMode::SingleImage);
     options.preserve_metadata = true;
@@ -158,8 +159,82 @@ fn fallback_options(output_opts: &OutputOptionsState, config: &TonepoetConfig) -
     // `ConversionOptions::effective_naming_template` adds any automatic
     // disc-folder prefix exactly once at the request boundary.
     options.naming_template = Some(crate::convert::renaming::encode_naming_capitalization(
-            &output_opts.filename_template, output_opts.filename_template_capitalize));
+            &output_opts.conversion_filename_template(), output_opts.filename_template_capitalize));
     options
+}
+
+/// Freeze the optional album-folder policy from the Convert source probe at
+/// admission, not during redraw or inside the conversion engine. Stable album
+/// prefixes and authored flat filenames already have their correct policy.
+/// Batch mode has only cursor metadata, not album metadata for every member;
+/// it must not apply one cursor's absent tag to unrelated queue items.
+pub(crate) fn apply_optional_naming_folder_for_source(
+    options: &mut ConversionOptions,
+    output_opts: &OutputOptionsState,
+    format: &FormatState,
+    source: &crate::tui::app::SourceMode,
+    metadata: &crate::tui::app::MetadataState,
+) {
+    if matches!(source, crate::tui::app::SourceMode::Batch { .. }) {
+        return;
+    }
+    let preview = crate::tui::draw_output_options::ConvertNamingPreview::from_source(
+        source, output_opts, metadata,
+    );
+    if let Some(empty) = crate::tui::draw_output_options::optional_convert_album_folder_is_empty(
+        output_opts, format, source.current_info(), preview,
+    ) {
+        options.flat_output = empty;
+    }
+}
+
+/// Resolve optional album folders once per independent batch input, not from
+/// the selected cursor. Read tags only for templates whose entire album prefix
+/// might disappear. The caller applies each policy to that item's options and
+/// executable request together, before queue publication.
+pub(crate) fn batch_optional_naming_flat_output_policies(
+    paths: &[std::path::PathBuf],
+    output_opts: &OutputOptionsState,
+    format: &FormatState,
+    metadata: &MetadataState,
+    mut read_tags: impl FnMut(&std::path::Path) -> Option<crate::tui::probe::SourceMetadata>,
+) -> std::collections::BTreeMap<std::path::PathBuf, bool> {
+    let mut policies = std::collections::BTreeMap::new();
+    if output_opts.folder_template.is_empty()
+        || OutputOptionsState::has_stable_album_prefix(&output_opts.folder_template) {
+        return policies;
+    }
+    // These tokens need technical audio facts rather than just tags. The
+    // established per-album policy already applies; don't read tags in vain.
+    let folder = output_opts.conversion_folder_template();
+    if folder.contains("%SAMPLERATE%") || folder.contains("%BITDEPTH%") {
+        return policies;
+    }
+
+    // Batch metadata editing exposes only AlbumArtist. The other metadata
+    // fields may hold the *cursor's* source tags, not user overrides; they
+    // must not overwrite a different batch member's YEAR or GENRE.
+    let overrides = crate::tui::draw_output_options::convert_batch_naming_overrides(metadata);
+    for path in paths {
+        let Some(source_metadata) = read_tags(path) else { continue; };
+        let preview = crate::tui::draw_output_options::ConvertNamingPreview {
+            source_metadata: &source_metadata,
+            album_metadata: None,
+            selected_track: None,
+            archive_track: false,
+            album_title: None,
+            album_artist: None,
+            multi_disc_proven: false,
+            overrides: &overrides,
+            source_path: path,
+        };
+        if let Some(empty) = crate::tui::draw_output_options::optional_convert_album_folder_for_probed_tags(
+            output_opts, format, preview,
+        ) {
+            policies.insert(path.clone(), empty);
+        }
+    }
+    policies
 }
 
 /// Build ConversionOptions and validate unified pipeline settings on the release path.
@@ -275,9 +350,10 @@ pub fn try_pills_to_options(
         // Store the authored template with its case marker; the request
         // projection adds automatic disc folders exactly once.
         naming_template: Some(crate::convert::renaming::encode_naming_capitalization(
-            &output_opts.filename_template, output_opts.filename_template_capitalize)),
+            &output_opts.conversion_filename_template(), output_opts.filename_template_capitalize)),
         folder_template: Some(crate::convert::renaming::encode_naming_capitalization(
-            &output_opts.folder_template, output_opts.folder_template_capitalize)),
+            &output_opts.conversion_folder_template(), output_opts.folder_template_capitalize)),
+        flat_output: output_opts.folder_template.is_empty(),
         output_dir: output_opts.dest_path.clone(),
         merge_to_single: matches!(merge, MergeMode::SingleImage),
         preserve_metadata: true,
@@ -1682,6 +1758,522 @@ mod lifecycle_forwarder_tests {
         let settings = options.pipeline_settings.expect("pipeline settings attached");
         assert_eq!(settings.target_sample_rate, pipeline_enums::RateTarget::Source);
         assert_eq!(settings.target_bit_depth, pipeline_enums::BitDepthTarget::Source);
+    }
+
+    #[test]
+    fn convert_one_line_naming_preserves_routing_and_case_in_request_projection() {
+        let mut output = OutputOptionsState::new();
+        let format = FormatState::new();
+        output.set_naming_template("%ALBUM%/%TRACKNUMBER% - %TITLE%.%EXTENSION%", true);
+        output.disc_subfolders.select_value(&true);
+        let foldered = try_pills_to_options(&format, &output, &TonepoetConfig::default())
+            .expect("foldered naming projection");
+        assert!(!foldered.flat_output);
+        assert!(foldered.create_disc_subfolders);
+        assert_eq!(foldered.folder_template.as_deref().map(
+            crate::convert::renaming::decode_naming_capitalization).map(|(_, name, cap)|
+            (name.to_string(), cap)), Some(("%ALBUM%".to_owned(), true)));
+        assert_eq!(foldered.naming_template.as_deref().map(
+            crate::convert::renaming::decode_naming_capitalization).map(|(_, name, cap)|
+            (name.to_string(), cap)),
+            Some(("%TRACKNN% - %TITLE%.%EXT%".to_owned(), true)));
+        assert_eq!(output.naming_template(),
+            "%ALBUM%/%TRACKNUMBER% - %TITLE%.%EXTENSION%");
+
+        output.set_naming_template("%TITLE%", false);
+        let flat = try_pills_to_options(&format, &output, &TonepoetConfig::default())
+            .expect("flat naming projection");
+        assert!(flat.flat_output);
+        assert!(flat.create_disc_subfolders);
+        assert_eq!(flat.folder_template.as_deref(), Some(""));
+        assert_eq!(flat.naming_template.as_deref(), Some("%TITLE%"));
+    }
+
+    #[test]
+    fn optional_album_folder_uses_album_scope_before_source_resolution() {
+        let format = FormatState::new();
+        let mut output = OutputOptionsState::new();
+        for disc_dirs in [false, true] {
+            output.disc_subfolders.select_value(&disc_dirs);
+            output.set_naming_template("%DISC%/%TRACKNN% - %TITLE%", false);
+            let disc = try_pills_to_options(&format, &output,
+                &TonepoetConfig::default()).expect("track-scoped disc");
+            assert!(disc.flat_output);
+            assert_eq!(disc.folder_template.as_deref(), Some(""));
+            assert_eq!(disc.naming_template.as_deref(),
+                Some("%DISC%/%TRACKNN% - %TITLE%"));
+            assert_eq!(disc.create_disc_subfolders, disc_dirs);
+
+            for (pattern, folder) in [
+                ("{%YEAR%}/%TRACKNN% - %TITLE%", "{%YEAR%}"),
+                ("%YEAR%/%TRACKNN% - %TITLE%", "%YEAR%"),
+                ("%GENRE%/%TRACKNN% - %TITLE%", "%GENRE%"),
+                ("%ALBUM%/{%YEAR%}/%TRACKNN% - %TITLE%", "%ALBUM%/{%YEAR%}"),
+            ] {
+                output.set_naming_template(pattern, false);
+                let options = try_pills_to_options(&format, &output,
+                    &TonepoetConfig::default()).expect("album-scoped naming");
+                assert!(!options.flat_output, "{pattern}");
+                assert_eq!(options.folder_template.as_deref(), Some(folder), "{pattern}");
+                assert_eq!(options.naming_template.as_deref(),
+                    Some("%TRACKNN% - %TITLE%"), "{pattern}");
+                assert_eq!(options.create_disc_subfolders, disc_dirs);
+            }
+        }
+    }
+
+    fn naming_probe_info() -> crate::tui::probe::SourceInfo {
+        crate::tui::probe::SourceInfo {
+            format_name: "FLAC".into(), codec: "flac".into(),
+            bit_depth: Some(24), sample_format_is_float: Some(false),
+            compression_is_lossless: Some(true), sample_rate: 44_100,
+            channels: 2, channel_layout: "stereo".into(),
+            duration_secs: 120.0, file_size: 1024,
+        }
+    }
+
+    fn naming_test_source(year: Option<&str>) -> SourceMode {
+        SourceMode::MultiTrack {
+            path: PathBuf::from("/music/album.cue"),
+            info: Some(naming_probe_info()),
+            metadata: crate::tui::probe::SourceMetadata {
+                title: Some("Album".into()), album: Some("Album".into()),
+                genre: Some("Jazz".into()), year: year.map(str::to_owned),
+                ..Default::default()
+            },
+            tracks: vec![
+                MultiTrackEntry { number: 1, title: Some("Opening".into()),
+                    performer: Some("Singer One".into()), duration_display: None },
+                MultiTrackEntry { number: 2, title: Some("Second".into()),
+                    performer: Some("Singer Two".into()), duration_display: None },
+            ],
+            area_label: None, album_title: Some("Album".into()),
+            album_artist: Some("Various Artists".into()), probe_notice: None,
+            scroll: 0, cursor: 1, selected: vec![true, true],
+            archive_preview: None, disc_contents: None,
+            selected_presentation_id: None,
+        }
+    }
+
+    fn prepared_naming_album(year: Option<&str>) -> crate::convert::pipeline::PreparedSource {
+        use crate::convert::pipeline::{AlbumMetadata, ExtractionProvenance,
+            PreparedSource, PreparedTrack, SourceAudioDescriptor, SourceAudioCoding,
+            SourceKind, TrackId, TrackMetadata, TrackSourceRef};
+        let tracks = ["Opening", "Second"].into_iter().enumerate()
+            .map(|(i, title)| PreparedTrack {
+                id: TrackId { source_ordinal: i as u32 + 1,
+                    disc_number: Some(i as u32 + 1), track_number: i as u32 + 1 },
+                source_ref: TrackSourceRef::StagedFile(PathBuf::from(format!("/stage/{i}.wav"))),
+                metadata: TrackMetadata { title: Some(title.into()),
+                    track_number: Some(i as u32 + 1),
+                    genre: Some(if i == 0 {"Jazz"} else {"Funk"}.into()).into(),
+                    ..Default::default() },
+                expected_samples: Some(44_100), sample_rate: Some(44_100),
+                source_audio: SourceAudioDescriptor::from_scalar(
+                    Some(44_100), Some(24), Some(SourceAudioCoding::Pcm)),
+                bit_depth: Some(24), warnings: Vec::new(),
+            }).collect();
+        PreparedSource {
+            container: PathBuf::from("/music/album.cue"), kind: SourceKind::CueImage,
+            tracks,
+            album_metadata: AlbumMetadata {
+                album: Some("Album".into()),
+                album_artist: Some("Various Artists".into()).into(),
+                genre: Some("Jazz".into()).into(), date: year.map(str::to_owned),
+                total_tracks: 2, total_discs: Some(2), ..Default::default()
+            },
+            provenance: ExtractionProvenance {
+                source_kind: SourceKind::CueImage, source_sha256: None,
+                tool_versions: Default::default(), extracted_at: chrono::Utc::now(),
+            },
+        }
+    }
+
+    fn planned_naming_outputs(
+        source: &crate::convert::pipeline::PreparedSource,
+        options: ConversionOptions,
+        root: &std::path::Path,
+    ) -> Result<crate::convert::pipeline::AlbumPlan, String> {
+        let mut options = options;
+        options.output_dir = Some(root.to_owned());
+        let settings = options.pipeline_settings.clone().expect("pipeline settings");
+        let item = ConversionItem::new(PathBuf::from("/music/album.cue"),
+            FileFormat::Audio(AudioFormat::Flac), options);
+        let mut req = crate::convert::pipeline::unified_request::build_pipeline_request_from_settings(
+            &item, settings).map_err(|err| err.to_string())?;
+        // Mirror the queue boundary: prepend the automatic disc-folder
+        // component exactly once, independently of the album folder.
+        req.naming.template = item.options.effective_naming_template("%NN% - %TITLE%");
+        crate::convert::pipeline::stages::plan_outputs(source, &req)
+            .map_err(|err| err.to_string())
+    }
+
+    #[test]
+    fn one_line_and_two_field_album_roots_match_real_planner_and_keep_both() {
+        let format = FormatState::new();
+        let config = TonepoetConfig::default();
+        let metadata = MetadataState::default();
+        let temp = tempfile::tempdir().expect("isolated destination");
+        for disc_dirs in [false, true] {
+            for (pattern, folder, filename, year, expected_root) in [
+                ("%GENRE%/%TRACKNN% - %TITLE%", "%GENRE%",
+                    "%TRACKNN% - %TITLE%", Some("2001"), "Jazz"),
+                ("%YEAR%/%TRACKNN% - %TITLE%", "%YEAR%",
+                    "%TRACKNN% - %TITLE%", Some("2001"), "2001"),
+                ("{%YEAR%}/%TRACKNN% - %TITLE%", "{%YEAR%}",
+                    "%TRACKNN% - %TITLE%", Some("2001"), "{2001}"),
+                ("Album/{%YEAR%}/%TRACKNN% - %TITLE%", "Album/{%YEAR%}",
+                    "%TRACKNN% - %TITLE%", None, "Album"),
+            ] {
+                let mut output = OutputOptionsState::new();
+                output.disc_subfolders.select_value(&disc_dirs);
+                output.set_naming_template(pattern, false);
+                let mut new_opts = try_pills_to_options(&format, &output, &config).unwrap();
+                let source_mode = naming_test_source(year);
+                apply_optional_naming_folder_for_source(&mut new_opts, &output,
+                    &format, &source_mode, &metadata);
+                assert!(!new_opts.flat_output, "present album folder {pattern}");
+
+                let source = prepared_naming_album(year);
+                let mut old_opts = new_opts.clone();
+                old_opts.folder_template = Some(folder.into());
+                old_opts.naming_template = Some(filename.into());
+                old_opts.flat_output = false;
+                let root = temp.path().join(format!("root-{}-{}",
+                    disc_dirs, pattern.len()));
+                let new_plan = planned_naming_outputs(&source, new_opts.clone(), &root).unwrap();
+                let old_plan = planned_naming_outputs(&source, old_opts, &root).unwrap();
+                assert_eq!(new_plan.album_dir, old_plan.album_dir, "{pattern}");
+                let new_paths: Vec<_> = new_plan.entries.iter().map(|e| &e.final_path).collect();
+                let old_paths: Vec<_> = old_plan.entries.iter().map(|e| &e.final_path).collect();
+                assert_eq!(new_paths, old_paths, "{pattern}");
+                assert_eq!(new_plan.album_dir, root.join(expected_root), "{pattern}");
+                assert!(new_plan.entries[1].final_path.starts_with(&new_plan.album_dir));
+                if disc_dirs {
+                    assert!(new_plan.entries[1].final_path.to_string_lossy()
+                        .contains("disc 02"), "proved second disc: {pattern}");
+                } else {
+                    assert!(!new_plan.entries[1].final_path.to_string_lossy()
+                        .contains("disc 02"), "disc dirs off: {pattern}");
+                }
+                if pattern.starts_with("%GENRE%") {
+                    assert!(new_plan.entries[1].final_path.starts_with(root.join("Jazz")),
+                        "album genre, not second track's Funk, owns folder");
+                }
+                let mut keep_both = new_opts;
+                keep_both.output_if_exists = Some(crate::convert::pipeline::OverwritePolicy::KeepBoth);
+                let keep_plan = planned_naming_outputs(&source, keep_both.clone(), &root)
+                    .expect("Keep Both needs real album folder");
+                assert_eq!(keep_plan.album_dir, new_plan.album_dir,
+                    "no existing collision: Keep Both retains album root");
+                std::fs::create_dir_all(&new_plan.album_dir).expect("occupy album folder");
+                let occupied = planned_naming_outputs(&source, keep_both, &root)
+                    .expect("Keep Both disambiguates occupied album folder");
+                assert_ne!(occupied.album_dir, new_plan.album_dir, "{pattern}");
+                assert!(occupied.album_dir.starts_with(&root));
+                assert!(occupied.entries.iter().all(|entry|
+                    entry.final_path.starts_with(&occupied.album_dir)));
+            }
+            // With no year, the authored optional folder vanishes and the
+            // TUI must opt into the existing flat publishing path.
+            for pattern in ["%YEAR%/%TRACKNN% - %TITLE%",
+                "{%YEAR%}/%TRACKNN% - %TITLE%"] {
+                let mut output = OutputOptionsState::new();
+                output.disc_subfolders.select_value(&disc_dirs);
+                output.set_naming_template(pattern, false);
+                let mut options = try_pills_to_options(&format, &output, &config).unwrap();
+                let mode = naming_test_source(None);
+                apply_optional_naming_folder_for_source(&mut options, &output,
+                    &format, &mode, &metadata);
+                assert!(options.flat_output, "missing optional album folder: {pattern}");
+                let root = temp.path().join("missing-year");
+                let plan = planned_naming_outputs(&prepared_naming_album(None), options, &root)
+                    .expect("missing year must not reject valid flat output");
+                assert_eq!(plan.album_dir, root);
+                assert!(plan.entries.iter().all(|entry| entry.final_path.starts_with(&root)));
+
+                // A user year override makes the folder real, even when the
+                // source has no year tag. The normal planner then retains its
+                // album root for logs, companions, and Keep Both.
+                let mut override_options = try_pills_to_options(&format, &output,
+                    &config).unwrap();
+                let override_metadata = MetadataState {
+                    year: Some("2018".into()), ..Default::default()
+                };
+                apply_optional_naming_folder_for_source(&mut override_options, &output,
+                    &format, &mode, &override_metadata);
+                assert!(!override_options.flat_output,
+                    "authored year override has a real album root: {pattern}");
+                let overridden_plan = planned_naming_outputs(
+                    &prepared_naming_album(Some("2018")), override_options, &root)
+                    .expect("overridden year must plan within album folder");
+                assert!(overridden_plan.album_dir.starts_with(&root));
+                assert_ne!(overridden_plan.album_dir, root);
+            }
+        }
+    }
+
+    #[test]
+    fn batch_optional_folder_is_decided_per_item_and_retains_album_roots() {
+        use crate::tui::probe::SourceMetadata;
+        let format = FormatState::new();
+        let config = TonepoetConfig::default();
+        let dated = PathBuf::from("/music/dated.flac");
+        let undated = PathBuf::from("/music/undated.flac");
+        let paths = [dated.clone(), undated.clone()];
+        let mut output = OutputOptionsState::new();
+        let temp = tempfile::tempdir().expect("temporary destination");
+        let mut cursor_metadata = MetadataState::default();
+        // Batch UI state may carry cursor-0's source tags; those do not
+        // override another member's own tags.
+        cursor_metadata.year = Some("2001".into());
+        cursor_metadata.genre = Some("Jazz".into());
+
+        for disc_dirs in [false, true] {
+            output.disc_subfolders.select_value(&disc_dirs);
+            for (pattern, present, present_dir) in [
+                ("{%YEAR%}/%TRACKNN% - %TITLE%", "2001", "{2001}"),
+                ("%YEAR%/%TRACKNN% - %TITLE%", "2001", "2001"),
+                ("%GENRE%/%TRACKNN% - %TITLE%", "Jazz", "Jazz"),
+            ] {
+                output.set_naming_template(pattern, false);
+                let mut reads = Vec::new();
+                let policies = batch_optional_naming_flat_output_policies(
+                    &paths, &output, &format, &cursor_metadata, |path| {
+                        reads.push(path.to_path_buf());
+                        Some(SourceMetadata {
+                            year: (path == dated.as_path()).then(|| "2001".into()),
+                            genre: (path == dated.as_path()).then(|| "Jazz".into()),
+                            ..Default::default()
+                        })
+                    },
+                );
+                assert_eq!(reads, paths.to_vec());
+                assert_eq!(policies.get(&dated), Some(&false), "{pattern}");
+                assert_eq!(policies.get(&undated), Some(&true), "{pattern}");
+                for path in &paths {
+                    let mut options = try_pills_to_options(&format, &output, &config).unwrap();
+                    options.flat_output = policies[path];
+                    let mut prepared = prepared_naming_album(
+                        (path == &dated).then_some(present).filter(|_| pattern.contains("YEAR"))
+                    );
+                    prepared.container = path.clone();
+                    prepared.album_metadata.genre = (path == &dated)
+                        .then(|| "Jazz".to_string()).into();
+                    let root = temp.path().join(format!("{}-{}-{}",
+                        disc_dirs, path.file_stem().unwrap().to_string_lossy(), pattern.len()));
+                    let plan = planned_naming_outputs(&prepared, options.clone(), &root)
+                        .expect("each batch input must plan independently");
+                    let album_root = if path == &dated {
+                        root.join(present_dir)
+                    } else {root.clone()};
+                    assert_eq!(plan.album_dir, album_root, "{pattern}, {:?}", path);
+                    assert!(plan.entries.iter().all(|entry|
+                        entry.final_path.starts_with(&plan.album_dir)));
+                    let filenames: Vec<_> = plan.entries.iter().map(|entry|
+                        entry.final_path.to_string_lossy().into_owned()).collect();
+                    assert_eq!(filenames.iter().any(|name| name.contains("disc 02")), disc_dirs,
+                        "automatic disc folders follow their existing policy");
+                    if path == &dated {
+                        // A real album root is necessary for the existing
+                        // Keep Both and companion/log destination policy.
+                        options.output_if_exists = Some(
+                            crate::convert::pipeline::OverwritePolicy::KeepBoth);
+                        let first = planned_naming_outputs(&prepared, options.clone(), &root).unwrap();
+                        assert_eq!(first.album_dir, album_root);
+                        std::fs::create_dir_all(&first.album_dir).unwrap();
+                        let displaced = planned_naming_outputs(&prepared, options, &root).unwrap();
+                        assert_ne!(displaced.album_dir, first.album_dir);
+                        assert!(displaced.album_dir.starts_with(&root));
+                    }
+                }
+            }
+        }
+
+        // Stable album prefixes cannot disappear: skip any additional tag I/O.
+        output.set_naming_template("%ALBUM%/{%YEAR%}/%TITLE%", false);
+        let policies = batch_optional_naming_flat_output_policies(
+            &paths, &output, &format, &cursor_metadata, |_| {
+                panic!("stable prefix must not read batch tags")
+            },
+        );
+        assert!(policies.is_empty());
+        output.set_naming_template("%TITLE%", false);
+        let policies = batch_optional_naming_flat_output_policies(
+            &paths, &output, &format, &cursor_metadata, |_| {
+                panic!("flat naming must not read batch tags")
+            },
+        );
+        assert!(policies.is_empty());
+    }
+
+    #[test]
+    fn batch_optional_folders_use_exact_selected_cue_metadata_authority() {
+        use crate::convert::pipeline::CueSidecarPolicy;
+        use std::collections::{BTreeMap, HashSet};
+
+        let temp = tempfile::tempdir().expect("temporary album");
+        let with_cue = temp.path().join("with_cue.flac");
+        let plain = temp.path().join("plain.flac");
+        let cue_path = temp.path().join("with_cue.cue");
+        let flac = include_bytes!("../../tests/fixtures/silence.flac");
+        std::fs::write(&with_cue, flac).unwrap();
+        std::fs::write(&plain, flac).unwrap();
+        let paths = [with_cue.clone(), plain.clone()];
+        let config = TonepoetConfig::default();
+        let format = FormatState::new();
+        let source_metadata = crate::tui::probe::read_metadata(&with_cue).unwrap();
+        assert!(source_metadata.year.is_none());
+        assert!(source_metadata.genre.is_none());
+
+        for (cue_year, cue_genre) in [(true, true), (false, false),
+            (true, false), (false, true)] {
+            let cue = format!(
+                "{}{}TITLE \"Cue Album\"\nPERFORMER \"Album Performer\"\n\
+                 FILE \"with_cue.flac\" FLAC\n  TRACK 01 AUDIO\n    TITLE \"Opening\"\n    INDEX 01 00:00:00\n\
+                   TRACK 02 AUDIO\n    TITLE \"Second\"\n    INDEX 01 00:00:02\n",
+                if cue_year { "REM DATE 1973\n" } else { "" },
+                if cue_genre { "REM GENRE Jazz\n" } else { "" },
+            );
+            std::fs::write(&cue_path, cue).unwrap();
+
+            let decision = crate::tui::app::resolve_convert_preview_authority(
+                &with_cue, &HashSet::new(), &BTreeMap::new(),
+                &config.conversion.aggregate_metadata_target_priority, None,
+            );
+            assert_eq!(decision.cue_sidecar_override, Some(CueSidecarPolicy::SidecarOnly));
+            let authoritative = crate::tui::app::read_convert_naming_metadata_for_cue_decision(
+                &with_cue, &decision,
+            ).expect("selected CUE metadata");
+            assert_eq!(authoritative.year.as_deref(), cue_year.then_some("1973"));
+            assert_eq!(authoritative.genre.as_deref(), cue_genre.then_some("Jazz"));
+            let (_, cursor_metadata, notice) = crate::tui::app::probe_convert_source_for_message(
+                &with_cue, decision.cue_sidecar_override,
+                decision.sidecar_cue_track_metadata.as_ref(),
+            );
+            assert!(notice.is_none(), "source-aware cursor probe: {notice:?}");
+            assert_eq!(cursor_metadata.year, authoritative.year);
+            assert_eq!(cursor_metadata.genre, authoritative.genre);
+
+            for disc_dirs in [false, true] {
+                for (pattern, expected_folder) in [
+                    ("%YEAR%/%TRACKNN% - %TITLE%", cue_year.then_some("1973")),
+                    ("%GENRE%/%TRACKNN% - %TITLE%", cue_genre.then_some("Jazz")),
+                ] {
+                    let mut output = OutputOptionsState::new();
+                    output.set_naming_template(pattern, false);
+                    output.disc_subfolders.select_value(&disc_dirs);
+                    let policies = batch_optional_naming_flat_output_policies(
+                        &paths, &output, &format, &MetadataState::default(), |path| {
+                            let decision = crate::tui::app::resolve_convert_preview_authority(
+                                path, &HashSet::new(), &BTreeMap::new(),
+                                &config.conversion.aggregate_metadata_target_priority, None,
+                            );
+                            crate::tui::app::read_convert_naming_metadata_for_cue_decision(
+                                path, &decision,
+                            )
+                        },
+                    );
+                    assert_eq!(policies.get(&with_cue), Some(&expected_folder.is_none()),
+                        "selected CUE policy for {pattern}, disc dirs={disc_dirs}");
+                    assert_eq!(policies.get(&plain), Some(&true),
+                        "unassociated FLAC must stay on tag-only flat policy");
+                    for path in &paths {
+                        let mut options = try_pills_to_options(&format, &output, &config).unwrap();
+                        options.flat_output = policies[path];
+                        let root = temp.path().join(format!(
+                            "result-{}-{}-{}-{}-{}", cue_year, cue_genre, disc_dirs,
+                            pattern.len(), path.file_stem().unwrap().to_string_lossy(),
+                        ));
+                        let date = (path == &with_cue && cue_year).then_some("1973");
+                        let mut prepared = prepared_naming_album(date);
+                        prepared.container = path.clone();
+                        prepared.album_metadata.genre = (path == &with_cue && cue_genre)
+                            .then(|| "Jazz".to_string()).into();
+                        // This fixture does not establish multi-disc evidence.
+                        prepared.album_metadata.total_discs = None;
+                        for track in &mut prepared.tracks {
+                            track.id.disc_number = None;
+                        }
+                        let plan = planned_naming_outputs(&prepared, options.clone(), &root)
+                            .expect("optional CUE folder must produce a valid plan");
+                        let expected = if path == &with_cue {
+                            expected_folder.map_or_else(|| root.clone(), |folder| root.join(folder))
+                        } else { root.clone() };
+                        assert_eq!(plan.album_dir, expected, "{pattern}, {path:?}");
+                        assert!(plan.entries.iter().all(|entry| entry.final_path.starts_with(&expected)));
+                        assert!(plan.entries.iter().all(|entry|
+                            !entry.final_path.to_string_lossy().contains("disc 02")));
+                        if path == &with_cue && expected_folder.is_some() {
+                            options.output_if_exists = Some(
+                                crate::convert::pipeline::OverwritePolicy::KeepBoth,
+                            );
+                            std::fs::create_dir_all(&plan.album_dir).unwrap();
+                            let displaced = planned_naming_outputs(&prepared, options, &root)
+                                .expect("Keep Both must retain a real album-root policy");
+                            assert_ne!(displaced.album_dir, plan.album_dir);
+                            assert!(displaced.album_dir.starts_with(&root));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_date_year_album_root_matches_existing_planner() {
+        let format = FormatState::new();
+        let config = TonepoetConfig::default();
+        let metadata = MetadataState::default();
+        let temp = tempfile::tempdir().unwrap();
+        for disc_dirs in [false, true] {
+            for pattern in ["%YEAR%/%TRACKNN% - %TITLE%",
+                "{%YEAR%}/%TRACKNN% - %TITLE%"] {
+                let mut output = OutputOptionsState::new();
+                output.set_naming_template(pattern, false);
+                output.disc_subfolders.select_value(&disc_dirs);
+                for (date, expected_year) in [
+                    (Some("2020-05-17"), Some("2020")),
+                    (Some("1984"), Some("1984")),
+                    (Some("March 1971"), Some("1971")),
+                    (None, None),
+                ] {
+                    let mut opts = try_pills_to_options(&format, &output, &config).unwrap();
+                    apply_optional_naming_folder_for_source(&mut opts, &output,
+                        &format, &naming_test_source(date), &metadata);
+                    assert_eq!(opts.flat_output, expected_year.is_none());
+                    let root = temp.path().join("date-root");
+                    let plan = planned_naming_outputs(&prepared_naming_album(date), opts, &root)
+                        .expect("planner must accept full, short, and missing DATE");
+                    let expected_root = match expected_year {
+                        Some(year) if pattern.starts_with('{') => root.join(format!("{{{year}}}")),
+                        Some(year) => root.join(year),
+                        None => root,
+                    };
+                    assert_eq!(plan.album_dir, expected_root,
+                        "pattern={pattern}, date={date:?}, disc_dirs={disc_dirs}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batch_optional_folder_uses_only_proven_metadata() {
+        use crate::tui::probe::SourceMetadata;
+        let format = FormatState::new();
+        let mut output = OutputOptionsState::new();
+        output.set_naming_template("{%YEAR%}/%TITLE%", false);
+        let paths = [PathBuf::from("known.flac"), PathBuf::from("unreadable.flac")];
+        let policies = batch_optional_naming_flat_output_policies(
+            &paths, &output, &format, &MetadataState::default(), |path| {
+                if path == paths[0].as_path() {
+                    Some(SourceMetadata {year: None, ..Default::default()})
+                } else {None}
+            },
+        );
+        assert_eq!(policies.get(&paths[0]), Some(&true));
+        assert_eq!(policies.get(&paths[1]), None,
+            "unreadable tags must not be mistaken for confirmed missing metadata");
     }
 
     #[test]

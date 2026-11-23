@@ -3961,7 +3961,7 @@ fn convert_output_options_field_value(
                 .unwrap_or_default(),
         ),
         OutputOptionsField::FolderTemplate => Some(output.folder_template.clone()),
-        OutputOptionsField::FilenameTemplate => Some(output.filename_template.clone()),
+        OutputOptionsField::FilenameTemplate => Some(output.naming_template()),
         OutputOptionsField::MergeMode => Some(output.merge.selected_label().to_string()),
         OutputOptionsField::CompanionExtensions => Some(output.companion_extensions.clone()),
         OutputOptionsField::CompanionFolders => Some(output.companion_folders.clone()),
@@ -4938,7 +4938,7 @@ fn output_options_field_value(app: &AppState, field: OutputOptionsField) -> Stri
             .map(|p| p.display().to_string())
             .unwrap_or_default(),
         OutputOptionsField::FolderTemplate => app.convert.output_options.folder_template.clone(),
-        OutputOptionsField::FilenameTemplate => app.convert.output_options.filename_template.clone(),
+        OutputOptionsField::FilenameTemplate => app.convert.output_options.naming_template(),
         OutputOptionsField::CompanionExtensions => app.convert.output_options.companion_extensions.clone(),
         OutputOptionsField::CompanionFolders => app.convert.output_options.companion_folders.clone(),
         OutputOptionsField::ExcludeFiles => app.convert.output_options.companion_exclude_files.clone(),
@@ -4995,7 +4995,8 @@ fn commit_output_options_inline_edit(app: &mut AppState) {
             app.preset.mark_modified();
         }
         OutputOptionsField::FilenameTemplate => {
-            app.convert.output_options.filename_template = trimmed.to_string();
+            let capitalize = app.convert.output_options.filename_template_capitalize;
+            app.convert.output_options.set_naming_template(trimmed, capitalize);
             app.preset.mark_modified();
         }
         OutputOptionsField::CompanionExtensions => {
@@ -7186,14 +7187,15 @@ mod inline_edit_behavior_tests {
     fn output_inline_escape_cancels_without_mutating_value() {
         let (tx, _rx) = channel();
         let mut app = convert_output_app();
-        app.convert.output_options.folder_template = "original".to_string();
-        begin_output_options_inline_edit(&mut app, OutputOptionsField::FolderTemplate, None);
+        app.convert.output_options.set_naming_template("original/track", true);
+        begin_output_options_inline_edit(&mut app, OutputOptionsField::FilenameTemplate, None);
         app.convert.output_options.edit_input.set_text_and_cursor("edited".to_string(), "edited".len());
 
         handle_key(&mut app, key(KeyCode::Esc), &tx);
 
         assert_eq!(app.convert.output_options.editing, None);
-        assert_eq!(app.convert.output_options.folder_template, "original");
+        assert_eq!(app.convert.output_options.naming_template(), "original/track");
+        assert!(app.convert.output_options.filename_template_capitalize);
     }
 
     #[test]
@@ -49928,8 +49930,7 @@ fn apply_shared_template(app:&mut AppState,target:TemplateTarget,template:String
                 app.convert.output_options.folder_template_capitalize=capitalize;
             },
             TemplateTarget::Filename=>{
-                app.convert.output_options.filename_template=template;
-                app.convert.output_options.filename_template_capitalize=capitalize;
+                app.convert.output_options.set_naming_template(&template, capitalize);
             },
         }
         app.preset.mark_modified();
@@ -50019,7 +50020,7 @@ fn open_template_picker(app: &mut AppState, target: TemplateTarget) {
     let templates = super::template_builder::list_templates(target);
     let active = match target {
         TemplateTarget::Folder => Some(app.convert.output_options.folder_template.clone()),
-        TemplateTarget::Filename => Some(app.convert.output_options.filename_template.clone()),
+        TemplateTarget::Filename => Some(app.convert.output_options.naming_template()),
     };
     let preview = if let Some(tmpl) = templates.first() {
         super::template_builder::preview_for_context_with_extension(
@@ -55230,7 +55231,8 @@ fn apply_text_edit(
             app.preset.mark_modified();
         }
         TextEditTarget::FilenameTemplate => {
-            app.convert.output_options.filename_template = trimmed.to_string();
+            let capitalize = app.convert.output_options.filename_template_capitalize;
+            app.convert.output_options.set_naming_template(trimmed, capitalize);
             app.preset.mark_modified();
         }
         TextEditTarget::CompanionExtensions => {
@@ -74758,7 +74760,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 app.active_overlay = ActiveOverlay::TemplateBuilder(Box::new(builder));
             }
             TuiButton::TemplateBuildFilenameButton => {
-                let initial = app.convert.output_options.filename_template.clone();
+                let initial = app.convert.output_options.naming_template();
                 let mut builder = TemplateBuilderState::new(TemplateTarget::Filename,
                     &initial, TemplateBuilderFocus::TemplateInput);
                 builder.capitalize = app.convert.output_options.filename_template_capitalize;

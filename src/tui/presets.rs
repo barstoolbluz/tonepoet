@@ -1916,19 +1916,23 @@ mod companion_preset_tests {
     }
 
     #[test]
-    fn conversion_preset_preserves_two_independent_naming_case_flags() {
-        let mut output = OutputOptionsState::new();
-        output.folder_template_capitalize = true;
-        output.filename_template_capitalize = false;
-        let preset = TuiPreset::from_pill_state("case", &FormatState::new(),
-            &output, &MetadataState::default());
-        let reloaded: TuiPreset = serde_json::from_str(
-            &serde_json::to_string(&preset).unwrap()).unwrap();
-        let mut restored = OutputOptionsState::new();
-        reloaded.apply_to_pills(&mut FormatState::new(), &mut restored,
-            &mut MetadataState::default());
-        assert!(restored.folder_template_capitalize);
-        assert!(!restored.filename_template_capitalize);
+    fn conversion_preset_round_trips_the_unified_naming_pattern_and_tick() {
+        for naming in ["%TITLE%", "%ARTIST%/%ALBUM%/%TITLE%"] {
+            let mut output = OutputOptionsState::new();
+            output.set_naming_template(naming, true);
+            output.disc_subfolders.select_value(&true);
+            let preset = TuiPreset::from_pill_state("case", &FormatState::new(),
+                &output, &MetadataState::default());
+            let reloaded: TuiPreset = serde_json::from_str(
+                &serde_json::to_string(&preset).unwrap()).unwrap();
+            let mut restored = OutputOptionsState::new();
+            reloaded.apply_to_pills(&mut FormatState::new(), &mut restored,
+                &mut MetadataState::default());
+            assert_eq!(restored.naming_template(), naming);
+            assert!(restored.folder_template_capitalize);
+            assert!(restored.filename_template_capitalize);
+            assert!(*restored.disc_subfolders.selected_value());
+        }
     }
 
     #[test]
