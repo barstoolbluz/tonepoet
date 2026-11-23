@@ -1712,9 +1712,13 @@ mod output_options_companion_render_tests {
                     metadata,
                 }).collect::<Vec<_>>();
             let album_metadata = archive_preview_album_metadata(&tracks);
-            // Missing or conflicting fields must never be promoted by the
-            // full-inventory preview even before selection is considered.
-            if case == "missing" || case == "conflicting" {
+            // The source-pane album summary keeps the old missing-tag rule.
+            // The conversion materializer and Naming projection require every
+            // selected member to have the tag, so their folder paths can differ.
+            if case == "missing" {
+                assert_eq!(album_metadata.year.as_deref(), Some("1984"));
+                assert_eq!(album_metadata.genre.as_deref(), Some("Ambient"));
+            } else if case == "conflicting" {
                 assert!(album_metadata.year.is_none(), "{case}: year");
                 assert!(album_metadata.genre.is_none(), "{case}: genre");
             }
@@ -1802,8 +1806,10 @@ mod output_options_companion_render_tests {
             for (pattern, expected_prefix, expect_flat) in [
                 ("%YEAR%/%TITLE%", album_year, album_year.is_none()),
                 ("%GENRE%/%TITLE%", album_genre, album_genre.is_none()),
-                ("%COMPOSER%/%TITLE%", common_extra.then_some("Bach"), !common_extra),
-                ("%ISRC%/%TITLE%", common_extra.then_some("AAA111"), !common_extra),
+                // These tokens are track-scoped. Their authored subfolders
+                // remain even with flat_output=true (no extra album folder).
+                ("%COMPOSER%/%TITLE%", Some("Bach"), true),
+                ("%ISRC%/%TITLE%", Some("AAA111"), true),
                 ("%CATALOG%/%TITLE%", common_extra.then_some("CAT-01"), !common_extra),
                 ("%TRACKNN% - %TITLE%", None, true),
                 ("%TITLE% - %GENRE%", None, true),
@@ -1830,6 +1836,8 @@ mod output_options_companion_render_tests {
                 let mut request = crate::convert::pipeline::unified_request::build_pipeline_request_from_settings(
                     &item, settings).expect("valid planner request");
                 request.naming.template = item.options.effective_naming_template("%NN% - %TITLE%");
+                assert_eq!(request.naming.per_album_subdir, !expect_flat,
+                    "{case}: album-folder request policy {pattern}");
                 let plan = crate::convert::pipeline::stages::plan_outputs(&prepared, &request)
                     .expect("planner accepts archive");
                 let planned = &plan.entries[0].final_path;
@@ -1841,6 +1849,14 @@ mod output_options_companion_render_tests {
                 } else if pattern.contains('/') {
                     assert_eq!(relative.components().count(), 1,
                         "{case}: {pattern} has no album folder");
+                }
+                if case == "missing" && matches!(pattern,
+                    "%COMPOSER%/%TITLE%" | "%ISRC%/%TITLE%") {
+                    // The second selected member has no such track tag, and
+                    // must not inherit a sibling's authored track directory.
+                    let second = plan.entries[1].final_path.strip_prefix(&root).unwrap();
+                    assert_eq!(second, Path::new("Second Track.flac"),
+                        "{case}: empty track-scoped prefix {pattern}");
                 }
                 if pattern.starts_with("%TRACKNN%") {
                     assert_eq!(relative, Path::new("07 - Archive Edit.flac"),

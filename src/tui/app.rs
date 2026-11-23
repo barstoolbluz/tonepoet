@@ -1416,15 +1416,90 @@ fn common_nonempty_metadata_value<F>(tracks: &[PreviewTrack], f: F) -> Option<St
 where
     F: for<'a> Fn(&'a SourceMetadata) -> Option<&'a String>,
 {
-    // Album-scoped values must be present and identical on every track.
-    // Filtering missing values would promote a track-only tag into an album
-    // folder, whereas the archive materializer deliberately rejects it.
-    let first = f(&tracks.first()?.metadata)?;
-    if first.trim().is_empty() {
-        return None;
+    // In the archive's source/metadata panes, missing tags do not defeat a
+    // value shared by all members that carry it. Convert's Naming preview
+    // separately uses the materializer's stricter selected-track rule.
+    let mut values = tracks.iter().filter_map(|track| f(&track.metadata))
+        .filter(|value| !value.trim().is_empty());
+    let first = values.next()?;
+    values.all(|value| value == first).then(|| first.clone())
+}
+
+#[cfg(test)]
+mod archive_preview_album_metadata_tests {
+    use super::*;
+
+    fn member(metadata: SourceMetadata) -> PreviewTrack {
+        PreviewTrack {
+            path: PathBuf::from("/preview/track.flac"),
+            original_name: "track".to_owned(),
+            info: SourceInfo {
+                format_name: "FLAC".to_owned(), codec: "flac".to_owned(),
+                bit_depth: Some(24), sample_format_is_float: Some(false),
+                compression_is_lossless: Some(true), sample_rate: 44_100,
+                channels: 2, channel_layout: "stereo".to_owned(),
+                duration_secs: 1.0, file_size: 100,
+            },
+            original_metadata: metadata.clone(), metadata,
+        }
     }
-    tracks.iter().all(|track| f(&track.metadata) == Some(first))
-        .then(|| first.to_owned())
+
+    #[test]
+    fn archive_album_tags_allow_untagged_members_but_reject_disagreement() {
+        let tagged = SourceMetadata {
+            album: Some("Live Album".into()), artist: Some("Quartet".into()),
+            album_artist: Some("Ensemble".into()), year: Some("1971".into()),
+            genre: Some("Jazz".into()), ..Default::default()
+        };
+        let mut tracks = vec![member(tagged.clone()); 11];
+        tracks.push(member(SourceMetadata::default()));
+        let assert_common = |tracks: &[PreviewTrack]| {
+            let result = archive_preview_album_metadata(tracks);
+            assert_eq!(result.album.as_deref(), Some("Live Album"));
+            assert_eq!(result.artist.as_deref(), Some("Quartet"));
+            assert_eq!(result.album_artist.as_deref(), Some("Ensemble"));
+            assert_eq!(result.year.as_deref(), Some("1971"));
+            assert_eq!(result.genre.as_deref(), Some("Jazz"));
+        };
+        assert_common(&tracks);
+        tracks.rotate_right(1); // First member also may lack every tag.
+        assert_common(&tracks);
+
+        let preview = ArchivePreview {
+            archive_path: PathBuf::from("/music/archive.zip"),
+            staging_dir: PathBuf::from("/preview"),
+            tracks: tracks.clone(),
+            album_metadata: archive_preview_album_metadata(&tracks),
+            mount_lease: None,
+        };
+        let SourceMode::MultiTrack { metadata, album_title, album_artist, .. } =
+            source_mode_from_archive_preview(preview) else { panic!("archive source"); };
+        assert_eq!(metadata.year.as_deref(), Some("1971"));
+        assert_eq!(metadata.genre.as_deref(), Some("Jazz"));
+        assert_eq!(album_title.as_deref(), Some("Live Album"));
+        assert_eq!(album_artist.as_deref(), Some("Quartet"));
+
+        let mut conflicting = tracks.clone();
+        conflicting[1].metadata.year = Some("1990".into());
+        conflicting[1].metadata.genre = Some("Rock".into());
+        conflicting[1].metadata.album = Some("Different Album".into());
+        conflicting[1].metadata.artist = Some("Soloist".into());
+        conflicting[1].metadata.album_artist = Some("Different Ensemble".into());
+        let result = archive_preview_album_metadata(&conflicting);
+        assert!(result.album.is_none());
+        assert!(result.artist.is_none());
+        assert!(result.album_artist.is_none());
+        assert!(result.year.is_none());
+        assert!(result.genre.is_none());
+        let empty = archive_preview_album_metadata(&[member(SourceMetadata::default())]);
+        assert!(empty.album.is_none() && empty.year.is_none() && empty.genre.is_none());
+
+        let without_album_artist = vec![member(SourceMetadata {
+            artist: Some("Quartet".into()), ..Default::default()
+        }), member(SourceMetadata::default())];
+        let result = archive_preview_album_metadata(&without_album_artist);
+        assert_eq!(result.album_artist.as_deref(), Some("Quartet"));
+    }
 }
 
 pub(crate) fn create_pending_archive_preview(

@@ -166,7 +166,7 @@ pub(super) fn native_folder_preview_caret(path: &Path, field_width: u16, cell: u
     raw_index.min(path.to_string_lossy().chars().count())
 }
 
-fn check(checked: bool) -> &'static str { if checked { "[✓]" } else { "[ ]" } }
+fn check(checked: bool) -> &'static str { if checked { "☑" } else { "☐" } }
 fn program_check(s: &DiscBrowserState, i: usize) -> &'static str {
     if !s.is_extractable(i) { "×" } else { check(s.selected[i]) }
 }
@@ -747,7 +747,7 @@ fn draw_programs(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, butt
             } else { name };
             display_rows.push((Some(i),name,s.cursor==i,None));
             if !is_title {
-                display_rows.push((None,format!("      {}",program_info(p,s.contents.format)),false,None));
+                display_rows.push((None,format!("    {}",program_info(p,s.contents.format)),false,None));
             }
         }
     }
@@ -778,8 +778,18 @@ fn draw_programs(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, butt
             Rect::new(inner.x,y,inner.width,1));
         if let Some(i)=index {
             buttons.record_button(TuiButton::DiscBrowserStream(*i),Rect::new(inner.x,y,inner.width,1));
-            buttons.record_button(TuiButton::DiscBrowserExpand(*i),
-                Rect::new(inner.x+2,y,4.min(inner.width.saturating_sub(2)),1));
+            // The one-cell box and the start of its caption toggle selection.
+            // The rest of the row still focuses on a single click, as before.
+            // Every row has a two-cell focus gutter; title and playlist
+            // child streams add two cells before the checkbox.
+            let indent = if matches!(s.contents.format, DiscFormat::DvdVideo | DiscFormat::BluRay) {
+                4
+            } else { 2 };
+            let start = inner.x + indent;
+            if start < inner.right() {
+                buttons.record_button(TuiButton::DiscBrowserExpand(*i),
+                    Rect::new(start, y, 6.min(inner.right() - start), 1));
+            }
         }
         let words=word_tiers(theme,colors,bg);
         let mut text = label.as_str();
@@ -812,22 +822,15 @@ fn draw_programs(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, butt
         let mut spans = Vec::new();
         spans.push(Span::styled(if *focused { "▌ " } else { "  " },
             Style::default().fg(if active{theme.info}else{colors.dim})));
-        if let Some(mark) = text.find('[') {
-            let prefix=&text[..mark];
-            spans.push(Span::styled(prefix.to_owned(),Style::default().fg(colors.dim)));
-            if text[mark..].starts_with("[✓]") || text[mark..].starts_with("[ ]") {
-                spans.push(Span::styled("[",Style::default().fg(if active{words.soft}else{words.label})));
-                spans.push(Span::styled(if text[mark..].starts_with("[✓]") {"✓"}else{" "},
-                    Style::default().fg(theme.success)));
-                spans.push(Span::styled("]",Style::default().fg(if active{words.soft}else{words.label})));
-                let marker_bytes=if text[mark..].starts_with("[✓]") {5}else{3};
-                spans.push(Span::styled(text[mark+marker_bytes..].to_owned(),
-                    Style::default().fg(if active {words.value}
-                        else if index.is_some_and(|i|!s.is_extractable(i)) {theme.error}
-                        else {words.value})));
-            } else {
-                spans.push(Span::styled(text[mark..].to_owned(),Style::default().fg(words.value)));
-            }
+        if let Some(mark) = text.find(|ch| matches!(ch, '☑' | '☐')) {
+            spans.push(Span::styled(text[..mark].to_owned(),Style::default().fg(colors.dim)));
+            let glyph = &text[mark..mark + '☑'.len_utf8()];
+            spans.push(Span::styled(glyph.to_owned(),Style::default().fg(
+                if glyph == "☑" { readable_word(theme.success, bg) } else { words.label })));
+            spans.push(Span::styled(text[mark + '☑'.len_utf8()..].to_owned(),
+                Style::default().fg(if active {words.value}
+                    else if index.is_some_and(|i|!s.is_extractable(i)) {theme.error}
+                    else {words.value})));
         } else {
             spans.push(Span::styled(text.to_owned(),Style::default().fg(if active{words.value}else{words.soft})));
         }
@@ -923,13 +926,11 @@ fn draw_items(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect,
             Rect::new(x,y,1,1));
         x+=2;
         let checked=s.items_checked.get(s.cursor).and_then(|v|v.get(i))==Some(&true);
-        frame.render_widget(Paragraph::new(Line::from(vec![
-            Span::styled("[",style.fg(if focused{words.soft}else{words.label})),
-            Span::styled(if checked {"✓"}else{" "},style.fg(theme.success)),
-            Span::styled("]",style.fg(if focused{words.soft}else{words.label})),
-        ])).style(style),Rect::new(x,y,3,1));
+        frame.render_widget(Paragraph::new(check(checked)).style(style.fg(
+            if checked { readable_word(theme.success, bg) } else { words.label })),
+            Rect::new(x,y,1,1));
         let check_x=x;
-        x+=4;
+        x+=2;
         let number_width=if track.number>99 {4}else{3};
         frame.render_widget(Paragraph::new(format!("{:02}",track.number))
             .style(style.fg(colors.dim)),Rect::new(x,y,number_width,1));
@@ -961,7 +962,7 @@ fn draw_items(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect,
         }
         start_secs=start_secs.and_then(|secs|track.duration_secs.map(|duration|secs+duration));
         buttons.record_button(TuiButton::DiscBrowserTrack(i),Rect::new(inner.x,y,inner.width,1));
-        buttons.record_button(TuiButton::DiscBrowserTrackCheck(i),Rect::new(check_x,y,3,1));
+        buttons.record_button(TuiButton::DiscBrowserTrackCheck(i),Rect::new(check_x,y,1,1));
     }
     if more_below {
         let hidden = remaining.saturating_sub(visible as usize);
@@ -1226,7 +1227,7 @@ fn draw_native_radio(frame: &mut ratatui::Frame, buttons: &mut ButtonRenderMap,
 fn draw_native_toggle(frame:&mut ratatui::Frame, buttons:&mut ButtonRenderMap,
     field:Rect, text:&str, enabled:bool, focused:bool, index:usize,
     theme:Theme, bg:Color) -> u16 {
-    let text=format!("{} {text}",if enabled {"[✓]"}else{"[ ]"});
+    let text=format!("{} {text}",check(enabled));
     let width=(text.chars().count() as u16).min(field.width);
     if width==0 {return field.x;}
     let control_bg=if focused {theme.input_focused_bg}else{bg};
@@ -1948,7 +1949,7 @@ fn extract_option_display(s:&DiscBrowserState,control:ExtractOptionControl) -> (
     use ExtractOptionControl as C;
     use crate::convert::pipeline::native_extract::{NativeCueBetweenGap as B,NativeCueFirstGap as F};
     let settings=&s.extract_settings;
-    let mark=|on:bool| if on {"☒"} else {"☐"};
+    let mark=check;
     let radio=|on:bool| if on {"●"} else {"○"};
     match control {
         C::WriteLog => (format!("{} Write extraction.log",mark(s.extraction_log)),
@@ -2048,11 +2049,11 @@ fn option_draw_control(frame:&mut ratatui::Frame,buttons:&mut ButtonRenderMap,
     let clipped=clip_end(label,rect.width);
     let mut chars=clipped.chars();
     let first=chars.next();
-    let mark=matches!(first,Some('☒'|'☐'|'●'|'○'));
+    let mark=matches!(first,Some('☑'|'☐'|'●'|'○'));
     if mark && !matches!(visual,ExtractOptionVisual::Button) {
         let glyph=first.unwrap_or(' ');
         let mark_fg=if focused {fg}
-            else if glyph=='☒' {readable_word(theme.success,bg)}
+            else if glyph=='☑' {readable_word(theme.success,bg)}
             else if glyph=='●' {readable_word(theme.info,bg)}
             else {readable_word(theme.label,bg)};
         let text=Line::from(vec![
@@ -2538,6 +2539,157 @@ mod extract_r3_render_tests {
             genre: None, year: None,
         };
         DiscBrowserState::new(contents, "disc.iso".into())
+    }
+
+    #[test]
+    fn r6_program_and_track_boxes_use_one_cell_and_preserve_click_targets() {
+        let theme = crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        let mut state = sacd_state(false, false);
+        let mut second = state.contents.presentations[0].tracks[0].clone();
+        second.number = 2;
+        second.title = Some("Second".into());
+        state.contents.presentations[0].tracks.push(second);
+        state.items_checked[0] = vec![true, false];
+
+        for (selected, mark) in [(false, "☐"), (true, "☑")] {
+            state.selected[0] = selected;
+            let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+            let mut buttons = ButtonRenderMap::new();
+            terminal.draw(|frame| draw_programs(frame, &state,
+                Rect::new(2, 3, 104, 8), &mut buttons, theme)).unwrap();
+            let target = TuiButton::DiscBrowserExpand(0);
+            let hit = buttons.button_rect(target).expect("program checkbox hit target");
+            assert_eq!(terminal.backend().buffer().get(hit.x, hit.y).symbol(), mark);
+            assert_eq!(buttons.find_button_at(hit.x, hit.y), Some(target));
+            assert_eq!(buttons.find_button_at(hit.x + 2, hit.y), Some(target),
+                "caption next to program checkbox remains clickable");
+            assert_eq!(buttons.find_button_at(hit.right(), hit.y),
+                Some(TuiButton::DiscBrowserStream(0)),
+                "rest of program row still focuses without toggling");
+        }
+
+        // A secondary details row stays one cell right of its program heading.
+        // Both SACD and DVD-Audio use the ordinary (non-title) layout.
+        for format in [DiscFormat::Sacd, DiscFormat::DvdAudio] {
+            let mut program = sacd_state(false, false);
+            program.contents.format = format;
+            if format == DiscFormat::DvdAudio {
+                program.contents.presentations[0].id = PresentationId::DvdAudioGroup(1);
+                program.contents.presentations[0].format.codec = Some("MLP".into());
+            }
+            let area = Rect::new(2, 3, 104, 8);
+            let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+            let mut buttons = ButtonRenderMap::new();
+            terminal.draw(|frame| draw_programs(frame, &program, area,
+                &mut buttons, theme)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let row = |y| (area.x..area.right()).map(|x|
+                buffer.get(x, y).symbol().to_owned()).collect::<Vec<_>>().concat();
+            let heading = header_for(program.contents.presentations[0].id,
+                &program.contents.presentations[0], 0);
+            let details = program_info(&program.contents.presentations[0], format);
+            let heading_row = row(area.y + 1);
+            let details_row = row(area.y + 2);
+            let heading_at = heading_row.find(heading.as_str()).expect("program heading rendered");
+            let details_at = details_row.find(details.as_str()).expect("program details rendered");
+            let heading_col = heading_row[..heading_at].chars().count();
+            let details_col = details_row[..details_at].chars().count();
+            assert_eq!(details_col, heading_col + 1,
+                "{format:?}: details remain one cell deeper than the heading");
+        }
+
+        state.focus = ExtractFocus::Items;
+        let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+        let mut buttons = ButtonRenderMap::new();
+        terminal.draw(|frame| draw_items(frame, &state,
+            Rect::new(2, 3, 104, 8), &mut buttons, theme, true)).unwrap();
+        for (index, mark) in [(0, "☑"), (1, "☐")] {
+            let target = TuiButton::DiscBrowserTrackCheck(index);
+            let hit = buttons.button_rect(target).expect("track checkbox hit target");
+            assert_eq!(hit.width, 1, "one-cell track tick box");
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer.get(hit.x, hit.y).symbol(), mark);
+            assert_eq!(buffer.get(hit.x + 2, hit.y).symbol(), "0",
+                "track numbers align after the narrow checkbox");
+            assert_eq!(buttons.find_button_at(hit.x, hit.y), Some(target));
+            assert_eq!(buttons.find_button_at(hit.x + 2, hit.y),
+                Some(TuiButton::DiscBrowserTrack(index)),
+                "track caption keeps the row's existing click behavior");
+        }
+
+        let mut title = chapter_state(1);
+        title.focus = ExtractFocus::Programs;
+        let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+        let mut buttons = ButtonRenderMap::new();
+        terminal.draw(|frame| draw_programs(frame, &title,
+            Rect::new(2, 3, 104, 8), &mut buttons, theme)).unwrap();
+        let target = TuiButton::DiscBrowserExpand(0);
+        let hit = buttons.button_rect(target).expect("indented stream checkbox hit target");
+        assert_eq!(terminal.backend().buffer().get(hit.x, hit.y).symbol(), "☑");
+        assert_eq!(buttons.find_button_at(hit.x, hit.y), Some(target));
+        assert_eq!(buttons.find_button_at(hit.x + 2, hit.y), Some(target));
+    }
+
+    #[test]
+    fn r6_options_and_tags_tick_boxes_keep_mouse_hits_on_glyph_and_caption() {
+        let theme = crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        let mut state = sacd_state(false, false);
+        for (width, height) in [(72, 24), (154, 40)] {
+            for panel in [ExtractPanel::Options, ExtractPanel::Chapters,
+                ExtractPanel::CueFiles, ExtractPanel::CopyFolder] {
+                state.panel = Some(panel);
+                let choices = state.option_controls();
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                let mut buttons = ButtonRenderMap::new();
+                terminal.draw(|frame| draw(frame, &state, Path::new("/tmp"),
+                    &mut buttons, theme)).unwrap();
+                let mut tick_count = 0;
+                for (index, control) in choices.iter().enumerate() {
+                    let (text, _) = extract_option_display(&state, *control);
+                    let Some(mark) = text.chars().next().filter(|mark|
+                        matches!(*mark, '☐' | '☑')) else { continue; };
+                    let target = TuiButton::DiscBrowserOptionControl(index);
+                    let hit = buttons.button_rect(target).expect("option checkbox target");
+                    assert!(hit.width >= 3, "{panel:?} checkbox caption has a hit target");
+                    let expected = if mark == '☑' { "☑" } else { "☐" };
+                    assert_eq!(terminal.backend().buffer().get(hit.x, hit.y).symbol(),
+                        expected, "{panel:?} {control:?}");
+                    assert_eq!(buttons.find_button_at(hit.x, hit.y), Some(target));
+                    assert_eq!(buttons.find_button_at(hit.x + 2, hit.y), Some(target));
+                    tick_count += 1;
+                }
+                assert!(tick_count > 0, "{panel:?} has visible tick boxes");
+            }
+        }
+
+        for transfer in [false, true] {
+            state.tags = transfer;
+            state.tag_fields = 0b010101010;
+            state.panel = Some(ExtractPanel::Tags);
+            let controls = state.tag_sheet_controls();
+            let mut terminal = Terminal::new(TestBackend::new(132, 44)).unwrap();
+            let mut buttons = ButtonRenderMap::new();
+            terminal.draw(|frame| draw_tags_sheet(frame, &state,
+                Rect::new(6, 5, 116, 33), &mut buttons, theme)).unwrap();
+            let checked = if transfer {
+                vec![TagSheetControl::Transfer, TagSheetControl::Field(0),
+                    TagSheetControl::Field(1), TagSheetControl::Artwork]
+            } else { vec![TagSheetControl::Transfer] };
+            for control in checked {
+                let index = controls.iter().position(|entry| *entry == control).unwrap();
+                let target = TuiButton::DiscBrowserTagSheetControl(index);
+                let hit = buttons.button_rect(target).expect("Tags checkbox target");
+                let on = match control {
+                    TagSheetControl::Transfer => transfer,
+                    TagSheetControl::Field(i) => state.tag_fields & (1u16 << i) != 0,
+                    TagSheetControl::Artwork => state.tag_artwork,
+                    _ => unreachable!(),
+                };
+                assert_eq!(terminal.backend().buffer().get(hit.x, hit.y).symbol(), check(on));
+                assert_eq!(buttons.find_button_at(hit.x, hit.y), Some(target));
+                assert_eq!(buttons.find_button_at(hit.x + 2, hit.y), Some(target));
+            }
+        }
     }
 
     fn render_header(state: &DiscBrowserState, width: u16, small: bool) -> (Vec<String>, Terminal<TestBackend>) {
@@ -4295,14 +4447,14 @@ mod extract_r3_render_tests {
                         "radio groups must share a choice column");
                 },
                 ExtractPanel::CopyFolder => {
-                    assert!(row("▸ Copy folder contents")<row("☒ Artwork"));
-                    let first=row("☒ Artwork");
-                    assert!(lines[first].contains("☒ Art folders") &&
-                        lines[first].contains("☒ .log") && lines[first].contains("☐ .cue"));
-                    let second=row("☒ .txt");
+                    assert!(row("▸ Copy folder contents")<row("☑ Artwork"));
+                    let first=row("☑ Artwork");
+                    assert!(lines[first].contains("☑ Art folders") &&
+                        lines[first].contains("☑ .log") && lines[first].contains("☐ .cue"));
+                    let second=row("☑ .txt");
                     assert_eq!(second,first+1);
-                    assert!(lines[second].contains("☒ .nfo") && lines[second].contains("☒ .md") &&
-                        lines[second].contains("☒ .pdf"));
+                    assert!(lines[second].contains("☑ .nfo") && lines[second].contains("☑ .md") &&
+                        lines[second].contains("☑ .pdf"));
                     assert!(lines[second+1].contains("☐ .md5") &&
                         lines[second+1].contains("☐ Everything else"));
                     assert!(row("Artwork: image files beside the CUE image.")>second+1);

@@ -600,9 +600,9 @@ pub fn draw_template_builder(
     let cap_y = inner.y + 1;
     let focus_cap = state.focus == TemplateBuilderFocus::Capitalization;
     let (scope, marker) = match (state.target, state.return_to_extract.is_some()) {
-        (_, true) => ("to folder and file names", if state.capitalize { "☒" } else { "☐" }),
-        (TemplateTarget::Folder, false) => ("to folder names", if state.capitalize { "☒" } else { "☐" }),
-        (TemplateTarget::Filename, false) => ("to folder and file names", if state.capitalize { "☒" } else { "☐" }),
+        (_, true) => ("to folder and file names", if state.capitalize { "☑" } else { "☐" }),
+        (TemplateTarget::Folder, false) => ("to folder names", if state.capitalize { "☑" } else { "☐" }),
+        (TemplateTarget::Filename, false) => ("to folder and file names", if state.capitalize { "☑" } else { "☐" }),
     };
     let caption = format!("  {marker} Apply TonePoet capitalization {scope}");
     f.render_widget(Paragraph::new(caption).style(Style::default()
@@ -1022,9 +1022,12 @@ mod tests {
         assert_eq!(buttons.find_button_at(toggle.x + 2, toggle.y),
             Some(TuiButton::TemplateBuilderCapitalization));
         assert_eq!(terminal.backend().buffer().get(toggle.x + 2, toggle.y).symbol(), "☐");
+        assert_eq!(buttons.find_button_at(toggle.x + 8, toggle.y),
+            Some(TuiButton::TemplateBuilderCapitalization),
+            "capitalization caption remains clickable");
         state.capitalize = true;
         terminal.draw(|frame| draw_template_builder(frame, &state, &mut buttons, theme)).unwrap();
-        assert_eq!(terminal.backend().buffer().get(toggle.x + 2, toggle.y).symbol(), "☒");
+        assert_eq!(terminal.backend().buffer().get(toggle.x + 2, toggle.y).symbol(), "☑");
         let saved = buttons.button_rect(TuiButton::TemplateBuilderSavedTemplates).unwrap();
         assert_eq!(buttons.find_button_at(saved.x + 2, saved.y),
             Some(TuiButton::TemplateBuilderSavedTemplates));
