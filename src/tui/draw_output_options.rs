@@ -8,7 +8,7 @@ use ratatui::{
     Frame,
 };
 
-use super::app::{FormatState, MetadataState, MultiTrackEntry, OutputOptionsField, OutputOptionsState, SourceMode};
+use super::app::{FormatState, MetadataState, MultiTrackEntry, OutputOptionsField, OutputOptionsState, PreviewTrack, SourceMode};
 use super::button_map::{ButtonRenderMap, TuiButton};
 use super::inline_edit::{inline_cursor_col, render_inline_value};
 use super::pill::{render_pill_spans, PillState};
@@ -215,12 +215,74 @@ pub(crate) fn convert_batch_naming_overrides(metadata: &MetadataState) -> Metada
     }
 }
 
+/// A borrowed projection of the archive members that Convert will submit.
+/// The materializer derives album metadata after filtering by track selection;
+/// use the same membership and strict promotion rule on the redraw path.
+/// No extra file reads or copies of artwork inventories are needed.
+#[derive(Clone, Copy)]
+pub(crate) struct ArchiveNamingAlbum<'a> {
+    album: Option<&'a str>,
+    album_artist: Option<&'a str>,
+    first_artist: Option<&'a str>,
+    year: Option<&'a str>,
+    genre: Option<&'a str>,
+    composer: Option<&'a str>,
+    isrc: Option<&'a str>,
+    catalog_number: Option<&'a str>,
+}
+
+fn common_selected_archive_tag<'a>(
+    tracks: &'a [PreviewTrack],
+    selected: &[bool],
+    field: for<'m> fn(&'m SourceMetadata) -> Option<&'m str>,
+) -> Option<&'a str> {
+    let mut members = tracks.iter().zip(selected.iter())
+        .filter_map(|(track, selected)| (*selected).then_some(&track.metadata));
+    let first = field(members.next()?)?;
+    if first.trim().is_empty() || !members.all(|metadata| field(metadata) == Some(first)) {
+        None
+    } else {
+        Some(first)
+    }
+}
+
+impl<'a> ArchiveNamingAlbum<'a> {
+    fn from_selection(tracks: &'a [PreviewTrack], selected: &[bool]) -> Self {
+        let artist = common_selected_archive_tag(tracks, selected,
+            |metadata| metadata.artist.as_deref());
+        let first_artist = tracks.iter().zip(selected.iter())
+            .filter(|(_, selected)| **selected)
+            .find_map(|(track, _)| track.metadata.artist.as_deref());
+        Self {
+            album: common_selected_archive_tag(tracks, selected,
+                |metadata| metadata.album.as_deref()),
+            album_artist: common_selected_archive_tag(tracks, selected,
+                |metadata| metadata.album_artist.as_deref()).or(artist),
+            first_artist,
+            year: common_selected_archive_tag(tracks, selected,
+                |metadata| metadata.year.as_deref()),
+            genre: common_selected_archive_tag(tracks, selected,
+                |metadata| metadata.genre.as_deref()),
+            // COMPOSER and ISRC stay track-scoped in filenames. All three
+            // fields require selected-track consensus in album folders;
+            // CATALOG is album-scoped in filenames as well.
+            composer: common_selected_archive_tag(tracks, selected,
+                |metadata| metadata.composer.as_deref()),
+            isrc: common_selected_archive_tag(tracks, selected,
+                |metadata| metadata.isrc.as_deref()),
+            catalog_number: common_selected_archive_tag(tracks, selected,
+                |metadata| metadata.catalog_number.as_deref()),
+        }
+    }
+}
+
 /// Live Convert metadata for the read-only Naming preview. The actual planner
 /// remains responsible for collisions, name limits, and disc subfolders.
 #[derive(Clone, Copy)]
 pub(crate) struct ConvertNamingPreview<'a> {
     pub source_metadata: &'a SourceMetadata,
     pub album_metadata: Option<&'a SourceMetadata>,
+    pub archive_album: Option<ArchiveNamingAlbum<'a>>,
     pub selected_track: Option<&'a MultiTrackEntry>,
     pub archive_track: bool,
     pub album_title: Option<&'a str>,
@@ -242,10 +304,10 @@ impl<'a> ConvertNamingPreview<'a> {
     ) -> Option<Self> {
         let source_path = source.current_path()?;
         let source_metadata = source.current_metadata_ref()?;
-        let (album_metadata, selected_track, archive_track, album_title,
-            album_artist, multi_disc_proven) = match source {
+        let (album_metadata, archive_album, selected_track, archive_track,
+            album_title, album_artist, multi_disc_proven) = match source {
             SourceMode::MultiTrack {
-                metadata, tracks, cursor, album_title, album_artist,
+                metadata, tracks, cursor, selected, album_title, album_artist,
                 archive_preview, ..
             } => {
                 let relevant = *opts.disc_subfolders.selected_value()
@@ -257,13 +319,16 @@ impl<'a> ConvertNamingPreview<'a> {
                             || entry.metadata.disc_total.is_some_and(|n| n > 1)
                     })
                 });
-                (Some(metadata), tracks.get(*cursor), archive_preview.is_some(),
+                let projected = archive_preview.as_ref().map(|archive| {
+                    ArchiveNamingAlbum::from_selection(&archive.tracks, selected)
+                });
+                (Some(metadata), projected, tracks.get(*cursor), archive_preview.is_some(),
                     album_title.as_deref(), album_artist.as_deref(), proven)
             }
-            _ => (None, None, false, None, None, false),
+            _ => (None, None, None, false, None, None, false),
         };
         Some(Self {
-            source_metadata, album_metadata, selected_track, archive_track,
+            source_metadata, album_metadata, archive_album, selected_track, archive_track,
             album_title, album_artist, multi_disc_proven, overrides,
             source_path: source_path.as_path(),
         })
@@ -319,7 +384,7 @@ fn optional_convert_album_folder_is_empty_with_evidence(
     let preview = preview?;
     let pattern = opts.conversion_folder_template();
     let known = ["ARTIST", "ALBUM_ARTIST", "ALBUM", "TITLE_EXTRA", "YEAR",
-        "GENRE", "CATALOG", "FORMAT", "SAMPLERATE", "BITDEPTH", "EXT"];
+        "GENRE", "COMPOSER", "ISRC", "CATALOG", "FORMAT", "SAMPLERATE", "BITDEPTH", "EXT"];
     if pattern.split('%').skip(1).step_by(2).any(|token| !known.contains(&token)) {
         return None;
     }
@@ -424,6 +489,27 @@ fn render_live_convert_template(
     let clean = crate::convert::pipeline::stages::conversion_action_sanitize_component;
     let src = preview.source_metadata;
     let album_src = preview.album_metadata.unwrap_or(src);
+    let archive_album = preview.archive_album;
+    let album_year = archive_album.map(|album| album.year)
+        .unwrap_or_else(|| album_src.year.as_deref());
+    let album_genre = archive_album.map(|album| album.genre)
+        .unwrap_or_else(|| album_src.genre.as_deref());
+    // The planner reads archive folder COMPOSER/ISRC from consensus album
+    // extras, but reads filename COMPOSER/ISRC from the individual track.
+    // CATALOG is album-scoped in both planner paths.
+    let (composer, isrc, catalog) = if let Some(album) = archive_album {
+        (
+            if album_scope { album.composer } else { src.composer.as_deref() },
+            if album_scope { album.isrc } else { src.isrc.as_deref() },
+            album.catalog_number,
+        )
+    } else {
+        (
+            src.composer.as_deref().or(album_src.composer.as_deref()),
+            src.isrc.as_deref(),
+            album_src.catalog_number.as_deref().or(src.catalog_number.as_deref()),
+        )
+    };
     let track = preview.selected_track;
     let source_stem = preview.source_path.file_stem().and_then(|stem| stem.to_str())
         .unwrap_or("untitled");
@@ -439,16 +525,27 @@ fn render_live_convert_template(
     }.unwrap_or(1);
     let track_artist = choose(track.and_then(|entry| entry.performer.as_deref())
         .or(src.artist.as_deref()).or(album_src.artist.as_deref()), "Unknown Artist");
+    let album_artist_source = if let Some(album) = archive_album {
+        // Match the archive planner: common album artist, then the first
+        // selected track's artist when no album-wide value is available.
+        album.album_artist.or(album.first_artist)
+    } else {
+        preview.album_artist.or(album_src.album_artist.as_deref())
+            .or(src.album_artist.as_deref()).or(album_src.artist.as_deref())
+            .or(Some(&track_artist))
+    };
     let album_artist = choose(preview.overrides.album_artist_for_conversion.as_deref()
         .filter(|value| !value.trim().is_empty())
-        .or(preview.album_artist).or(album_src.album_artist.as_deref())
-        .or(src.album_artist.as_deref()).or(album_src.artist.as_deref())
-        .or(Some(&track_artist)), "Unknown Artist");
+        .or(album_artist_source), "Unknown Artist");
     // In Convert's established planner, ARTIST in the album folder means
     // album artist. ARTIST in the track filename means track performer.
     let artist = if album_scope { album_artist.clone() } else { track_artist };
-    let mut album = choose(album_src.album.as_deref()
-        .or(preview.album_title).or(src.album.as_deref()), source_stem);
+    let album_name = if let Some(album) = archive_album {
+        album.album
+    } else {
+        album_src.album.as_deref().or(preview.album_title).or(src.album.as_deref())
+    };
+    let mut album = choose(album_name, source_stem);
     let mut title_extra = String::new();
     if template.contains("%TITLE_EXTRA%") {
         if let Some((stem, qualifier)) =
@@ -494,21 +591,20 @@ fn render_live_convert_template(
     }.unwrap_or_default();
     // The planner renders YEAR from the first contiguous run of four ASCII
     // date digits, not from the entire DATE field (e.g. 2020-05-17 -> 2020).
-    let year = album_src.year.as_deref().or(src.year.as_deref())
-        .map(convert_preview_year_from_date)
-        .unwrap_or_default();
+    // Both planner scopes use album_metadata.date. A track's own DATE can
+    // differ across a multi-track source and must not invent an album folder.
+    let year = album_year.map(convert_preview_year_from_date).unwrap_or_default();
     let mut tokens = BTreeMap::new();
     for (key, value) in [
         ("ARTIST", artist.as_str()), ("ALBUM_ARTIST", album_artist.as_str()),
         ("ALBUM", album.as_str()), ("TITLE", title.as_str()),
         ("TITLE_EXTRA", title_extra.as_str()),
-        ("GENRE", (if album_scope { album_src.genre.as_deref() } else { src.genre.as_deref() })
-            .or(album_src.genre.as_deref()).unwrap_or("")),
+        ("GENRE", (if album_scope { album_genre } else { src.genre.as_deref().or(album_genre) })
+            .unwrap_or("")),
         ("YEAR", year.as_str()),
-        ("COMPOSER", src.composer.as_deref().or(album_src.composer.as_deref()).unwrap_or("")),
-        ("ISRC", src.isrc.as_deref().unwrap_or("")),
-        ("CATALOG", album_src.catalog_number.as_deref()
-            .or(src.catalog_number.as_deref()).unwrap_or("")),
+        ("COMPOSER", composer.unwrap_or("")),
+        ("ISRC", isrc.unwrap_or("")),
+        ("CATALOG", catalog.unwrap_or("")),
         ("FORMAT", format.format.selected_value().name()),
         ("SAMPLERATE", rate.as_str()), ("BITDEPTH", depth.as_str()),
     ] {
@@ -1408,6 +1504,7 @@ mod output_options_companion_render_tests {
         let context = ConvertNamingPreview {
             source_metadata: &metadata,
             album_metadata: None,
+            archive_album: None,
             selected_track: None,
             archive_track: false,
             album_title: None,
@@ -1453,6 +1550,7 @@ mod output_options_companion_render_tests {
             ConvertNamingPreview {
                 source_metadata: album,
                 album_metadata: Some(album),
+                archive_album: None,
                 selected_track: Some(track),
                 archive_track: false,
                 album_title: Some("Songs from the Album"),
@@ -1503,14 +1601,303 @@ mod output_options_companion_render_tests {
             source_metadata: &edited_archive_member, overrides: &overrides,
             ..archive_context
         };
+        // The planner derives the album YEAR and GENRE independently of
+        // this archive member's track tags. An album prefix remains empty
+        // when the selected source has no common album value.
         for (pattern, expected) in [
             ("%TRACKNN% - %TITLE%", "07 - Archive Edit.flac"),
-            ("%YEAR%/%TITLE%", "1984/Archive Edit.flac"),
-            ("%GENRE%/%TITLE%", "Ambient/Archive Edit.flac"),
+            ("%YEAR%/%TITLE%", "Archive Edit.flac"),
+            ("%GENRE%/%TITLE%", "Archive Edit.flac"),
+            ("%TITLE% - %GENRE%", "Archive Edit - Ambient.flac"),
         ] {
             opts.set_naming_template(pattern, false);
             assert_eq!(convert_naming_path_preview(&opts, &opts.naming_template(),
                 &format, 160, None, Some(archive_edited)), expected);
+        }
+        // With an authoritative album value, the folder takes that value,
+        // even when the selected archive member has different tags.
+        let tagged_album = SourceMetadata {
+            year: Some("1977".into()), genre: Some("Soul".into()), ..album.clone()
+        };
+        let archive_album = ConvertNamingPreview {
+            album_metadata: Some(&tagged_album), ..archive_edited
+        };
+        for (pattern, expected) in [
+            ("%YEAR%/%TITLE%", "1977/Archive Edit.flac"),
+            ("%GENRE%/%TITLE%", "Soul/Archive Edit.flac"),
+        ] {
+            opts.set_naming_template(pattern, false);
+            assert_eq!(convert_naming_path_preview(&opts, &opts.naming_template(),
+                &format, 160, None, Some(archive_album)), expected);
+        }
+    }
+
+    #[test]
+    fn archive_selection_and_edits_keep_preview_folder_admission_and_planner_in_sync() {
+        use crate::convert::pipeline::{AlbumMetadata, ExtractionProvenance,
+            PreparedSource, PreparedTrack, SourceAudioCoding, SourceAudioDescriptor,
+            SourceKind, TrackId, TrackMetadata, TrackSourceRef};
+        use crate::convert::{ConversionItem, FileFormat};
+        use crate::tui::app::{archive_preview_album_metadata,
+            source_mode_from_archive_preview, ArchivePreview, PreviewTrack};
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+
+        let info = SourceInfo {
+            format_name: "FLAC".into(), codec: "flac".into(),
+            bit_depth: Some(24), sample_format_is_float: Some(false),
+            compression_is_lossless: Some(true), sample_rate: 44_100,
+            channels: 2, channel_layout: "stereo".into(),
+            duration_secs: 1.0, file_size: 1024,
+        };
+        let format = FormatState::new();
+        let config = crate::config::TonepoetConfig::default();
+        let edits = MetadataState::default();
+        let destination = tempfile::tempdir().expect("isolated destination");
+        let root = destination.path().to_path_buf();
+        let archive_path = PathBuf::from("/music/archive.zip");
+
+        // The expected album values are independent of the TUI projection.
+        // They represent the materializer's strict, post-selection promotion.
+        for (case, second_year, second_genre, selected, edit_first,
+            album_year, album_genre) in [
+            ("missing", None, None, [true, true], false, None, None),
+            ("matching", Some("1984"), Some("Ambient"), [true, true], false,
+                Some("1984"), Some("Ambient")),
+            ("conflicting", Some("1990"), Some("Rock"), [true, true], false,
+                None, None),
+            ("partial", Some("1990"), Some("Rock"), [true, false], false,
+                Some("1984"), Some("Ambient")),
+            // Start with missing tags, then simulate the existing metadata
+            // editor applying the changes to the already-probed track.
+            ("edited", Some("1990"), Some("Rock"), [true, false], true,
+                Some("1984"), Some("Ambient")),
+        ] {
+            // Archive folder extras follow the materializer's all-selected
+            // rule. Missing tags and disagreement both defeat promotion.
+            let common_extra = matches!(case, "matching" | "partial" | "edited");
+            let (second_composer, second_isrc, second_catalog) = match case {
+                "missing" => (None, None, None),
+                "matching" => (Some("Bach"), Some("AAA111"), Some("CAT-01")),
+                _ => (Some("Mozart"), Some("BBB222"), Some("CAT-02")),
+            };
+            let first = SourceMetadata {
+                title: Some("Archive Edit".into()),
+                artist: Some("Singer".into()),
+                album: Some("Album".into()), track_number: Some(7),
+                year: (!edit_first).then_some("1984".into()),
+                genre: (!edit_first).then_some("Ambient".into()),
+                composer: Some("Bach".into()),
+                isrc: Some("AAA111".into()),
+                catalog_number: Some("CAT-01".into()),
+                ..Default::default()
+            };
+            let second = SourceMetadata {
+                title: Some("Second Track".into()),
+                artist: Some("Singer".into()),
+                album: Some("Album".into()),
+                year: second_year.map(str::to_string),
+                genre: second_genre.map(str::to_string),
+                composer: second_composer.map(str::to_string),
+                isrc: second_isrc.map(str::to_string),
+                catalog_number: second_catalog.map(str::to_string),
+                ..Default::default()
+            };
+            let tracks = [first, second].into_iter().enumerate()
+                .map(|(idx, metadata)| PreviewTrack {
+                    path: PathBuf::from(format!("/stage/track-{idx}.flac")),
+                    original_name: format!("track-{idx}"),
+                    info: info.clone(),
+                    original_metadata: metadata.clone(),
+                    metadata,
+                }).collect::<Vec<_>>();
+            let album_metadata = archive_preview_album_metadata(&tracks);
+            // Missing or conflicting fields must never be promoted by the
+            // full-inventory preview even before selection is considered.
+            if case == "missing" || case == "conflicting" {
+                assert!(album_metadata.year.is_none(), "{case}: year");
+                assert!(album_metadata.genre.is_none(), "{case}: genre");
+            }
+            let preview = ArchivePreview {
+                staging_dir: PathBuf::from("/stage"),
+                archive_path: archive_path.clone(),
+                tracks, album_metadata,
+                mount_lease: None,
+            };
+            let mut source = source_mode_from_archive_preview(preview);
+            let SourceMode::MultiTrack {
+                selected: flags, archive_preview: Some(archive), ..
+            } = &mut source else { panic!("expected archive source") };
+            *flags = selected.to_vec();
+            if edit_first {
+                archive.tracks[0].metadata.year = Some("1984".into());
+                archive.tracks[0].metadata.genre = Some("Ambient".into());
+                archive.tracks[0].metadata.title = Some("Archive Edit".into());
+                // Deliberately leave the cached album snapshot stale: the
+                // live preview and admission must use edited selected tracks.
+            }
+            let SourceMode::MultiTrack {
+                archive_preview: Some(archive), ..
+            } = &source else { unreachable!() };
+            let prepared_tracks = archive.tracks.iter().enumerate()
+                .zip(selected)
+                .filter(|(_, wanted)| *wanted)
+                .map(|((idx, track), _)| {
+                    let ordinal = idx as u32 + 1;
+                    PreparedTrack {
+                        id: TrackId { source_ordinal: ordinal, disc_number: None,
+                            track_number: track.metadata.track_number.unwrap_or(ordinal) },
+                        source_ref: TrackSourceRef::StagedFile(track.path.clone()),
+                        metadata: TrackMetadata {
+                            title: track.metadata.title.clone(),
+                            artist: track.metadata.artist.clone().into(),
+                            date: track.metadata.year.clone(),
+                            genre: track.metadata.genre.clone().into(),
+                            composer: track.metadata.composer.clone().into(),
+                            isrc: track.metadata.isrc.clone(),
+                            // The archive tag reader preserves source text
+                            // fields as lower-case planner extras.
+                            extra: [
+                                ("composer", track.metadata.composer.as_ref()),
+                                ("isrc", track.metadata.isrc.as_ref()),
+                                ("catalognumber", track.metadata.catalog_number.as_ref()),
+                            ].into_iter().filter_map(|(key, value)| {
+                                value.map(|value| (key.to_owned(), value.clone()))
+                            }).collect(),
+                            track_number: track.metadata.track_number,
+                            ..Default::default()
+                        },
+                        expected_samples: Some(44_100), sample_rate: Some(44_100),
+                        source_audio: SourceAudioDescriptor::from_scalar(
+                            Some(44_100), Some(24), Some(SourceAudioCoding::Pcm)),
+                        bit_depth: Some(24), warnings: Vec::new(),
+                    }
+                }).collect();
+            let prepared = PreparedSource {
+                container: archive_path.clone(), kind: SourceKind::Archive,
+                tracks: prepared_tracks,
+                album_metadata: AlbumMetadata {
+                    album: Some("Album".into()),
+                    album_artist: Some("Singer".into()).into(),
+                    date: album_year.map(str::to_owned),
+                    genre: album_genre.map(str::to_owned).into(),
+                    // Independently model the materializer's promoted extras
+                    // after selection, then compare the actual plan to the UI.
+                    extra: if common_extra {
+                        BTreeMap::from([
+                            ("composer".into(), "Bach".into()),
+                            ("isrc".into(), "AAA111".into()),
+                            ("catalognumber".into(), "CAT-01".into()),
+                        ])
+                    } else { BTreeMap::new() },
+                    total_tracks: selected.iter().filter(|&&value| value).count() as u32,
+                    ..Default::default()
+                },
+                provenance: ExtractionProvenance {
+                    source_kind: SourceKind::Archive,
+                    source_sha256: None, tool_versions: Default::default(),
+                    extracted_at: chrono::Utc::now(),
+                },
+            };
+            for (pattern, expected_prefix, expect_flat) in [
+                ("%YEAR%/%TITLE%", album_year, album_year.is_none()),
+                ("%GENRE%/%TITLE%", album_genre, album_genre.is_none()),
+                ("%COMPOSER%/%TITLE%", common_extra.then_some("Bach"), !common_extra),
+                ("%ISRC%/%TITLE%", common_extra.then_some("AAA111"), !common_extra),
+                ("%CATALOG%/%TITLE%", common_extra.then_some("CAT-01"), !common_extra),
+                ("%TRACKNN% - %TITLE%", None, true),
+                ("%TITLE% - %GENRE%", None, true),
+                ("%TITLE% - %COMPOSER%", None, true),
+                ("%TITLE% - %ISRC%", None, true),
+                ("%TITLE% - %CATALOG%", None, true),
+            ] {
+                let mut opts = OutputOptionsState::new();
+                opts.dest_path = Some(root.clone());
+                opts.set_naming_template(pattern, false);
+                let context = ConvertNamingPreview::from_source(&source, &opts, &edits)
+                    .expect("already-probed source");
+                let displayed = convert_naming_path_preview(&opts, &opts.naming_template(),
+                    &format, 512, source.current_info(), Some(context));
+                let mut conversion = crate::tui::convert_actions::try_pills_to_options(
+                    &format, &opts, &config).expect("valid Convert options");
+                crate::tui::convert_actions::apply_optional_naming_folder_for_source(
+                    &mut conversion, &opts, &format, &source, &edits);
+                assert_eq!(conversion.flat_output, expect_flat,
+                    "{case}: admission policy {pattern}");
+                let settings = conversion.pipeline_settings.clone().unwrap();
+                let item = ConversionItem::new(archive_path.clone(),
+                    FileFormat::Audio(crate::convert::formats::AudioFormat::Flac), conversion);
+                let mut request = crate::convert::pipeline::unified_request::build_pipeline_request_from_settings(
+                    &item, settings).expect("valid planner request");
+                request.naming.template = item.options.effective_naming_template("%NN% - %TITLE%");
+                let plan = crate::convert::pipeline::stages::plan_outputs(&prepared, &request)
+                    .expect("planner accepts archive");
+                let planned = &plan.entries[0].final_path;
+                assert_eq!(Path::new(&displayed), planned.as_path(),
+                    "{case}: preview and planner {pattern}");
+                let relative = planned.strip_prefix(&root).unwrap();
+                if let Some(prefix) = expected_prefix {
+                    assert!(relative.starts_with(prefix), "{case}: {pattern} folder");
+                } else if pattern.contains('/') {
+                    assert_eq!(relative.components().count(), 1,
+                        "{case}: {pattern} has no album folder");
+                }
+                if pattern.starts_with("%TRACKNN%") {
+                    assert_eq!(relative, Path::new("07 - Archive Edit.flac"),
+                        "{case}: archive TRACKNUMBER survives");
+                }
+                if pattern.contains(" - %GENRE%") {
+                    assert_eq!(relative, Path::new("Archive Edit - Ambient.flac"),
+                        "{case}: track GENRE remains track-scoped");
+                }
+                if pattern.contains(" - %COMPOSER%") {
+                    assert_eq!(relative, Path::new("Archive Edit - Bach.flac"),
+                        "{case}: filename COMPOSER remains track-scoped");
+                }
+                if pattern.contains(" - %ISRC%") {
+                    assert_eq!(relative, Path::new("Archive Edit - AAA111.flac"),
+                        "{case}: filename ISRC remains track-scoped");
+                }
+                if pattern.contains(" - %CATALOG%") {
+                    let expected = if common_extra { "Archive Edit - CAT-01.flac" }
+                        else { "Archive Edit -.flac" };
+                    assert_eq!(relative, Path::new(expected),
+                        "{case}: filename CATALOG uses common album metadata");
+                }
+            }
+            if case == "missing" {
+                // The highlighted second member has no COMPOSER or ISRC.
+                // Its filename must not inherit the first member's tags.
+                let SourceMode::MultiTrack { cursor, .. } = &mut source
+                    else { unreachable!() };
+                *cursor = 1;
+                for pattern in ["%TITLE% - %COMPOSER%", "%TITLE% - %ISRC%"] {
+                    let mut opts = OutputOptionsState::new();
+                    opts.dest_path = Some(root.clone());
+                    opts.set_naming_template(pattern, false);
+                    let context = ConvertNamingPreview::from_source(&source, &opts, &edits)
+                        .expect("already-probed second member");
+                    let displayed = convert_naming_path_preview(&opts, &opts.naming_template(),
+                        &format, 512, source.current_info(), Some(context));
+                    let mut converted = crate::tui::convert_actions::try_pills_to_options(
+                        &format, &opts, &config).expect("valid Convert options");
+                    crate::tui::convert_actions::apply_optional_naming_folder_for_source(
+                        &mut converted, &opts, &format, &source, &edits);
+                    assert!(converted.flat_output, "filename-only admission: {pattern}");
+                    let settings = converted.pipeline_settings.clone().unwrap();
+                    let item = ConversionItem::new(archive_path.clone(),
+                        FileFormat::Audio(crate::convert::formats::AudioFormat::Flac), converted);
+                    let mut request = crate::convert::pipeline::unified_request::build_pipeline_request_from_settings(
+                        &item, settings).expect("planner request");
+                    request.naming.template = item.options.effective_naming_template("%NN% - %TITLE%");
+                    let plan = crate::convert::pipeline::stages::plan_outputs(&prepared, &request)
+                        .expect("planner accepts both selected tracks");
+                    let planned = &plan.entries[1].final_path;
+                    assert_eq!(Path::new(&displayed), planned.as_path(),
+                        "second member must use its own {pattern} metadata");
+                    assert_eq!(displayed, "Second Track -.flac");
+                }
+            }
         }
     }
 
@@ -1530,6 +1917,7 @@ mod output_options_companion_render_tests {
         };
         let overrides = MetadataState::default();
         let context = ConvertNamingPreview {
+            archive_album: None,
             source_metadata: &metadata, album_metadata: None, selected_track: None,
             archive_track: false, album_title: None, album_artist: None,
             multi_disc_proven: false, overrides: &overrides, source_path: path,
@@ -1629,6 +2017,7 @@ mod output_options_companion_render_tests {
                     options.set_naming_template(pattern, false);
                     for width in [80, 160] {
                         let context = ConvertNamingPreview {
+                            archive_album: None,
                             source_metadata: &cursor, album_metadata: None,
                             selected_track: None, archive_track: false,
                             album_title: None, album_artist: None,
@@ -1663,6 +2052,7 @@ mod output_options_companion_render_tests {
         fn ctx<'a>(source: &'a SourceMetadata, overrides: &'a MetadataState)
             -> ConvertNamingPreview<'a> {
             ConvertNamingPreview {
+                archive_album: None,
                 source_metadata: source, album_metadata: None, selected_track: None,
                 archive_track: false, album_title: None, album_artist: None,
                 multi_disc_proven: false, overrides, source_path: Path::new("input.flac"),
@@ -1689,6 +2079,7 @@ mod output_options_companion_render_tests {
         // A missing optional composer must not invent a folder.
         let without_composer = SourceMetadata {composer: None, ..source.clone()};
         let ctx_missing = ConvertNamingPreview {
+            archive_album: None,
             source_metadata: &without_composer, album_metadata: None,
             selected_track: None, archive_track: false, album_title: None,
             album_artist: None, multi_disc_proven: false,
@@ -1709,6 +2100,7 @@ mod output_options_companion_render_tests {
         };
         let overrides = MetadataState::default();
         let ctx = ConvertNamingPreview {
+            archive_album: None,
             source_metadata: &metadata, album_metadata: None,
             selected_track: None, archive_track: false,
             album_title: None, album_artist: None,
@@ -1769,6 +2161,7 @@ mod output_options_companion_render_tests {
         opts.set_naming_template("{%YEAR%}/%TITLE%", false);
         let undated = SourceMetadata {title: Some("Undated".into()), ..Default::default()};
         let preview = ConvertNamingPreview {
+            archive_album: None,
             source_metadata: &undated, album_metadata: None, selected_track: None,
             archive_track: false, album_title: None, album_artist: None,
             multi_disc_proven: false, overrides: &overrides,
@@ -1803,6 +2196,7 @@ mod output_options_companion_render_tests {
                     source.year = source_date.map(str::to_owned);
                     overrides.year = override_date.map(str::to_owned);
                     let preview = ConvertNamingPreview {
+                        archive_album: None,
                         source_metadata: &source, album_metadata: None,
                         selected_track: None, archive_track: false,
                         album_title: None, album_artist: None,
@@ -1964,6 +2358,7 @@ mod output_options_companion_render_tests {
         };
         let overrides = MetadataState::default();
         let context = ConvertNamingPreview {
+            archive_album: None,
             source_metadata: &metadata, album_metadata: None,
             selected_track: None, archive_track: false,
             album_title: None, album_artist: None,

@@ -218,6 +218,7 @@ pub(crate) fn batch_optional_naming_flat_output_policies(
     for path in paths {
         let Some(source_metadata) = read_tags(path) else { continue; };
         let preview = crate::tui::draw_output_options::ConvertNamingPreview {
+            archive_album: None,
             source_metadata: &source_metadata,
             album_metadata: None,
             selected_track: None,

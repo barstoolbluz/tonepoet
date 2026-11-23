@@ -1399,10 +1399,13 @@ pub(crate) fn archive_preview_album_metadata(tracks: &[PreviewTrack]) -> SourceM
 
     let same_album = common_nonempty_metadata_value(tracks, |metadata| metadata.album.as_ref());
     let same_artist = common_nonempty_metadata_value(tracks, |metadata| metadata.artist.as_ref());
+    let same_album_artist = common_nonempty_metadata_value(tracks,
+        |metadata| metadata.album_artist.as_ref());
     let same_year = common_nonempty_metadata_value(tracks, |metadata| metadata.year.as_ref());
     let same_genre = common_nonempty_metadata_value(tracks, |metadata| metadata.genre.as_ref());
 
     metadata.album = same_album;
+    metadata.album_artist = same_album_artist.or_else(|| same_artist.clone());
     metadata.artist = same_artist;
     metadata.year = same_year;
     metadata.genre = same_genre;
@@ -1413,16 +1416,15 @@ fn common_nonempty_metadata_value<F>(tracks: &[PreviewTrack], f: F) -> Option<St
 where
     F: for<'a> Fn(&'a SourceMetadata) -> Option<&'a String>,
 {
-    let mut values = tracks
-        .iter()
-        .filter_map(|track| f(&track.metadata))
-        .filter(|value| !value.trim().is_empty());
-    let first = values.next()?.clone();
-    if values.all(|value| value == &first) {
-        Some(first)
-    } else {
-        None
+    // Album-scoped values must be present and identical on every track.
+    // Filtering missing values would promote a track-only tag into an album
+    // folder, whereas the archive materializer deliberately rejects it.
+    let first = f(&tracks.first()?.metadata)?;
+    if first.trim().is_empty() {
+        return None;
     }
+    tracks.iter().all(|track| f(&track.metadata) == Some(first))
+        .then(|| first.to_owned())
 }
 
 pub(crate) fn create_pending_archive_preview(

@@ -1496,13 +1496,42 @@ fn draw_output_with_hover(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
                         hover==Some(TuiButton::DiscBrowserNamingCustom),theme);
                 }
             }
-            "Downmix" | "Assume decrypted" => {
-                let value=if *name=="Downmix" {option_value(s,"Downmix")}
-                    else {format!("{} Assume decrypted",check(s.assume_decrypted))};
-                let fbg=if focused {theme.input_focused_bg}else{theme.input_unfocused_bg};
-                let text=clip_end(&value,field.width);
-                frame.render_widget(Paragraph::new(text).style(Style::default()
-                    .fg(readable_word(theme.value,fbg)).bg(fbg)),field);
+            "Downmix" => {
+                // Reserve the longest policy name, regardless of the active
+                // value. On narrow screens keep both arrows visible and clip
+                // only the label; the mouse targets do not move as it cycles.
+                let maximum = super::disc_browser_actions::NATIVE_DVDA_DOWNMIX_POLICIES.iter()
+                    .map(|policy| super::display_width::width(policy.as_str()) as u16)
+                    .max().unwrap_or(0);
+                let well=if focused {theme.input_focused_bg}else{theme.input_unfocused_bg};
+                buttons.record_button(TuiButton::DiscBrowserToggle(i),field);
+                if field.width>=5 {
+                    let value_width=maximum.min(field.width.saturating_sub(4));
+                    let next_x=field.x+value_width+3;
+                    fill(frame,Rect::new(field.x,field.y,value_width+4,1),well);
+                    frame.render_widget(Paragraph::new("◂").style(Style::default()
+                        .fg(if focused {theme.info}else{theme.label}).bg(well)),
+                        Rect::new(field.x,field.y,1,1));
+                    frame.render_widget(Paragraph::new(clip_end(s.downmix.as_str(),value_width))
+                        .style(Style::default().fg(readable_word(theme.value,well)).bg(well)),
+                        Rect::new(field.x+2,field.y,value_width,1));
+                    frame.render_widget(Paragraph::new("▸").style(Style::default()
+                        .fg(if focused {theme.info}else{theme.label}).bg(well)),
+                        Rect::new(next_x,field.y,1,1));
+                    buttons.record_button(TuiButton::DiscBrowserDownmixPrev,
+                        Rect::new(field.x,field.y,1,1));
+                    buttons.record_button(TuiButton::DiscBrowserDownmixNext,
+                        Rect::new(next_x,field.y,1,1));
+                } else {
+                    frame.render_widget(Paragraph::new(clip_end(s.downmix.as_str(),field.width))
+                        .style(Style::default().fg(readable_word(theme.value,well)).bg(well)),field);
+                }
+            }
+            "Assume decrypted" => {
+                let value=format!("{} Assume decrypted",check(s.assume_decrypted));
+                let well=if focused {theme.input_focused_bg}else{theme.input_unfocused_bg};
+                frame.render_widget(Paragraph::new(clip_end(&value,field.width))
+                    .style(Style::default().fg(readable_word(theme.value,well)).bg(well)),field);
                 buttons.record_button(TuiButton::DiscBrowserToggle(i),field);
             }
             _ => {},
@@ -3164,6 +3193,56 @@ mod extract_r3_render_tests {
         let arrow=buttons.button_rect(TuiButton::DiscBrowserOverwriteNext).unwrap();
         assert_eq!(buttons.find_button_at(arrow.x,arrow.y),
             Some(TuiButton::DiscBrowserOverwriteHelpOutside));
+    }
+
+    #[test]
+    fn round_5_downmix_arrows_have_stable_positions_and_click_targets() {
+        use crate::convert::pipeline::DvdaDownmixPolicy as Policy;
+        let theme=crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        let mut state=sacd_state(false,false);
+        state.contents.format=DiscFormat::DvdAudio;
+        state.contents.presentations[0].format.channels=Some(6);
+        state.focus=ExtractFocus::Output;
+        let index=state.output_rows().iter().position(|name|*name=="Downmix")
+            .expect("DVD-A multichannel Downmix row");
+        state.output_cursor=index;
+        let max_value=crate::tui::disc_browser_actions::NATIVE_DVDA_DOWNMIX_POLICIES.iter()
+            .map(|policy|policy.as_str().len() as u16).max().unwrap();
+        for (area,wide) in [(Rect::new(2,3,150,10),true),
+            (Rect::new(2,3,78,12),false),
+            (Rect::new(2,3,36,12),false)] {
+            let mut positions=None;
+            for policy in [Policy::None,Policy::Auto,
+                Policy::FooInputDvdaCompatible,Policy::FfmpegDefault] {
+                state.downmix=policy;
+                let mut terminal=Terminal::new(TestBackend::new(155,20)).unwrap();
+                let mut buttons=ButtonRenderMap::new();
+                terminal.draw(|frame|draw_output(frame,&state,area,&mut buttons,theme,wide)).unwrap();
+                let prev=buttons.button_rect(TuiButton::DiscBrowserDownmixPrev)
+                    .expect("left Downmix arrow");
+                let next=buttons.button_rect(TuiButton::DiscBrowserDownmixNext)
+                    .expect("right Downmix arrow");
+                let field=buttons.button_rect(TuiButton::DiscBrowserToggle(index))
+                    .expect("Downmix value field");
+                assert_eq!(next.x-prev.x,max_value.min(field.width-4)+3);
+                assert!(next.right()<=field.right());
+                assert_eq!(prev.y,next.y);
+                assert_eq!(terminal.backend().buffer().get(prev.x,prev.y).symbol(),"◂");
+                assert_eq!(terminal.backend().buffer().get(next.x,next.y).symbol(),"▸");
+                assert_eq!(buttons.find_button_at(prev.x,prev.y),
+                    Some(TuiButton::DiscBrowserDownmixPrev));
+                assert_eq!(buttons.find_button_at(next.x,next.y),
+                    Some(TuiButton::DiscBrowserDownmixNext));
+                if field.width>=max_value+4 {
+                    let rendered=(prev.x+2..prev.x+2+policy.as_str().len() as u16)
+                        .map(|x|terminal.backend().buffer().get(x,prev.y).symbol().to_owned())
+                        .collect::<Vec<_>>().concat();
+                    assert_eq!(rendered,policy.as_str());
+                }
+                if let Some(previous)=positions { assert_eq!((prev,next),previous); }
+                else {positions=Some((prev,next));}
+            }
+        }
     }
 
     #[test]

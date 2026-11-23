@@ -890,6 +890,15 @@ pub fn handle_disc_browser_button_click_with_shift(
             cycle_native_option(state,-1);
             true
         }
+        TuiButton::DiscBrowserDownmixNext | TuiButton::DiscBrowserDownmixPrev => {
+            let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { return false; };
+            if !state.output_rows().contains(&"Downmix") { return false; }
+            focus_native_row(state, "Downmix");
+            cycle_native_option(state, if matches!(button,TuiButton::DiscBrowserDownmixPrev) {
+                -1
+            } else { 1 });
+            true
+        }
         TuiButton::DiscBrowserOverwriteHelp => {
             let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { return false; };
             focus_native_row(state, "Overwrite");
@@ -1289,9 +1298,17 @@ pub(super) fn selected_sacd_has_dst(state: &DiscBrowserState) -> bool {
             && presentation_has_dst(program))
 }
 
+// The renderer uses this same policy list to size the Downmix cycler.
+// Order is the established keyboard/Enter cycle and must remain unchanged.
+pub(super) const NATIVE_DVDA_DOWNMIX_POLICIES: [crate::convert::pipeline::DvdaDownmixPolicy; 4] = [
+    crate::convert::pipeline::DvdaDownmixPolicy::None,
+    crate::convert::pipeline::DvdaDownmixPolicy::FooInputDvdaCompatible,
+    crate::convert::pipeline::DvdaDownmixPolicy::FfmpegDefault,
+    crate::convert::pipeline::DvdaDownmixPolicy::Auto,
+];
+
 fn cycle_native_option(state: &mut DiscBrowserState, step: i32) {
     use crate::convert::pipeline::native_extract::NativeWavContainer;
-    use crate::convert::pipeline::DvdaDownmixPolicy;
     match state.output_rows().get(state.output_cursor).copied() {
         _ if state.focus == crate::tui::disc_browser::ExtractFocus::Programs => {
             state.cycle_angle_for(state.cursor, step);
@@ -1313,8 +1330,7 @@ fn cycle_native_option(state: &mut DiscBrowserState, step: i32) {
         },
         Some("Files") => set_native_files(state,usize::from(!state.file_per_program)),
         Some("Downmix") => {
-            let all = [DvdaDownmixPolicy::None, DvdaDownmixPolicy::FooInputDvdaCompatible,
-                DvdaDownmixPolicy::FfmpegDefault, DvdaDownmixPolicy::Auto];
+            let all = &NATIVE_DVDA_DOWNMIX_POLICIES;
             let index = all.iter().position(|value| *value == state.downmix).unwrap_or(0);
             state.downmix = all[(index as i32 + step).rem_euclid(all.len() as i32) as usize];
         }
@@ -1429,11 +1445,16 @@ fn native_key_bindings(state: &DiscBrowserState) -> Vec<NativeKeyBinding> {
                 _ => "↵ settings",
             }, A::Enter);
             }
-            if native_form_has_neighbor(state, -1) {
-                add(KeyCode::Left, M::NONE, "← move", A::FormLeft);
-            }
-            if native_form_has_neighbor(state, 1) {
-                add(KeyCode::Right, M::NONE, "→ move", A::FormRight);
+            if row == "Downmix" {
+                add(KeyCode::Left, M::NONE, "←→ choose", A::Previous);
+                add(KeyCode::Right, M::NONE, "←→ choose", A::Next);
+            } else {
+                if native_form_has_neighbor(state, -1) {
+                    add(KeyCode::Left, M::NONE, "← move", A::FormLeft);
+                }
+                if native_form_has_neighbor(state, 1) {
+                    add(KeyCode::Right, M::NONE, "→ move", A::FormRight);
+                }
             }
         }
         ExtractFocus::Footer => {
@@ -3938,6 +3959,51 @@ mod tests {
         press(&mut app,KeyCode::Esc);
         assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if
             !s.overwrite_open && s.overwrite_policy==Policy::Replace));
+    }
+
+    #[test]
+    fn round_5_downmix_mouse_and_keyboard_cycle_without_moving_row_focus() {
+        use crossterm::event::KeyModifiers as M;
+        use crate::convert::pipeline::DvdaDownmixPolicy as Policy;
+        let source=PathBuf::from("dvda.iso");
+        let mut state=DiscBrowserState::new(
+            selectable_disc_contents(source.clone(),FolderDiscMarkerKind::DvdAudio),source);
+        state.contents.presentations[0].format.channels=Some(6);
+        state.downmix=Policy::None;
+        focus_native_row(&mut state,"Downmix");
+        let mut app=AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay=ActiveOverlay::DiscBrowser(Box::new(state));
+        let (tx,_rx)=tokio::sync::mpsc::channel(8);
+        let press=|app:&mut AppState,key|handle_disc_browser_key(app,
+            KeyEvent::new(key,M::NONE),&tx);
+        for (button,expected) in [
+            (TuiButton::DiscBrowserDownmixPrev,Policy::Auto),
+            (TuiButton::DiscBrowserDownmixNext,Policy::None),
+            (TuiButton::DiscBrowserDownmixNext,Policy::FooInputDvdaCompatible),
+            (TuiButton::DiscBrowserDownmixNext,Policy::FfmpegDefault),
+            (TuiButton::DiscBrowserDownmixNext,Policy::Auto),
+            (TuiButton::DiscBrowserDownmixNext,Policy::None),
+        ] {
+            assert!(handle_disc_browser_button_click(&mut app,&button,1,&tx));
+            assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if
+                s.downmix==expected && s.current_output_row()=="Downmix"));
+        }
+        for (key,expected) in [
+            (KeyCode::Left,Policy::Auto),
+            (KeyCode::Right,Policy::None),
+            (KeyCode::Char('['),Policy::Auto),
+            (KeyCode::Char(']'),Policy::None),
+        ] {
+            press(&mut app,key);
+            assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if
+                s.downmix==expected && s.current_output_row()=="Downmix"));
+        }
+        press(&mut app,KeyCode::Up);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if
+            s.current_output_row()=="Naming" && s.downmix==Policy::None));
+        press(&mut app,KeyCode::Down);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if
+            s.current_output_row()=="Downmix" && s.downmix==Policy::None));
     }
 
     /// Locate a character in the rendered terminal cell buffer, not by
