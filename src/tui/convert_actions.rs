@@ -1948,6 +1948,13 @@ mod lifecycle_forwarder_tests {
                 let old_paths: Vec<_> = old_plan.entries.iter().map(|e| &e.final_path).collect();
                 assert_eq!(new_paths, old_paths, "{pattern}");
                 assert_eq!(new_plan.album_dir, root.join(expected_root), "{pattern}");
+                let expected_second = if disc_dirs {
+                    root.join(expected_root).join("disc 02").join("02 - Second.flac")
+                } else {
+                    root.join(expected_root).join("02 - Second.flac")
+                };
+                assert_eq!(new_plan.entries[1].final_path, expected_second,
+                    "authored album folder precedes any automatic disc folder: {pattern}, disc dirs={disc_dirs}");
                 assert!(new_plan.entries[1].final_path.starts_with(&new_plan.album_dir));
                 if disc_dirs {
                     assert!(new_plan.entries[1].final_path.to_string_lossy()
@@ -1992,9 +1999,9 @@ mod lifecycle_forwarder_tests {
                 assert_eq!(plan.album_dir, root);
                 assert!(plan.entries.iter().all(|entry| entry.final_path.starts_with(&root)));
 
-                // A user year override makes the folder real, even when the
-                // source has no year tag. The normal planner then retains its
-                // album root for logs, companions, and Keep Both.
+                // A local metadata-pane Year edit is not carried into the
+                // conversion request; it cannot turn a missing-year source
+                // into a new album directory at queue admission.
                 let mut override_options = try_pills_to_options(&format, &output,
                     &config).unwrap();
                 let override_metadata = MetadataState {
@@ -2002,13 +2009,15 @@ mod lifecycle_forwarder_tests {
                 };
                 apply_optional_naming_folder_for_source(&mut override_options, &output,
                     &format, &mode, &override_metadata);
-                assert!(!override_options.flat_output,
-                    "authored year override has a real album root: {pattern}");
+                assert!(override_options.flat_output,
+                    "UI-only year edit must keep flat output: {pattern}");
                 let overridden_plan = planned_naming_outputs(
-                    &prepared_naming_album(Some("2018")), override_options, &root)
-                    .expect("overridden year must plan within album folder");
-                assert!(overridden_plan.album_dir.starts_with(&root));
-                assert_ne!(overridden_plan.album_dir, root);
+                    &prepared_naming_album(None), override_options, &root)
+                    .expect("UI-only year must not affect planned destinations");
+                assert_eq!(overridden_plan.album_dir, root);
+                assert_eq!(overridden_plan.entries.iter().map(|entry| &entry.final_path)
+                    .collect::<Vec<_>>(), plan.entries.iter().map(|entry| &entry.final_path)
+                    .collect::<Vec<_>>(), "UI-only year edit must not change names: {pattern}");
             }
         }
     }
