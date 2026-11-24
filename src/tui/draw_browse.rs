@@ -447,8 +447,7 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
             // Context menus are composited after Browse; they must not
             // remove artwork from the underlying Info pane.
             let suppress_artwork_image = !matches!(app.active_overlay,
-                super::app::ActiveOverlay::None | super::app::ActiveOverlay::ContextMenu { .. }
-                | super::app::ActiveOverlay::ArtworkSettings(_))
+                super::app::ActiveOverlay::None | super::app::ActiveOverlay::ContextMenu { .. })
                 || app.browse_artwork.popup_open;
             // The Info renderer knows the current, bounded artwork rectangle.
             // Give it the modal so it can update placement before drawing image

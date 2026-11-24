@@ -173,6 +173,11 @@ pub fn draw_ui(f: &mut Frame, app: &mut AppState) {
                 draw_ui(f, app);
             }
         } else {
+            // The native Kitty upload has been withheld by tmux preflight.
+            // Do not consume its one-shot worker frame until it is delivered.
+            if native == Some(super::tmux_images::NativeProtocol::Kitty) {
+                app.browse_artwork.kitty_upload_withheld();
+            }
             super::kitty_transport::suppress_unverified_tmux_graphics(f.buffer_mut());
         }
         return;

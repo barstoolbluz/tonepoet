@@ -172,7 +172,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
         match key.code {
             KeyCode::Esc | KeyCode::Enter => app.browse_artwork.close_popup(),
             KeyCode::Char('f') if key.modifiers == KeyModifiers::NONE => {
-                app.browse_artwork.enter_fullscreen();
+                app.browse_artwork.toggle_fullscreen();
             }
             KeyCode::Left | KeyCode::Up => { app.browse_artwork.cycle(false); }
             KeyCode::Right | KeyCode::Down | KeyCode::Char(' ') => {
@@ -6473,6 +6473,12 @@ mod inline_edit_behavior_tests {
         assert!(!normal_menu.iter().any(|entry| matches!(entry,
             ContextMenuEntry::Item(item)
                 if matches!(&item.action, ContextAction::BrowseArtworkExitFullscreen))));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE), &tx);
+        assert!(app.browse_artwork.popup_open && app.browse_artwork.fullscreen);
+        // 'f' is a reversible viewport toggle, not a one-way fullscreen key.
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE), &tx);
+        assert!(app.browse_artwork.popup_open && !app.browse_artwork.fullscreen);
+        assert_eq!(app.browse_artwork.popup_rect, Rect::default());
         handle_key(&mut app, KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE), &tx);
         assert!(app.browse_artwork.popup_open && app.browse_artwork.fullscreen);
         let fullscreen_menu = build_browse_artwork_menu(&app);
@@ -74775,6 +74781,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::ArtworkHeightInc(_)
             | TuiButton::ArtworkHeightBar(_, _)
             | TuiButton::ArtworkRevert
+            | TuiButton::ArtworkApply
             | TuiButton::ArtworkClose
             | TuiButton::ArtworkHelp
             | TuiButton::ArtworkNameRow(_)

@@ -3288,6 +3288,7 @@ pub fn execute_context_action(
                 super::artwork_settings::ArtworkSettingsState::new_for_preview(
                     &app.browse.artwork_config, anchor)
             };
+            app.browse_artwork.artwork_settings_opened();
             app.active_overlay = ActiveOverlay::ArtworkSettings(Box::new(settings));
         }
         ContextAction::BrowseArtworkToggleEmbeddedPreference => {

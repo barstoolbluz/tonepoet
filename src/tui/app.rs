@@ -18478,6 +18478,8 @@ impl AppState {
         // state to Halfblocks and invalidates old protocol caches first.
         self.force_halfblocks_for_unsafe_terminal_image_protocol();
 
+        self.browse_artwork.set_artwork_settings_visible(
+            matches!(self.active_overlay, ActiveOverlay::ArtworkSettings(_)));
         let protocol_generation = self.image_picker_generation;
         let retransmit_generation = self.image_kitty_retransmit_generation;
         let mut changed = false;
