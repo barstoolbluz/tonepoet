@@ -431,6 +431,15 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
     // documented interaction model.
     app.button_map.record_button(TuiButton::BrowsePaneTitle(BrowsePaneId::Browse), Rect::new(list_area.x, list_area.y, list_area.width, 1));
 
+    // An unavailable Info image has no anchor. Viewer windows update their
+    // own anchor in draw_popup(), after calculating the actual image rectangle.
+    if (!app.browse.info_enabled || app.browse.info_collapsed)
+        && !app.browse_artwork.popup_open
+    {
+        if let super::app::ActiveOverlay::ArtworkSettings(state) = &mut app.active_overlay {
+            state.update_anchor(Rect::default(), f.size());
+        }
+    }
     if app.browse.info_enabled {
         if app.browse.info_collapsed {
             draw_collapsed_pane(f, info_area, BrowsePaneId::Info, "info", &mut app.button_map, theme);
@@ -438,8 +447,18 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
             // Context menus are composited after Browse; they must not
             // remove artwork from the underlying Info pane.
             let suppress_artwork_image = !matches!(app.active_overlay,
-                super::app::ActiveOverlay::None | super::app::ActiveOverlay::ContextMenu { .. })
+                super::app::ActiveOverlay::None | super::app::ActiveOverlay::ContextMenu { .. }
+                | super::app::ActiveOverlay::ArtworkSettings(_))
                 || app.browse_artwork.popup_open;
+            // The Info renderer knows the current, bounded artwork rectangle.
+            // Give it the modal so it can update placement before drawing image
+            // cells, including when the terminal size has not changed.
+            let settings = if !app.browse_artwork.popup_open {
+                match &mut app.active_overlay {
+                    super::app::ActiveOverlay::ArtworkSettings(state) => Some(state.as_mut()),
+                    _ => None,
+                }
+            } else { None };
             draw_browse_info_with_artwork_cursor(
                 f,
                 info_area,
@@ -454,6 +473,7 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
                     (&mut app.browse_artwork, &app.browse.artwork_config)),
                 suppress_artwork_image,
                 show_terminal_cursor,
+                settings,
             );
             app.button_map.record_button(TuiButton::BrowsePaneToggle(BrowsePaneId::Info), Rect::new(info_area.x + 1, info_area.y, 7.min(info_area.width.saturating_sub(2)), 1));
         }
@@ -3554,7 +3574,7 @@ fn draw_browse_info_with_artwork(
     suppress_image: bool,
 ) {
     draw_browse_info_with_artwork_cursor(f,area,browse,accounting,inline_edit,
-        info_focus,buttons,hover,theme,artwork,suppress_image,true);
+        info_focus,buttons,hover,theme,artwork,suppress_image,true,None);
 }
 
 fn draw_browse_info_with_artwork_cursor(
@@ -3570,8 +3590,12 @@ fn draw_browse_info_with_artwork_cursor(
     mut artwork: Option<(&mut BrowseArtworkState, &crate::config::BrowseArtworkConfig)>,
     suppress_image: bool,
     show_terminal_cursor: bool,
+    mut settings: Option<&mut super::artwork_settings::ArtworkSettingsState>,
 ) {
     if area.height < 4 || area.width < 15 {
+        if let Some(settings) = settings {
+            settings.update_anchor(Rect::default(), f.size());
+        }
         return;
     }
 
@@ -3681,6 +3705,15 @@ fn draw_browse_info_with_artwork_cursor(
             percent_height(content_height as u16, config.pane_height_percent) as usize))
     } else { 0 };
     let text_height = content_height.saturating_sub(artwork_height);
+    let artwork_area = Rect::new(area.x.saturating_add(1),
+        area.y.saturating_add(1 + text_height as u16),
+        area.width.saturating_sub(2), artwork_height as u16);
+    if let Some(settings) = settings.as_deref_mut() {
+        settings.update_anchor(if artwork.is_some() && artwork_height > 0 {
+            artwork_area
+        } else { Rect::default() }, f.size());
+    }
+    let suppress_image = suppress_image || settings.as_ref().is_some_and(|s| s.hide_image());
     let start_row = 0;
 
     // Render content lines with border
@@ -3701,9 +3734,6 @@ fn draw_browse_info_with_artwork_cursor(
 
     if artwork_height > 0 {
         if let Some((state, config)) = artwork.as_mut() {
-            let artwork_area = Rect::new(area.x.saturating_add(1),
-                area.y.saturating_add(1 + text_height as u16),
-                area.width.saturating_sub(2), artwork_height as u16);
             // The final content row stays empty as a visual gap below the
             // image. No source filename or cycle caption is drawn in Info.
             let image_area = info_artwork_image_area(artwork_area);

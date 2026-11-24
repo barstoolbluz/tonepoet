@@ -30,7 +30,7 @@ fn duplicate_files_with_shared_admission(
     Ok(logical_created)
 }
 
-fn persist_browse_config(app: &mut AppState) {
+pub(crate) fn persist_browse_config(app: &mut AppState) {
     let browsing = app.browse.capture_browsing_config();
     app.config.browsing = browsing.clone();
     if let Err(err) = app.config.update(|latest| latest.browsing = browsing.clone()) {
@@ -144,6 +144,7 @@ pub enum ContextAction {
     BrowseImageFileView(PathBuf),
     /// Reserved image-editing entry. No edits or resize UI are implemented yet.
     BrowseImageActions,
+    BrowseArtworkOpenSettings,
     BrowseArtworkToggleEmbeddedPreference,
     BrowseArtworkToggleUpscale,
     BrowseArtworkToggleOpenFullscreen,
@@ -3198,40 +3199,21 @@ fn explicit_convert_cue_policy_for_selection(
 /// An image-region menu: unrelated Browse context actions are never offered
 /// when the pointer is over album artwork.
 pub fn build_browse_artwork_menu(app: &AppState) -> Vec<ContextMenuEntry> {
-    let config = &app.browse.artwork_config;
-    let mut entries = vec![if app.browse_artwork.popup_open && app.browse_artwork.fullscreen {
+    let entries = vec![if app.browse_artwork.popup_open && app.browse_artwork.fullscreen {
         item("Exit full screen", ContextAction::BrowseArtworkExitFullscreen)
     } else if app.browse_artwork.popup_open {
         item("Close view", ContextAction::BrowseArtworkCloseView)
     } else {
         item_enabled("View", ContextAction::BrowseArtworkView,
             app.browse_artwork.has_candidate())
-    }];
-    if app.browse_artwork.popup_open || app.browse_artwork.has_candidate() {
-        entries.push(item("Actions", ContextAction::BrowseImageActions));
-    }
-    entries.push(ContextMenuEntry::Submenu {
-            label: "Settings".into(),
-            children: vec![
-                item(&format!("{} Prefer embedded artwork",
-                    if config.prefer_embedded { "☑" } else { "☐" }),
-                    ContextAction::BrowseArtworkToggleEmbeddedPreference),
-                item(&format!("{} Allow image enlargement",
-                    if config.allow_upscale { "☑" } else { "☐" }),
-                    ContextAction::BrowseArtworkToggleUpscale),
-                item(&format!("{} Open images full screen",
-                    if config.open_fullscreen { "☑" } else { "☐" }),
-                    ContextAction::BrowseArtworkToggleOpenFullscreen),
-                separator(),
-                item(&format!("Info artwork height… ({}%)", config.pane_height_percent),
-                    ContextAction::BrowseArtworkEditPaneHeight),
-                item(&format!("View artwork height… ({}%)", config.popup_height_percent),
-                    ContextAction::BrowseArtworkEditPopupHeight),
-                item("Preferred artwork filenames…", ContextAction::BrowseArtworkEditFilenames),
-                separator(),
-                item("Reload artwork", ContextAction::BrowseArtworkReload),
-            ],
-        });
+    },
+    // Image editing does not exist in this release. Keep the shipped reload
+    // action reachable without displaying a button that cannot do its job.
+    ContextMenuEntry::Submenu {
+        label: "Actions".into(),
+        children: vec![item("Reload artwork", ContextAction::BrowseArtworkReload)],
+    },
+    item("Settings…", ContextAction::BrowseArtworkOpenSettings)];
     entries
 }
 
@@ -3291,6 +3273,18 @@ pub fn execute_context_action(
         ContextAction::BrowseImageActions => {
             // Intentionally a placeholder: no file writes, scaling, or modal.
             app.set_status("Image actions are not implemented yet");
+        }
+        ContextAction::BrowseArtworkOpenSettings => {
+            let anchor = if app.browse_artwork.popup_open {
+                app.browse_artwork.popup_rect
+            } else {
+                app.button_map.button_rect(super::button_map::TuiButton::BrowseInfoArtworkArea)
+                    .unwrap_or_default()
+            };
+            app.active_overlay = ActiveOverlay::ArtworkSettings(Box::new(
+                super::artwork_settings::ArtworkSettingsState::new(
+                    &app.browse.artwork_config, anchor),
+            ));
         }
         ContextAction::BrowseArtworkToggleEmbeddedPreference => {
             app.browse.artwork_config.prefer_embedded = !app.browse.artwork_config.prefer_embedded;
@@ -8583,9 +8577,19 @@ mod tests {
         assert!(app.browse_artwork.is_single_file_popup());
         let menu = build_browse_artwork_menu(&app);
         assert!(menu.iter().any(|entry| matches!(entry,
+            ContextMenuEntry::Submenu { label, children }
+                if label == "Actions" && children.iter().any(|child| matches!(child,
+                    ContextMenuEntry::Item(ContextMenuItem {
+                        label: reload, action: ContextAction::BrowseArtworkReload,
+                        enabled: true, ..
+                    }) if reload == "Reload artwork")))));
+        assert!(menu.iter().any(|entry| matches!(entry,
             ContextMenuEntry::Item(ContextMenuItem {
-                label, action: ContextAction::BrowseImageActions, enabled: true, ..
-            }) if label == "Actions")));
+                label, action: ContextAction::BrowseArtworkOpenSettings,
+                enabled: true, ..
+            }) if label == "Settings…")));
+        assert!(!menu.iter().any(|entry| matches!(entry,
+            ContextMenuEntry::Submenu { label, .. } if label == "Settings")));
         let before = std::fs::read(&path).unwrap();
         execute_context_action(&mut app, ContextAction::BrowseImageActions, &tx, false);
         assert_eq!(std::fs::read(&path).unwrap(), before,

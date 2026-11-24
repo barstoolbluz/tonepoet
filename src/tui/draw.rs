@@ -46,6 +46,9 @@ pub(crate) fn solid_title_block(
 /// Main draw function dispatching to screen-specific renderers
 pub fn draw_ui(f: &mut Frame, app: &mut AppState) {
     let theme = app.theme;
+    if let super::app::ActiveOverlay::ArtworkSettings(state) = &mut app.active_overlay {
+        state.prepare_geometry(f.size());
+    }
     // Clear button map for this frame
     app.button_map.clear();
 
@@ -129,7 +132,8 @@ pub fn draw_ui(f: &mut Frame, app: &mut AppState) {
     if app.current_screen == AppScreen::Browse
         && app.browse_artwork.popup_open
         && matches!(app.active_overlay,
-            super::app::ActiveOverlay::None | super::app::ActiveOverlay::ContextMenu { .. })
+            super::app::ActiveOverlay::None | super::app::ActiveOverlay::ContextMenu { .. }
+            | super::app::ActiveOverlay::ArtworkSettings(_))
     {
         super::browse_artwork::draw_popup(f, app, theme);
     }

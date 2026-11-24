@@ -266,6 +266,16 @@ impl BrowseArtworkState {
         self.warning = None;
     }
 
+    /// Settings apply while the image viewer remains open. A new discovery
+    /// generation replaces old pixels without exiting the invoking view.
+    pub fn invalidate_for_settings(&mut self) {
+        let was_open = self.popup_open;
+        let was_fullscreen = self.fullscreen;
+        self.invalidate();
+        self.popup_open = was_open;
+        self.fullscreen = was_fullscreen;
+    }
+
     pub fn clear_cache(&mut self) -> (u64, mpsc::Receiver<Result<(), String>>) {
         self.preview_cache_handle().clear()
     }
@@ -2801,6 +2811,12 @@ pub fn draw_popup(f: &mut ratatui::Frame, app: &mut super::app::AppState,
     // In full-screen mode, the entire terminal owns pointer input, including
     // letterboxing around an image smaller than the display.
     app.browse_artwork.popup_rect = if fullscreen { terminal } else { rect };
+    if let super::app::ActiveOverlay::ArtworkSettings(settings) = &mut app.active_overlay {
+        settings.update_anchor(app.browse_artwork.popup_rect, terminal);
+        if settings.hide_image() {
+            return;
+        }
+    }
     f.render_widget(Clear, rect);
     // No border, label, caption row, or panel outside the image. The backing
     // color matches the application rather than the old oversized panel.
