@@ -3281,10 +3281,14 @@ pub fn execute_context_action(
                 app.button_map.button_rect(super::button_map::TuiButton::BrowseInfoArtworkArea)
                     .unwrap_or_default()
             };
-            app.active_overlay = ActiveOverlay::ArtworkSettings(Box::new(
+            let settings = if app.browse_artwork.popup_open {
                 super::artwork_settings::ArtworkSettingsState::new(
-                    &app.browse.artwork_config, anchor),
-            ));
+                    &app.browse.artwork_config, anchor)
+            } else {
+                super::artwork_settings::ArtworkSettingsState::new_for_preview(
+                    &app.browse.artwork_config, anchor)
+            };
+            app.active_overlay = ActiveOverlay::ArtworkSettings(Box::new(settings));
         }
         ContextAction::BrowseArtworkToggleEmbeddedPreference => {
             app.browse.artwork_config.prefer_embedded = !app.browse.artwork_config.prefer_embedded;

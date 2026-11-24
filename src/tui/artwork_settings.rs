@@ -100,6 +100,7 @@ pub struct ArtworkSettingsState {
     popup_area: Rect,
     screen: Rect,
     anchor: Rect,
+    center_over_preview: bool,
     hovered: Option<TuiButton>,
     hide_image: bool,
 }
@@ -116,9 +117,18 @@ impl ArtworkSettingsState {
             popup_area: Rect::default(),
             screen: Rect::default(),
             anchor,
+            center_over_preview: false,
             hovered: None,
             hide_image: false,
         }
+    }
+
+    /// Preview actions use the same screen-centered window position as the
+    /// current viewer fallback. Placement beside artwork remains a viewer policy.
+    pub fn new_for_preview(config: &BrowseArtworkConfig, anchor: Rect) -> Self {
+        let mut state = Self::new(config, anchor);
+        state.center_over_preview = true;
+        state
     }
 
     /// A centered fallback cannot leave a usable artwork rectangle alongside it.
@@ -187,7 +197,7 @@ impl ArtworkSettingsState {
         let fits = |x: u16, y: u16| {
             x >= x_min && x <= x_max && y >= y_min && y <= y_max
         };
-        let choice = if anchor.width == 0 || anchor.height == 0 {
+        let choice = if self.center_over_preview || anchor.width == 0 || anchor.height == 0 {
             None
         } else {
             anchor.x.checked_sub(WIDTH + 2)
@@ -212,18 +222,31 @@ impl ArtworkSettingsState {
         // Retain the prior position while it still leaves the image visible.
         // Reposition only after an anchor change invalidates that separation,
         // or when a previously hidden image can now be shown.
+        let separate_from_image = |area: Rect| {
+            area.right().saturating_add(2) <= anchor.x
+                || anchor.right().saturating_add(2) <= area.x
+                || area.bottom().saturating_add(1) <= anchor.y
+                || anchor.bottom().saturating_add(1) <= area.y
+        };
         let previous_valid = !self.hide_image
             && fits(self.area.x, self.area.y)
             && self.area.width == WIDTH && self.area.height == HEIGHT
-            && (self.area.right().saturating_add(2) <= anchor.x
-                || anchor.right().saturating_add(2) <= self.area.x
-                || self.area.bottom().saturating_add(1) <= anchor.y
-                || anchor.bottom().saturating_add(1) <= self.area.y);
-        self.hide_image = choice.is_none();
-        self.area = match choice {
-            Some(_) if previous_valid => self.area,
-            Some((x, y)) => Rect::new(x, y, WIDTH, HEIGHT),
-            None => center,
+            && separate_from_image(self.area);
+        // Preview settings always open at screen center. Hide the image only
+        // if its current rectangle would intrude on that centered modal.
+        self.hide_image = if self.center_over_preview {
+            anchor.width > 0 && anchor.height > 0 && !separate_from_image(center)
+        } else {
+            choice.is_none()
+        };
+        self.area = if self.center_over_preview {
+            center
+        } else {
+            match choice {
+                Some(_) if previous_valid => self.area,
+                Some((x, y)) => Rect::new(x, y, WIDTH, HEIGHT),
+                None => center,
+            }
         };
         self.popup_area = Rect::new(
             self.area.x + (WIDTH - POPUP_WIDTH) / 2,
@@ -295,7 +318,7 @@ fn band_color(theme: Theme, focused: bool) -> Color {
 fn paint(f: &mut Frame, rect: Rect, x: u16, y: u16, text: &str, color: Color, bg: Color) {
     if x >= rect.width || y >= rect.height { return; }
     let max = (rect.width - x) as usize;
-    let fitted = display_width::fit_prefix(text, max);
+    let fitted = display_width::truncate_right(text, max);
     let width = display_width::width(&fitted) as u16;
     if width == 0 { return; }
     f.render_widget(
@@ -306,7 +329,7 @@ fn paint(f: &mut Frame, rect: Rect, x: u16, y: u16, text: &str, color: Color, bg
 
 fn paint_raw(f: &mut Frame, rect: Rect, x: u16, y: u16, text: &str, color: Color, bg: Color) {
     if x >= rect.width || y >= rect.height { return; }
-    let fitted = display_width::fit_prefix(text, (rect.width - x) as usize);
+    let fitted = display_width::truncate_right(text, (rect.width - x) as usize);
     let width = display_width::width(&fitted) as u16;
     if width > 0 {
         f.render_widget(Paragraph::new(fitted).style(Style::default().fg(color).bg(bg)),
@@ -345,7 +368,7 @@ fn button(f: &mut Frame, area: Rect, x: u16, y: u16, width: u16, label: &str,
     let background = if focused { theme.pill_active_bg }
         else if hovered { theme.pill_neutral_hover_bg } else { bg };
     let foreground = if focused { theme.pill_active_fg } else { theme.value };
-    let words = display_width::fit_prefix(label, width as usize);
+    let words = display_width::truncate_right(label, width as usize);
     let words = format!("{words:<width$}", width = width as usize);
     paint(f, area, x, y, &words, foreground, background);
 }
@@ -892,7 +915,7 @@ pub fn draw(f: &mut Frame, state: &mut ArtworkSettingsState,
 }
 
 fn list_visible(name: &str, width: usize) -> String {
-    display_width::fit_prefix(name, width)
+    display_width::truncate_right(name, width)
 }
 
 fn name_preview(name: &str) -> String {
@@ -939,10 +962,10 @@ fn draw_filenames(f: &mut Frame, area: Rect, popup: &FilenamesPopup,
         (4, PopupFocus::Add, 9, 11, " Add "),
     ] {
         let armed = focus == PopupFocus::Restore && popup.restore_armed;
-        button(f, area, 35, row, width, label, popup.focus == focus && !armed,
+        button(f, area, 34, row, width, label, popup.focus == focus && !armed,
             !armed && hovered == Some(TuiButton::ArtworkNameAction(index)),
             if armed { theme.destructive } else { theme.pill_neutral_bg }, theme);
-        record(map, TuiButton::ArtworkNameAction(index), area, 35, row, width);
+        record(map, TuiButton::ArtworkNameAction(index), area, 34, row, width);
     }
     paint(f, area, 3, 9, "Name", theme.label, theme.dropdown_bg);
     let name_bg = well(theme);
@@ -951,12 +974,12 @@ fn draw_filenames(f: &mut Frame, area: Rect, popup: &FilenamesPopup,
     // filenames must never shift the Add button or their mouse hitboxes.
     let field = format!(" {}{} ", visible,
                         " ".repeat(19usize.saturating_sub(display_width::width(&visible))));
-    paint(f, area, 10, 9, &field, theme.value, name_bg);
+    paint(f, area, 9, 9, &field, theme.value, name_bg);
     if popup.focus == PopupFocus::Name {
-        let caret_col = 11 + display_width::width(&visible) as u16;
-        paint(f, area, caret_col.min(30), 9, " ", theme.panel_bg, theme.editing_cursor);
+        let caret_col = 10 + display_width::width(&visible) as u16;
+        paint(f, area, caret_col.min(29), 9, " ", theme.panel_bg, theme.editing_cursor);
     }
-    record(map, TuiButton::ArtworkNameField, area, 10, 9, 21);
+    record(map, TuiButton::ArtworkNameField, area, 9, 9, 21);
     fill(f, Rect::new(area.x + 1, area.y + 11, POPUP_WIDTH - 2, 1), theme.dropdown_bg);
     paint(f, area, 3, 11, "?", theme.info, theme.dropdown_bg);
     paint(f, area, 5, 11, "all keys", theme.label, theme.dropdown_bg);
@@ -1012,6 +1035,172 @@ fn draw_help(f: &mut Frame, state: &ArtworkSettingsState, theme: Theme) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn right_border_and_local_backgrounds_survive_text_in_both_themes() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        for slug in ["tokyo-night", "tokyo-night-day"] {
+            let theme = super::super::theme::theme_by_slug(slug).unwrap();
+            let config = BrowseArtworkConfig::default();
+            let mut state = ArtworkSettingsState::new(&config, Rect::default());
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let mut map = ButtonRenderMap::default();
+            terminal.draw(|frame| draw(frame, &mut state, &config, &mut map, theme)).unwrap();
+            let area = state.area;
+            let buffer = terminal.backend().buffer();
+            for y in 0..area.height {
+                let expected = if y == 0 { "\u{2510}" } else if y == area.height - 1 {
+                    "\u{2518}"
+                } else if y == 4 || y == 10 { "\u{2524}" } else { "\u{2502}" };
+                let cell = buffer.get(area.right() - 1, area.y + y);
+                assert_eq!(cell.symbol(), expected, "{slug} main row {y}");
+                assert_eq!(cell.fg, readable(theme.title, theme.panel_bg), "{slug} main border color at row {y}");
+            }
+            let selected_width = display_width::width("\u{2611} Prefer embedded artwork") as u16;
+            assert_eq!(buffer.get(area.x + 3 + selected_width - 1, area.y + 2).bg,
+                       theme.selection_bg, "{slug} selected label ends at its text");
+            assert_eq!(buffer.get(area.x + 3 + selected_width, area.y + 2).bg,
+                       band_color(theme, true), "{slug} selected label must not flood the row");
+            for x in 38..49 {
+                assert_eq!(buffer.get(area.x + x, area.y + 11).bg,
+                           theme.chip_dismiss, "{slug} close chip cell {x}");
+            }
+            assert_eq!(buffer.get(area.x + 49, area.y + 11).bg,
+                       theme.panel_bg, "{slug} close chip ends at its fixed width");
+
+            state.help = true;
+            terminal.draw(|frame| draw(frame, &mut state, &config, &mut map, theme)).unwrap();
+            let window_help = Rect::new(12, 6, 56, 12);
+            let buffer = terminal.backend().buffer();
+            for y in 1..window_help.height - 1 {
+                let cell = buffer.get(window_help.right() - 1, window_help.y + y);
+                assert_eq!(cell.symbol(), "\u{2502}", "{slug} window help row {y}");
+            }
+            state.help = false;
+            state.filenames = Some(FilenamesPopup::new());
+            map.clear();
+            terminal.draw(|frame| draw(frame, &mut state, &config, &mut map, theme)).unwrap();
+            let popup = state.popup_area;
+            let buffer = terminal.backend().buffer();
+            for y in 0..popup.height {
+                let expected = if y == 0 { "\u{2510}" } else if y == popup.height - 1 {
+                    "\u{2518}"
+                } else if y == 10 { "\u{2524}" } else { "\u{2502}" };
+                let cell = buffer.get(popup.right() - 1, popup.y + y);
+                assert_eq!(cell.symbol(), expected, "{slug} popup row {y}");
+                assert_eq!(cell.fg, readable(theme.title, theme.panel_bg), "{slug} popup border color at row {y}");
+            }
+            assert_eq!(buffer.get(popup.x + 35, popup.y + 9).symbol(), "A",
+                       "{slug} Add must remain visible");
+
+            state.help = true;
+            terminal.draw(|frame| draw(frame, &mut state, &config, &mut map, theme)).unwrap();
+            let help_height = 11;
+            let help = Rect::new(12, (24 - help_height) / 2, 56, help_height);
+            let buffer = terminal.backend().buffer();
+            for y in 0..help.height {
+                let expected = if y == 0 { "\u{2510}" } else if y == help.height - 1 {
+                    "\u{2518}"
+                } else { "\u{2502}" };
+                let cell = buffer.get(help.right() - 1, help.y + y);
+                assert_eq!(cell.symbol(), expected, "{slug} all-keys row {y}");
+                assert_eq!(cell.fg, readable(theme.title, theme.panel_bg), "{slug} all-keys border color at row {y}");
+            }
+        }
+    }
+
+    #[test]
+    fn filename_actions_and_name_field_match_mockup_columns() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        for slug in ["tokyo-night", "tokyo-night-day"] {
+            let config = BrowseArtworkConfig::default();
+            let theme = super::super::theme::theme_by_slug(slug).unwrap();
+            let mut state = ArtworkSettingsState::new(&config, Rect::default());
+            let mut popup = FilenamesPopup::new();
+            popup.name = "cover.webp".to_owned();
+            state.filenames = Some(popup);
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let mut map = ButtonRenderMap::default();
+            terminal.draw(|frame| draw(frame, &mut state, &config, &mut map, theme)).unwrap();
+            let area = state.popup_area;
+            let buffer = terminal.backend().buffer();
+            for (index, row, first_letter, width) in [
+                (0u8, 3, "M", 11), (1, 4, "M", 11), (2, 5, "R", 11),
+                (3, 7, "R", 18), (4, 9, "A", 11),
+            ] {
+                assert_eq!(buffer.get(area.x + 35, area.y + row).symbol(), first_letter,
+                           "{slug} popup action {index} text start");
+                assert_eq!(map.button_rect(TuiButton::ArtworkNameAction(index)),
+                           Some(Rect::new(area.x + 34, area.y + row, width, 1)),
+                           "{slug} popup action {index} hitbox");
+            }
+            assert_eq!(buffer.get(area.x + 10, area.y + 9).symbol(), "c",
+                       "{slug} typed Name text starts at column 10");
+            assert_eq!(map.button_rect(TuiButton::ArtworkNameField),
+                       Some(Rect::new(area.x + 9, area.y + 9, 21, 1)),
+                       "{slug} Name field click target");
+            assert_eq!(map.button_rect(TuiButton::ArtworkNameDone),
+                       Some(Rect::new(area.x + 47, area.y + 11, 6, 1)),
+                       "{slug} Done must not move");
+        }
+    }
+
+    #[test]
+    fn preview_settings_center_and_track_image_overlap_without_moving() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use super::super::{
+            app::{ActiveOverlay, AppScreen},
+            context_menu::{execute_context_action, ContextAction},
+        };
+
+        let screen = Rect::new(0, 0, 160, 60);
+        let small_art = Rect::new(116, 41, 42, 12);
+        let expected = Rect::new(42, 23, WIDTH, HEIGHT);
+
+        // Exercise the actual Info-preview action. Calling new_for_preview()
+        // directly would miss a regression in the context-menu dispatcher.
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        assert!(!app.browse_artwork.popup_open, "test must open from Info preview");
+        app.button_map.record_button(TuiButton::BrowseInfoArtworkArea, small_art);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        execute_context_action(&mut app, ContextAction::BrowseArtworkOpenSettings, &tx, false);
+        let mut preview = match std::mem::replace(&mut app.active_overlay, ActiveOverlay::None) {
+            ActiveOverlay::ArtworkSettings(settings) => *settings,
+            other => panic!("Settings action did not open the artwork overlay: {other:?}"),
+        };
+        assert_eq!(preview.anchor, small_art, "use the registered Info artwork rectangle");
+        let config = app.browse.artwork_config.clone();
+        let mut terminal = Terminal::new(TestBackend::new(screen.width, screen.height)).unwrap();
+        let mut map = ButtonRenderMap::default();
+        terminal.draw(|frame| draw(frame, &mut preview, &config, &mut map, app.theme)).unwrap();
+        assert_eq!(preview.area, expected, "Info context action must open settings centered");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer.get(expected.x, expected.y).symbol(), "┌");
+        assert_eq!(buffer.get(expected.right() - 1, expected.y).symbol(), "┐");
+        assert!(!preview.hide_image());
+        assert_eq!(preview.popup_area.x, expected.x + (WIDTH - POPUP_WIDTH) / 2);
+
+        // A normal viewer still follows its original artwork-relative policy.
+        let mut viewer = ArtworkSettingsState::new(&config, small_art);
+        viewer.prepare_geometry(screen);
+        assert_ne!(viewer.area, expected);
+        assert!(!viewer.hide_image());
+
+        preview.update_anchor(Rect::new(116, 28, 42, 25), screen);
+        assert_eq!(preview.area, expected);
+        assert!(preview.hide_image());
+        preview.update_anchor(Rect::new(116, 43, 42, 10), screen);
+        assert_eq!(preview.area, expected);
+        assert!(!preview.hide_image());
+
+        let resized = Rect::new(0, 0, 132, 52);
+        preview.update_anchor(Rect::new(95, 36, 35, 12), resized);
+        assert_eq!(preview.area, Rect::new(28, 19, WIDTH, HEIGHT));
+        assert!(!preview.hide_image());
+    }
 
     #[test]
     fn summary_keeps_names_whole_and_reserves_remaining_count() {
@@ -1111,10 +1300,10 @@ mod tests {
         let theme = super::super::theme::theme_by_slug_or_default("tokyo-night");
         terminal.draw(|frame| draw(frame, &mut state, &config, &mut map, theme)).unwrap();
         assert_eq!(state.popup_area, Rect::new(12, 7, POPUP_WIDTH, POPUP_HEIGHT));
-        let restore = Rect::new(47, 14, 18, 1);
+        let restore = Rect::new(46, 14, 18, 1);
         assert_eq!(map.button_rect(TuiButton::ArtworkNameAction(3)), Some(restore));
         assert_eq!(map.button_rect(TuiButton::ArtworkNameField),
-                   Some(Rect::new(22, 16, 21, 1)));
+                   Some(Rect::new(21, 16, 21, 1)));
         assert_eq!(map.button_rect(TuiButton::ArtworkNameDone),
                    Some(Rect::new(59, 18, 6, 1)));
         state.filenames.as_mut().unwrap().restore_armed = true;
@@ -1143,15 +1332,15 @@ mod tests {
 
             let area = state.popup_area;
             let buffer = terminal.backend().buffer();
-            let displayed = (11..30)
+            let displayed = (10..29)
                 .map(|col| buffer.get(area.x + col, area.y + 9).symbol())
                 .collect::<Vec<_>>().join("");
             assert_eq!(displayed, name, "{slug}");
-            let caret = buffer.get(area.x + 30, area.y + 9);
+            let caret = buffer.get(area.x + 29, area.y + 9);
             assert_eq!(caret.symbol(), " ", "{slug}");
             assert_eq!(caret.bg, theme.editing_cursor, "{slug}");
             assert_eq!(map.button_rect(TuiButton::ArtworkNameField),
-                       Some(Rect::new(area.x + 10, area.y + 9, 21, 1)), "{slug}");
+                       Some(Rect::new(area.x + 9, area.y + 9, 21, 1)), "{slug}");
         }
     }
 
