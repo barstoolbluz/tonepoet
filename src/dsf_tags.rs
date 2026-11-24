@@ -688,6 +688,23 @@ pub fn write_artwork_with_control(
     Ok((snapshot, warning))
 }
 
+/// Replace exactly the selected APIC occurrence, using the established DSF
+/// tail writer. No audio-region copy is needed for a normal tag update.
+pub(crate) fn replace_artwork_occurrence(
+    path: &Path, index: usize, kind: u8, description: &str, original: &[u8],
+    mime: &str, data: &[u8], is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), String> {
+    if is_cancelled() { return Err("metadata save cancelled before preparing DSF artwork".into()); }
+    reject_symlinked_write_path(path)?;
+    let (_write_lock, target_path) = acquire_dsf_write_lock(path)?;
+    let path = target_path.as_path();
+    preflight_dsf_write_artifacts(path)?;
+    if let Some((location, encoded)) = backend::prepare_artwork_occurrence(path, index, kind, description, original, mime, data)? {
+        if let Some(warning) = write_prepared(path, location, &encoded, is_cancelled, &|_| {})? { log::warn!("{warning}"); }
+    }
+    Ok(())
+}
+
 /// Remove one APIC picture type through the journaled DSF tail writer.
 /// `Ok(None)` means the file had no matching picture and was not changed.
 pub fn remove_artwork_with_control(
@@ -3588,6 +3605,32 @@ mod backend {
         ))
     }
 
+    pub(super) fn prepare_artwork_occurrence(
+        path: &Path, index: usize, kind: u8, description: &str, original: &[u8],
+        mime: &str, data: &[u8],
+    ) -> Result<Option<(DsfMetadataLocation, Vec<u8>)>, String> {
+        let location = super::inspect_dsf_metadata_location(path)?;
+        let mut tag = read_tag(path, location)?;
+        let mut pictures: Vec<Picture> = tag.pictures().cloned().collect();
+        let selected = pictures.get_mut(index).ok_or("Selected DSF picture disappeared")?;
+        if u8::from(selected.picture_type.clone()) != kind || selected.description != description || selected.data != original {
+            return Err("Selected DSF picture changed or does not match its tag occurrence".into());
+        }
+        if selected.data == data { return Ok(None); }
+        selected.mime_type = mime.to_string();
+        selected.data = data.to_vec();
+        // id3's frame identity can collapse duplicate APIC descriptions. Never
+        // commit if the library cannot preserve the occurrence list exactly.
+        tag.remove("APIC");
+        for picture in &pictures { tag.add_frame(picture.clone()); }
+        let actual: Vec<_> = tag.pictures().collect();
+        if actual.len() != pictures.len() || actual.iter().zip(&pictures).any(|(a,b)|
+            a.picture_type != b.picture_type || a.description != b.description || a.mime_type != b.mime_type || a.data != b.data) {
+            return Err("DSF ID3 backend cannot preserve the existing picture occurrences".into());
+        }
+        Ok(Some((location, encode_tag(&tag)?)))
+    }
+
     pub(super) fn prepare_artwork_remove(
         path: &Path,
         picture_type_code: u8,
@@ -6073,6 +6116,15 @@ mod tests {
         assert_eq!(picture_count(&path, 3), 0);
         assert!(!tail_journal_path(&path).exists());
         assert!(!crate::db::Database::backup_path_for(&path).exists());
+    }
+
+    #[test]
+    fn editor_dsf_occurrence_replacement_preserves_audio_and_cancelled_file() {
+        let _coordination=crate::concurrency::scoped_test_coordination_root();let dir=tempfile::tempdir().unwrap();let path=dir.path().join("editor.dsf");write_test_dsf_fixture(&path,None).unwrap();let original=std::fs::read(&path).unwrap();
+        let _=write_artwork_with_control(&path,3,"image/png",b"original-cover",&||false,&|_|{}).unwrap();
+        replace_artwork_occurrence(&path,0,3,"",b"original-cover","image/jpeg",b"edited-cover",&||false).unwrap();let after=std::fs::read(&path).unwrap();assert_eq!(&after[..12],&original[..12]);assert_eq!(&after[28..original.len()],&original[28..]);
+        let offset=u64::from_le_bytes(after[20..28].try_into().unwrap()) as usize;let tag=id3::Tag::read_from2(&mut std::io::Cursor::new(&after[offset..])).unwrap();let pictures:Vec<_>=tag.pictures().collect();assert_eq!(pictures.len(),1);assert_eq!(pictures[0].data,b"edited-cover");assert_eq!(pictures[0].mime_type,"image/jpeg");
+        assert!(replace_artwork_occurrence(&path,0,3,"",b"edited-cover","image/png",b"cancel",&||true).is_err());assert_eq!(std::fs::read(&path).unwrap(),after);assert!(!tail_journal_path(&path).exists());assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(),1);
     }
 
     #[test]

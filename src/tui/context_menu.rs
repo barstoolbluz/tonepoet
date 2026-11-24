@@ -143,7 +143,9 @@ pub enum ContextAction {
     /// View a selected direct image file in Browse's existing artwork popup.
     BrowseImageFileView(PathBuf),
     /// Reserved image-editing entry. No edits or resize UI are implemented yet.
-    BrowseImageActions,
+    BrowseImageActions, // legacy no-op retained for compatibility with older callers
+    BrowseEditImageFiles { clicked: PathBuf, selection: Vec<PathBuf> },
+    BrowseEditArtwork { path: PathBuf, embedded: bool },
     BrowseArtworkOpenSettings,
     BrowseArtworkToggleEmbeddedPreference,
     BrowseArtworkToggleUpscale,
@@ -1599,7 +1601,6 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
                 && (entry.is_regular_file || (entry.is_symlink && !entry.is_broken_symlink))
             {
                 items.push(item("View", ContextAction::BrowseImageFileView(entry.path.clone())));
-                items.push(item("Actions", ContextAction::BrowseImageActions));
                 items.push(separator());
             }
             if super::browse::is_viewable_text_file(&entry.path) {
@@ -1617,6 +1618,21 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
                 ContextAction::CopyPath(entry.path.clone()),
             ));
         }
+    }
+
+    if super::edit_image_pipeline::supported_file(&entry.path) {
+        let action = ContextAction::BrowseEditImageFiles {
+            clicked: entry.path.clone(),
+            selection: selection_paths.iter().map(|p| (*p).clone()).collect(),
+        };
+        let actions = ContextMenuEntry::Submenu {
+            label: "Actions".into(),
+            children: vec![item("Edit Image…", action)],
+        };
+        let insertion = items.iter().position(|entry| matches!(entry,
+            ContextMenuEntry::Item(ContextMenuItem { action: ContextAction::BrowseImageFileView(_), .. })))
+            .map(|i| i + 1).unwrap_or(2.min(items.len()));
+        items.insert(insertion, actions);
     }
 
     if allow_single_item_actions && entry.path.is_file() {
@@ -3207,11 +3223,16 @@ pub fn build_browse_artwork_menu(app: &AppState) -> Vec<ContextMenuEntry> {
         item_enabled("View", ContextAction::BrowseArtworkView,
             app.browse_artwork.has_candidate())
     },
-    // Image editing does not exist in this release. Keep the shipped reload
-    // action reachable without displaying a button that cannot do its job.
     ContextMenuEntry::Submenu {
         label: "Actions".into(),
-        children: vec![item("Reload artwork", ContextAction::BrowseArtworkReload)],
+        children: {
+            let mut children = Vec::new();
+            if let Some((path, embedded)) = app.browse_artwork.edit_source() {
+                children.push(item("Edit Image…", ContextAction::BrowseEditArtwork { path, embedded }));
+            }
+            children.push(item("Reload artwork", ContextAction::BrowseArtworkReload));
+            children
+        },
     },
     item("Settings…", ContextAction::BrowseArtworkOpenSettings)];
     entries
@@ -3268,6 +3289,20 @@ pub fn execute_context_action(
                 if app.browse.artwork_config.open_fullscreen {
                     app.browse_artwork.enter_fullscreen();
                 }
+            }
+        }
+        ContextAction::BrowseEditImageFiles { clicked, selection } => {
+            if app.current_screen == AppScreen::Browse && !app.browse.is_in_archive() {
+                app.browse_artwork.artwork_settings_opened();
+                app.active_overlay = ActiveOverlay::EditImage(Box::new(
+                    super::edit_image::EditImageState::files(clicked, selection)));
+            }
+        }
+        ContextAction::BrowseEditArtwork { path, embedded } => {
+            if app.current_screen == AppScreen::Browse && !app.browse.is_in_archive() {
+                app.browse_artwork.artwork_settings_opened();
+                app.active_overlay = ActiveOverlay::EditImage(Box::new(
+                    super::edit_image::EditImageState::artwork(path, embedded)));
             }
         }
         ContextAction::BrowseImageActions => {
@@ -8535,7 +8570,7 @@ mod tests {
 
         for name in ["cover.png", "photo.JPG", "art.webp", "art.GIF", "art.bmp", "art.jpeg"] {
             let path = temp.path().join(name);
-            std::fs::write(&path, b"image data is decoded only after View").unwrap();
+            image::DynamicImage::new_rgb8(8, 8).save(&path).unwrap();
             app.browse.entries = vec![BrowseEntry::new(
                 path.clone(), name.into(), EntryKind::OtherFile, 0, None,
             )];
@@ -8545,9 +8580,8 @@ mod tests {
                     label, action: ContextAction::BrowseImageFileView(view_path), enabled: true, ..
                 }) if label == "View" && view_path == &path)), "{name}");
             assert!(menu.iter().any(|entry| matches!(entry,
-                ContextMenuEntry::Item(ContextMenuItem {
-                    label, action: ContextAction::BrowseImageActions, enabled: true, ..
-                }) if label == "Actions")), "image actions missing: {name}");
+                ContextMenuEntry::Submenu { label, children } if label == "Actions" && children.iter().any(|child| matches!(child,
+                    ContextMenuEntry::Item(ContextMenuItem { action: ContextAction::BrowseEditImageFiles { clicked, .. }, enabled: true, .. }) if clicked == &path)))), "image actions missing: {name}");
         }
 
         for name in ["image.svg", "image.png.txt", "notes.bin"] {
@@ -8562,9 +8596,7 @@ mod tests {
                     action: ContextAction::BrowseImageFileView(_), ..
                 }))), "{name}");
             assert!(!menu.iter().any(|entry| matches!(entry,
-                ContextMenuEntry::Item(ContextMenuItem {
-                    action: ContextAction::BrowseImageActions, ..
-                }))), "unexpected image actions: {name}");
+                ContextMenuEntry::Submenu { label, .. } if label == "Actions")), "unexpected image actions: {name}");
         }
     }
 

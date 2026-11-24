@@ -313,6 +313,9 @@ mod tests {
             &path, lofty::picture::PictureType::CoverFront,
         ).unwrap();
         assert_eq!(artwork, png);
+        let (pictures,_,_)=super::super::editor_pictures(&path).unwrap();
+        let picture=pictures.iter().find(|p|p.picture.pic_type()==lofty::picture::PictureType::CoverFront).unwrap();
+        assert_eq!(picture.picture.data(),png.as_slice());assert!(picture.tag.is_none(),"RF64 fallback is a read-only projection");
     }
 
     #[test]

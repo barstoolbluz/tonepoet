@@ -1169,61 +1169,107 @@ pub fn read_embedded_picture_bytes(
     path: &Path,
     picture_type: lofty::picture::PictureType,
 ) -> Result<Vec<u8>, String> {
-    use lofty::file::TaggedFileExt;
+    let container = read_artwork_container(path)?;
+    let data = match container {
+        ArtworkContainer::Tagged(tagged, _) => {
+            use lofty::file::TaggedFileExt;
+            tagged.tags().iter().flat_map(|tag| tag.pictures())
+                .find(|picture| picture.pic_type() == picture_type)
+                .map(|picture| picture.data().to_vec())
+        }
+        ArtworkContainer::NativeApe(outcome) => outcome.artwork.into_iter()
+            .find(|picture| picture.picture_type == picture_type).map(|picture| picture.data),
+    };
+    data.ok_or_else(|| format!("No embedded {:?} artwork found in '{}'", picture_type, path.display()))
+}
 
+// Share the reader and recovery policy with the viewer. RF64's synthesized
+// RIFF view and the native APE read fallback are not writable Lofty carriers.
+enum ArtworkContainer {
+    Tagged(lofty::file::TaggedFile, bool),
+    NativeApe(crate::metadata_persistence::NeutralApeReadOutcome),
+}
+
+fn read_artwork_container(path: &Path) -> Result<ArtworkContainer, String> {
     recover_metadata_before_read(path)?;
-
     match lofty::read_from_path(path) {
-        Ok(tagged_file) => {
-            for tag in tagged_file.tags() {
-                if let Some(picture) = tag
-                    .pictures()
-                    .iter()
-                    .find(|picture| picture.pic_type() == picture_type)
-                {
-                    return Ok(picture.data().to_vec());
+        Ok(tagged) => Ok(ArtworkContainer::Tagged(tagged, !rf64_metadata::has_rf64_magic(path))),
+        Err(_) if rf64_metadata::has_rf64_magic(path) =>
+            rf64_metadata::read_tags(path).map(|tagged| ArtworkContainer::Tagged(tagged, false)),
+        Err(error) if native_ape_fallback_is_eligible(path, &error) =>
+            read_neutral_native_ape_fallback(path).map(ArtworkContainer::NativeApe).map_err(|native_error|
+                format!("Failed to read artwork from '{}': {error}; native APEv2 fallback also refused: {native_error}", path.display())),
+        Err(error) => Err(format!("Failed to read artwork from '{}': {error}", path.display())),
+    }
+}
+
+/// Identity is an occurrence within a tag, not merely a picture type. A
+/// fallback-only record has no writable tag; its ordinal is container-wide.
+pub(super) struct EditorPicture {
+    pub tag: Option<lofty::tag::TagType>,
+    pub index: usize,
+    pub picture: lofty::picture::Picture,
+}
+
+pub(super) fn editor_pictures(path: &Path) -> Result<(Vec<EditorPicture>, String, String), String> {
+    use lofty::{file::TaggedFileExt, tag::Accessor, picture::Picture};
+    let mut pictures = Vec::new();
+    match read_artwork_container(path)? {
+        ArtworkContainer::Tagged(tagged, writable) => {
+            let album = tagged.primary_tag().and_then(|tag| tag.album()).map(|s| s.into_owned()).unwrap_or_default();
+            let artist = tagged.primary_tag().and_then(|tag| tag.artist()).map(|s| s.into_owned()).unwrap_or_default();
+            for tag in tagged.tags() {
+                for (index, picture) in tag.pictures().iter().enumerate() {
+                    pictures.push(EditorPicture { tag: writable.then_some(tag.tag_type()),
+                        index: if writable { index } else { pictures.len() }, picture: picture.clone() });
                 }
             }
+            Ok((pictures, album, artist))
         }
-        Err(_) if rf64_metadata::has_rf64_magic(path) => {
-            let tagged_file = rf64_metadata::read_tags(path)?;
-            for tag in tagged_file.tags() {
-                if let Some(picture) = tag.pictures().iter()
-                    .find(|picture| picture.pic_type() == picture_type)
-                {
-                    return Ok(picture.data().to_vec());
-                }
+        ArtworkContainer::NativeApe(outcome) => {
+            let value = |key: &str| outcome.rows.iter().find(|row| !row.is_binary && row.canonical_key.eq_ignore_ascii_case(key))
+                .map(|row| row.value.clone()).unwrap_or_default();
+            let (album, artist) = (value("ALBUM"), value("ARTIST"));
+            for (index, picture) in outcome.artwork.into_iter().enumerate() {
+                let mime = match picture.mime_type.as_str() {
+                    "image/jpeg" => Some(lofty::picture::MimeType::Jpeg),
+                    "image/png" => Some(lofty::picture::MimeType::Png),
+                    _ => None,
+                };
+                pictures.push(EditorPicture { tag: None, index,
+                    picture: Picture::new_unchecked(picture.picture_type, mime, None, picture.data) });
             }
-        }
-        Err(error) if native_ape_fallback_is_eligible(path, &error) => {
-            let outcome = read_neutral_native_ape_fallback(path).map_err(|native_error| {
-                format!(
-                    "Failed to read artwork from '{}': {error}; native APEv2 fallback also refused: {native_error}",
-                    path.display()
-                )
-            })?;
-            if let Some(artwork) = outcome
-                .artwork
-                .into_iter()
-                .find(|artwork| artwork.picture_type == picture_type)
-            {
-                return Ok(artwork.data);
-            }
-        }
-        Err(error) => {
-            return Err(format!(
-                "Failed to read artwork from '{}': {}",
-                path.display(),
-                error
-            ));
+            Ok((pictures, album, artist))
         }
     }
+}
 
-    Err(format!(
-        "No embedded {:?} artwork found in '{}'",
-        picture_type,
-        path.display()
-    ))
+/// Return true for native carriers. Native failures never reach the generic
+/// writer. The selected bytes are revalidated under the native write claim.
+pub(super) fn replace_editor_picture_native(
+    path: &Path, tag: lofty::tag::TagType, index: usize,
+    picture: &lofty::picture::Picture, mime: &str, data: &[u8],
+    cancel: &MetadataWriteCancelFlag,
+) -> Result<bool, String> {
+    if flac_metadata_writer::is_probably_flac(path) {
+        if tag != lofty::tag::TagType::VorbisComments {
+            return Err("Selected picture is not in the native FLAC picture blocks".into());
+        }
+        flac_metadata_writer::replace_picture_occurrence(path, index, picture, mime, data, cancel)
+            .map_err(|error| if cancel.is_cancelled() { error } else { native_flac_write_refused_error(path, "artwork write", &error) })?;
+        return Ok(true);
+    }
+    if crate::dsf_tags::is_dsf(path) {
+        if tag != lofty::tag::TagType::Id3v2 { return Err("Selected picture is not in the DSF ID3 tag".into()); }
+        crate::dsf_tags::replace_artwork_occurrence(path, index, picture.pic_type().as_u8(),
+            picture.description().unwrap_or(""), picture.data(), mime, data, &|| cancel.is_cancelled())?;
+        return Ok(true);
+    }
+    reject_unsupported_dff_metadata_write(path, "artwork writing")?;
+    if rf64_metadata::has_rf64_magic(path) {
+        return Err("RF64 artwork is readable, but this build has no RF64 artwork writer".into());
+    }
+    Ok(false)
 }
 
 /// Synthesize source-level metadata for a SACD ISO from the Master
@@ -2470,6 +2516,63 @@ mod flac_metadata_writer {
         }
 
         Ok(Some(replacement))
+    }
+
+    // Single-picture editor: leave other same-type blocks and all unrelated
+    // metadata blocks in their original order. The existing region writer owns
+    // padding, streaming overflow rewrites, journals and cancellation.
+    pub(super) fn replace_picture_occurrence(
+        path: &Path, index: usize, selected: &lofty::picture::Picture,
+        mime: &str, data: &[u8], cancel: &super::MetadataWriteCancelFlag,
+    ) -> Result<(), String> {
+        reject_symlink_native_write(path, "artwork write")?;
+        let mut claim = acquire_common_write_claim(path, "artwork write")?;
+        recover_metadata_journal(path)?;
+        recover_artwork_rollback_journal_before_native_write(path, "artwork write")?;
+        reject_hardlinked_native_write(path, "artwork write")?;
+        let metadata = read_flac_metadata(path)?;
+        let mut replacement: Vec<_> = metadata.blocks.iter().filter(|b| b.block_type != BLOCK_PADDING).cloned().collect();
+        let block = replacement.iter_mut().filter(|b| b.block_type == BLOCK_PICTURE).nth(index)
+            .ok_or("Selected native FLAC picture disappeared")?;
+        block.data = replace_picture_body(&block.data, selected, mime, data)?;
+        if block.data == metadata.blocks.iter().filter(|b| b.block_type == BLOCK_PICTURE).nth(index).unwrap().data {
+            return Ok(());
+        }
+        let report = write_replacement_blocks(path, &metadata, replacement, Some(cancel))?;
+        // Same native writer/cleanup behavior as ordinary FLAC metadata edits.
+        for warning in report.durability_warnings { log::warn!("{warning}"); }
+        if let Some(warning) = claim.release_with_warning("FLAC artwork write lock cleanup") { log::warn!("{warning}"); }
+        Ok(())
+    }
+
+    fn replace_picture_body(old: &[u8], selected: &lofty::picture::Picture, mime: &str, data: &[u8]) -> Result<Vec<u8>, String> {
+        fn field<'a>(bytes: &'a [u8], offset: &mut usize) -> Result<&'a [u8], String> {
+            let n = u32::from_be_bytes(read_bytes(bytes, offset, 4)?.try_into().unwrap()) as usize;
+            read_bytes(bytes, offset, n)
+        }
+        let kind = parse_picture_type_code(old)?;
+        let mut pos = 4;
+        let _old_mime = field(old, &mut pos)?;
+        let description = field(old, &mut pos)?;
+        let _dimensions = read_bytes(old, &mut pos, 16)?;
+        let original = field(old, &mut pos)?;
+        if pos != old.len() || kind != u32::from(selected.pic_type().as_u8())
+            || original != selected.data() || description != selected.description().unwrap_or("").as_bytes() {
+            return Err("Selected native FLAC picture changed or does not match its tag occurrence".into());
+        }
+        if original == data { return Ok(old.to_vec()); }
+        let (width, height) = super::picture_dimensions(data);
+        let mut out = Vec::new();
+        push_be_u32(&mut out, kind);
+        push_be_len_prefixed(&mut out, mime.as_bytes(), "picture MIME type")?;
+        push_be_len_prefixed(&mut out, description, "picture description")?;
+        push_be_u32(&mut out, width.unwrap_or(0));
+        push_be_u32(&mut out, height.unwrap_or(0));
+        push_be_u32(&mut out, 0);
+        push_be_u32(&mut out, 0);
+        push_be_len_prefixed(&mut out, data, "picture data")?;
+        if out.len() > MAX_BLOCK_BODY_LEN { return Err("FLAC PICTURE block is too large".into()); }
+        Ok(out)
     }
 
     fn build_picture_replacement(
@@ -23555,6 +23658,16 @@ mod tests {
     }
 
     #[test]
+    fn editor_reads_native_ape_artwork_when_lofty_cannot() {
+        use lofty::{file::{AudioFile,TaggedFileExt},picture::{Picture,PictureType,MimeType}};
+        let (_temp,path)=copy_numbering_fixture("artwork-invalid-key.wv",APE_NUMBERING_FIXTURE);
+        let mut bytes=Vec::new();image::DynamicImage::new_rgb8(8,8).write_to(&mut std::io::Cursor::new(&mut bytes),image::ImageFormat::Png).unwrap();
+        let mut tagged=lofty::read_from_path(&path).unwrap();tagged.primary_tag_mut().unwrap().push_picture(Picture::new_unchecked(PictureType::CoverFront,Some(MimeType::Png),None,bytes.clone()));tagged.save_to_path(&path,lofty::config::WriteOptions::default()).unwrap();append_invalid_key_ape_item(&path);
+        assert_eq!(read_embedded_picture_bytes(&path,PictureType::CoverFront).unwrap(),bytes);
+        let (pictures,_,_)=editor_pictures(&path).unwrap();let p=pictures.iter().find(|p|p.picture.pic_type()==PictureType::CoverFront).unwrap();assert_eq!(p.picture.data(),bytes.as_slice());assert!(p.tag.is_none());
+    }
+
+    #[test]
     // Strong-mode writes consult the metadata journal DB; isolate
     // XDG dirs (and serialize with other env-redirecting tests) so a
     // concurrent guard user cannot swap the journal path mid-write.
@@ -27879,6 +27992,21 @@ mod tests {
         let bytes = std::fs::read(&path).expect("read artwork-layout FLAC");
         assert_eq!(&bytes[audio_start_after as usize..], audio.as_slice());
         assert!(!crate::db::Database::backup_path_for(&path).exists());
+    }
+
+    #[test]
+    fn editor_replaces_one_same_type_flac_occurrence_and_preserves_audio() {
+        let _coordination=crate::concurrency::isolated_test_coordination_root();
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("multiple.flac");
+        use lofty::picture::{Picture,PictureType,MimeType};
+        let first=synthetic_picture_block(PictureType::CoverFront,b"first");let second=synthetic_picture_block(PictureType::CoverFront,b"second");let back=synthetic_picture_block(PictureType::CoverBack,b"back");let application=b"tpst-application".to_vec();let vorbis=vorbis_block_body("tonepoet-test",&[("TITLE","Keep")]);
+        let audio=write_synthetic_flac_with_blocks(&path,&[(0,vec![0;34]),(4,vorbis.clone()),(2,application.clone()),(6,first.clone()),(6,second),(6,back.clone()),(1,vec![0;65536])],65536);
+        let selected=Picture::new_unchecked(PictureType::CoverFront,Some(MimeType::Png),None,b"second".to_vec());let cancel=MetadataWriteCancelFlag::new();
+        flac_metadata_writer::replace_picture_occurrence(&path,1,&selected,"image/jpeg",b"edited",&cancel).unwrap();
+        let pictures=payloads_for_type(&path,6);assert_eq!(pictures.len(),3);assert_eq!(pictures[0],first);assert_eq!(pictures[2],back);assert!(pictures[1].ends_with(b"edited"));assert_eq!(payloads_for_type(&path,2),vec![application]);assert_eq!(payloads_for_type(&path,4),vec![vorbis]);
+        let start=flac_metadata_writer::test_read_audio_start(&path).unwrap() as usize;assert_eq!(&std::fs::read(&path).unwrap()[start..],audio.as_slice());assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(),1);
+        let before=std::fs::read(&path).unwrap();assert!(flac_metadata_writer::replace_picture_occurrence(&path,1,&selected,"image/jpeg",b"wrong",&cancel).is_err());assert_eq!(std::fs::read(&path).unwrap(),before);
+        let current=Picture::new_unchecked(PictureType::CoverFront,Some(MimeType::Jpeg),None,b"edited".to_vec());cancel.cancel();assert!(flac_metadata_writer::replace_picture_occurrence(&path,1,&current,"image/png",b"cancelled",&cancel).is_err());assert_eq!(std::fs::read(&path).unwrap(),before);assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(),1);
     }
 
     #[test]

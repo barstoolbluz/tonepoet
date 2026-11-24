@@ -455,6 +455,10 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
         .as_ref()
         .is_some_and(|state| state.maximized);
 
+    if let ActiveOverlay::EditImage(state) = &mut app.active_overlay {
+        super::edit_image::draw(f, state, theme);
+        return;
+    }
     if let ActiveOverlay::ArtworkSettings(state) = &mut app.active_overlay {
         super::artwork_settings::draw(
             f, state, &app.browse.artwork_config, &mut app.button_map, theme,
@@ -576,7 +580,7 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
     let overlay = app.active_overlay.clone();
     match overlay {
         ActiveOverlay::None => {}
-        ActiveOverlay::ArtworkSettings(_) => {}
+        ActiveOverlay::ArtworkSettings(_) | ActiveOverlay::EditImage(_) => {}
         ActiveOverlay::FolderProperties(ref state) => {
             super::draw_directory_properties::draw(f, state, &app.directory_accounting, &mut app.button_map, theme);
         }

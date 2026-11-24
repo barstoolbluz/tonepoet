@@ -271,7 +271,7 @@ fn mix(left: Color, right: Color, weight_right: u16, denom: u16) -> Color {
     )
 }
 
-fn readable(color: Color, bg: Color) -> Color {
+pub(super) fn readable(color: Color, bg: Color) -> Color {
     if contrast_ratio(color, bg) >= 4.5 {
         return color;
     }
@@ -303,7 +303,7 @@ fn soft(theme: Theme, background: Color) -> Color {
     mix(readable(theme.label, background), theme.value, 1, 3)
 }
 
-fn well(theme: Theme) -> Color {
+pub(super) fn well(theme: Theme) -> Color {
     if theme.dark {
         mix(theme.panel_bg, Color::Rgb(0, 0, 0), 1, 3)
     } else {
@@ -311,11 +311,11 @@ fn well(theme: Theme) -> Color {
     }
 }
 
-fn band_color(theme: Theme, focused: bool) -> Color {
+pub(super) fn band_color(theme: Theme, focused: bool) -> Color {
     if focused { theme.border_dim } else { theme.surface }
 }
 
-fn paint(f: &mut Frame, rect: Rect, x: u16, y: u16, text: &str, color: Color, bg: Color) {
+pub(super) fn paint(f: &mut Frame, rect: Rect, x: u16, y: u16, text: &str, color: Color, bg: Color) {
     if x >= rect.width || y >= rect.height { return; }
     let max = (rect.width - x) as usize;
     let fitted = display_width::truncate_right(text, max);
@@ -327,7 +327,7 @@ fn paint(f: &mut Frame, rect: Rect, x: u16, y: u16, text: &str, color: Color, bg
     );
 }
 
-fn paint_raw(f: &mut Frame, rect: Rect, x: u16, y: u16, text: &str, color: Color, bg: Color) {
+pub(super) fn paint_raw(f: &mut Frame, rect: Rect, x: u16, y: u16, text: &str, color: Color, bg: Color) {
     if x >= rect.width || y >= rect.height { return; }
     let fitted = display_width::truncate_right(text, (rect.width - x) as usize);
     let width = display_width::width(&fitted) as u16;
@@ -337,13 +337,13 @@ fn paint_raw(f: &mut Frame, rect: Rect, x: u16, y: u16, text: &str, color: Color
     }
 }
 
-fn fill(f: &mut Frame, rect: Rect, color: Color) {
+pub(super) fn fill(f: &mut Frame, rect: Rect, color: Color) {
     if rect.width > 0 && rect.height > 0 {
         f.render_widget(Block::default().style(Style::default().bg(color)), rect);
     }
 }
 
-fn frame(f: &mut Frame, area: Rect, title: &str, rules: &[u16], theme: Theme) {
+pub(super) fn frame(f: &mut Frame, area: Rect, title: &str, rules: &[u16], theme: Theme) {
     // Style-only blocks preserve old symbols. Clear once for all three modal
     // frames; the subsequent region fills are intentionally style-only.
     f.render_widget(Clear, area);

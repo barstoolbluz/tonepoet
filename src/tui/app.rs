@@ -9198,6 +9198,7 @@ pub enum ActiveOverlay {
     None,
     /// Artwork settings and its ordered filename editor.
     ArtworkSettings(Box<crate::tui::artwork_settings::ArtworkSettingsState>),
+    EditImage(Box<crate::tui::edit_image::EditImageState>),
     /// Read-only filesystem folder properties; metadata editor remains separate.
     FolderProperties(Box<crate::tui::directory_properties::FolderPropertiesState>),
     /// Three-view theme builder overlay.
@@ -18469,7 +18470,7 @@ impl AppState {
         if self.browse_artwork.popup_open
             && !matches!(self.active_overlay,
                 ActiveOverlay::None | ActiveOverlay::ContextMenu { .. }
-                | ActiveOverlay::ArtworkSettings(_))
+                | ActiveOverlay::ArtworkSettings(_) | ActiveOverlay::EditImage(_))
         {
             self.browse_artwork.close_popup();
         }
@@ -18479,11 +18480,15 @@ impl AppState {
         self.force_halfblocks_for_unsafe_terminal_image_protocol();
 
         self.browse_artwork.set_artwork_settings_visible(
-            matches!(self.active_overlay, ActiveOverlay::ArtworkSettings(_)));
+            matches!(self.active_overlay, ActiveOverlay::ArtworkSettings(_) | ActiveOverlay::EditImage(_)));
         let protocol_generation = self.image_picker_generation;
         let retransmit_generation = self.image_kitty_retransmit_generation;
         let mut changed = false;
         match &mut self.active_overlay {
+            ActiveOverlay::EditImage(state) => {
+                changed |= state.prepare(&mut self.image_picker, protocol_generation,
+                    retransmit_generation, self.theme);
+            }
             ActiveOverlay::MetadataEditor(state) => {
                 changed |= state.prepare_artwork_preview_protocol(
                     &mut self.image_picker,
@@ -18510,6 +18515,16 @@ impl AppState {
                     );
             }
             _ => {}
+        }
+        let finished_edit = match &mut self.active_overlay {
+            ActiveOverlay::EditImage(state) => state.finished.take().map(|status| (status, state.wrote)),
+            _ => None,
+        };
+        if let Some((status, wrote)) = finished_edit {
+            self.active_overlay = ActiveOverlay::None;
+            self.browse_artwork.edit_image_finished(wrote);
+            self.set_status(status);
+            changed = true;
         }
         if self.current_screen == AppScreen::Browse
             && ((self.browse.info_enabled && !self.browse.info_collapsed

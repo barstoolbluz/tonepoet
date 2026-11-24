@@ -154,6 +154,9 @@ pub struct BrowseArtworkState {
     // asynchronous gallery scan finishes. A failed explicit file stays chosen.
     failed: HashMap<ArtworkSource, String>,
     viewer_decode_bounds: Option<(u32, u32)>,
+    viewer_max_area: Rect,
+    // Session-only fixed-origin native frames, keyed to decoded content and terminal geometry.
+    alternate_frames: Vec<(u64, Option<[u8; 3]>, (u16, u16), ratatui_image::picker::ProtocolType, EncodedFrame)>,
     /// RGB ground used for viewer alpha composition, not Info's cached pixels.
     viewer_background: Option<[u8; 3]>,
     decode_rx: Option<Receiver<DecodeResult>>,
@@ -223,6 +226,7 @@ impl Default for BrowseArtworkState {
             context: None, generation: 0, scan_generation: 0, decode_generation: 0, changed_at: Instant::now(), scanned: None,
             scan_rx: None, sources: Vec::new(), cursor: 0,
             queued_gallery_offset: 0, failed: HashMap::new(), viewer_decode_bounds: None,
+            viewer_max_area: Rect::default(), alternate_frames: Vec::new(),
             viewer_background: None, decode_rx: None, decoded_source: None, decoded_embedded_path: None, decoded: None,
             preview_cache: None, memory_only_preview_cache: false,
             protocol: None, desired_area: Rect::default(),
@@ -286,6 +290,8 @@ impl BrowseArtworkState {
         self.post_native_repaint_redraw = false;
         self.failed.clear();
         self.viewer_decode_bounds = None;
+        self.viewer_max_area = Rect::default();
+        self.alternate_frames.clear();
         self.decoded_source = None;
         self.decoded_embedded_path = None;
         self.decoded = None;
@@ -426,6 +432,9 @@ impl BrowseArtworkState {
     /// generation-obsolete; it may finish, but cannot populate the viewer.
     pub fn open_info_popup(&mut self) {
         self.popup_open = true;
+        self.asynchronous_after_settings = true;
+        self.viewer_max_area = Rect::default();
+        self.alternate_frames.clear();
         self.fullscreen = false;
         self.popup_rect = Rect::default();
         self.desired_area = Rect::default(); // wait for viewer geometry before decoding
@@ -454,6 +463,9 @@ impl BrowseArtworkState {
         self.sources = vec![ArtworkSource::File(path)];
         self.queued_gallery_offset = 0;
         self.popup_open = true;
+        self.asynchronous_after_settings = true;
+        self.viewer_max_area = Rect::default();
+        self.alternate_frames.clear();
         self.fullscreen = false;
         self.popup_rect = Rect::default();
         self.desired_area = Rect::default();
@@ -461,36 +473,35 @@ impl BrowseArtworkState {
         self.invalidate_protocol();
     }
 
-    /// `f` expands an already-open viewer. The next draw records the new
-    /// terminal-sized viewport; the existing prepare pass then decodes to its
-    /// new pixel bounds, discarding any stale lower-resolution result.
-    pub fn enter_fullscreen(&mut self) {
-        if self.popup_open && !self.fullscreen {
-            self.fullscreen = true;
-            self.popup_rect = Rect::default();
-            // The next render records the terminal's actual geometry.
-            // Defer decoding until then, rather than scheduling an obsolete
-            // modal-sized decode during the event loop's pre-draw update.
-            self.desired_area = Rect::default();
-            self.needs_background_restore = true;
-            self.invalidate_protocol();
+    // Retain only fixed-origin protocols. Kitty has one-shot image IDs and
+    // must always use a new protocol after changing geometry.
+    fn remember_viewer_frame(&mut self) {
+        if !self.prepared_protocol_has_fixed_origin { return; }
+        if let Some(frame) = self.encoded_frame.take() {
+            if frame.key != self.encoded_frame_key() { return; }
+            self.alternate_frames.retain(|(_, _, _, _, old)| old.key.area != frame.key.area);
+            if self.alternate_frames.len() >= 2 { self.alternate_frames.remove(0); }
+            self.alternate_frames.push((self.generation, self.viewer_background,
+                self.font_size, self.prepared_protocol_type, frame));
         }
     }
 
-    /// F toggles the already-open viewer between its ordinary and full-terminal
-    /// viewport. Leave the viewer open and let the established bounds-aware
-    /// decode worker prepare pixels for the new size.
+    fn switch_viewport(&mut self, fullscreen: bool) {
+        self.remember_viewer_frame();
+        self.fullscreen = fullscreen;
+        self.asynchronous_after_settings = true;
+        self.popup_rect = Rect::default();
+        self.desired_area = Rect::default();
+        self.needs_background_restore = true;
+        self.invalidate_protocol();
+    }
+
+    pub fn enter_fullscreen(&mut self) {
+        if self.popup_open && !self.fullscreen { self.switch_viewport(true); }
+    }
+
     pub fn toggle_fullscreen(&mut self) {
-        if !self.popup_open { return; }
-        if !self.fullscreen {
-            self.enter_fullscreen();
-        } else {
-            self.fullscreen = false;
-            self.popup_rect = Rect::default();
-            self.desired_area = Rect::default();
-            self.needs_background_restore = true;
-            self.invalidate_protocol();
-        }
+        if self.popup_open { self.switch_viewport(!self.fullscreen); }
     }
 
     /// Defer expensive native image encoding after the settings window opens.
@@ -519,6 +530,37 @@ impl BrowseArtworkState {
             self.native_placement_awaiting_render = true;
             self.post_native_repaint_redraw = false;
         }
+    }
+
+    pub(super) fn edit_source(&self) -> Option<(PathBuf, bool)> {
+        match self.decoded_source.as_ref()? {
+            ArtworkSource::File(path) => Some((path.clone(), false)),
+            ArtworkSource::Embedded(_) => self.decoded_embedded_path.clone().map(|p| (p, true)),
+        }
+    }
+
+    pub(super) fn edit_image_finished(&mut self, wrote: bool) {
+        self.set_artwork_settings_visible(false);
+        self.needs_background_restore = true;
+        self.alternate_frames.clear();
+        if wrote {
+            if let (Some(cache), Some((path, _))) = (&self.preview_cache, self.edit_source()) { cache.invalidate_paths(&[path]); }
+            self.generation = self.generation.wrapping_add(1);
+            self.failed.clear();
+            self.decoded = None;
+            self.decoded_source = None;
+            self.decoded_embedded_path = None;
+        }
+        self.invalidate_protocol();
+    }
+
+    pub(super) fn set_edit_preview_pixels(&mut self, pixels: Arc<DynamicImage>, _background: Color) {
+        self.generation = self.generation.wrapping_add(1);
+        self.decoded = Some(pixels);
+        self.fullscreen = true; // previews never enlarge
+        self.asynchronous_after_settings = true;
+        self.needs_background_restore = true;
+        self.invalidate_protocol();
     }
 
     pub fn has_image(&self) -> bool { self.decoded.is_some() }
@@ -612,6 +654,8 @@ impl BrowseArtworkState {
         self.settings_visible = false;
         self.awaiting_viewport_after_settings = false;
         self.encoded_frame = None;
+        self.alternate_frames.clear();
+        self.viewer_max_area = Rect::default();
         self.inline_click_source = None;
         self.artwork_menu_occludes_image = false;
         self.repaint_image_after_menu = false;
@@ -697,9 +741,15 @@ impl BrowseArtworkState {
         }
         let font_size = picker.font_size;
         self.font_size = font_size;
+        // Decode once for the largest viewport this terminal can display.
+        // A modal/full-screen toggle changes only terminal encoding geometry.
+        let decode_area = if self.popup_open && self.desired_area.width > 0
+            && self.desired_area.height > 0 && self.viewer_max_area.width > 0 {
+            self.viewer_max_area
+        } else { self.desired_area };
         let bounds = (
-            u32::from(self.desired_area.width).saturating_mul(u32::from(font_size.0.max(1))),
-            u32::from(self.desired_area.height).saturating_mul(u32::from(font_size.1.max(1))),
+            u32::from(decode_area.width).saturating_mul(u32::from(font_size.0.max(1))),
+            u32::from(decode_area.height).saturating_mul(u32::from(font_size.1.max(1))),
         );
         // The popup is measured on its first draw. Do not decode at an
         // arbitrary 1600-pixel fallback then immediately decode again.
@@ -803,6 +853,21 @@ impl BrowseArtworkState {
             self.protocol_area = desired;
             self.protocol_generation = picker_generation;
             self.retransmit_generation = kitty;
+            if self.popup_open && self.prepared_protocol_has_fixed_origin {
+                let position = self.alternate_frames.iter().position(|(generation, ground, font, protocol, frame)| {
+                    *generation == self.generation && *ground == self.viewer_background
+                    && *font == font_size && *protocol == picker.protocol_type
+                    && frame.key.area == desired && frame.key.protocol_generation == picker_generation
+                    && frame.key.retransmit_generation == kitty
+                });
+                if let Some(position) = position {
+                    let (_, _, _, _, mut frame) = self.alternate_frames.remove(position);
+                    frame.key = self.encoded_frame_key();
+                    frame.upload_drawn = false;
+                    self.encoded_frame = Some(frame);
+                    self.repaint_image_after_menu = true;
+                }
+            }
             changed = true;
         }
         // Never use terminal draw to resize/encode after an artwork-settings
@@ -828,6 +893,7 @@ impl BrowseArtworkState {
                 self.encode_rx = Some(rx);
                 self.encode_request = Some(key);
                 thread::spawn(move || {
+                    let started=Instant::now();
                     let kitty = picker.protocol_type ==
                         ratatui_image::picker::ProtocolType::Kitty;
                     let mut protocol = picker.new_resize_protocol(pixels.as_ref().clone());
@@ -861,6 +927,10 @@ impl BrowseArtworkState {
                             super::kitty_transport::compress_kitty_upload(origin.symbol()) {
                             origin.set_symbol(&compressed);
                         }
+                    }
+                    if log::log_enabled!(log::Level::Debug) {
+                        let bytes:usize=(0..area.height).map(|y|(0..area.width).map(|x|cells.get(x,y).symbol().len()).sum::<usize>()).sum();
+                        log::debug!("artwork native encode: {}x{} cells, {} ms, {} buffer symbol bytes (not PTY bytes)",area.width,area.height,started.elapsed().as_millis(),bytes);
                     }
                     let _ = tx.send(EncodedFrame {
                         key, cells, placement_cells, upload_drawn: false,
@@ -1019,6 +1089,13 @@ impl BrowseArtworkState {
     /// The renderer records geometry and paints prepared protocol state.
     /// After settings opens, native resize/encode is worker-owned; a pending
     /// worker must never fall back to a blocking image encode here.
+    #[cfg(test)]
+    pub(super) fn native_frame_ready(&self)->bool {
+        self.decoded.is_some()&&self.protocol.is_some()&&self.protocol_area.width>0&&self.protocol_area.height>0
+            &&(!self.asynchronous_after_settings||self.prepared_protocol_type==ratatui_image::picker::ProtocolType::Halfblocks
+                ||self.encoded_frame.as_ref().is_some_and(|frame|frame.key==self.encoded_frame_key()))
+    }
+
     pub fn render_image(&mut self, f: &mut ratatui::Frame, area: Rect,
                         allow_upscale: bool, placement: ImageVerticalPlacement,
                         background: Color) -> bool {
@@ -1407,7 +1484,7 @@ fn decode_image_bytes_with_bounds(
 /// Composite before downsampling: Sixel does not carry PNG alpha and its
 /// palette quantizer otherwise uses hidden RGB values as visible edge ink.
 /// Opaque images retain their existing decoding and resizing path.
-fn composite_viewer_alpha(image: DynamicImage, background: [u8; 3]) -> DynamicImage {
+pub(super) fn composite_viewer_alpha(image: DynamicImage, background: [u8; 3]) -> DynamicImage {
     if !image.color().has_alpha() { return image; }
     // PNG encoders often retain an RGBA channel even for wholly opaque art.
     // Preserve that image's original pixel format and resizing path.
@@ -2391,6 +2468,9 @@ mod tests {
         picker.protocol_type = ProtocolType::Sixel;
         let config = BrowseArtworkConfig::default();
         assert!(state.prepare(&mut picker, 0, 0, &config, Color::Rgb(0, 0, 0)));
+        let deadline=Instant::now()+std::time::Duration::from_secs(10);
+        while !state.native_frame_ready()&&Instant::now()<deadline {state.prepare(&mut picker,0,0,&config,Color::Rgb(0,0,0));std::thread::sleep(std::time::Duration::from_millis(2));}
+        assert!(state.native_frame_ready(),"native worker must complete");
         assert!(state.take_background_restore());
         let mut terminal = Terminal::new(TestBackend::new(40, 25)).unwrap();
         terminal.draw(|frame| {
@@ -3301,6 +3381,36 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_round_trip_preserves_terminal_sized_decoded_pixels() {
+        use ratatui_image::picker::ProtocolType;
+        let mut state=BrowseArtworkState::default();
+        state.open_file_popup(PathBuf::from("/image/cover.png"));
+        state.scanned=state.context.clone();
+        state.viewer_max_area=Rect::new(0,0,100,40);
+        state.viewer_decode_bounds=Some((800,480));
+        state.viewer_background=Some([0,0,0]);
+        let pixels=Arc::new(DynamicImage::new_rgb8(800,480));
+        state.decoded=Some(pixels.clone());
+        let generation=state.generation;
+        let mut picker=Picker::new((8,12)); picker.protocol_type=ProtocolType::Halfblocks;
+        for fullscreen in [false,true,false,true] {
+            if state.fullscreen!=fullscreen {state.toggle_fullscreen();}
+            let area=if fullscreen {Rect::new(0,0,100,40)} else {Rect::new(0,0,100,20)};
+            state.set_desired_area(area,ImageVerticalPlacement::Center);
+            state.prepare(&mut picker,0,0,&BrowseArtworkConfig::default(),Color::Rgb(0,0,0));
+            assert_eq!(state.generation,generation);
+            assert!(Arc::ptr_eq(state.decoded.as_ref().unwrap(),&pixels));
+            assert!(state.decode_rx.is_none());
+        }
+    }
+
+    #[test]
+    fn fullscreen_native_workers_reuse_pixels_and_render_matching_geometry() {
+        use ratatui::{backend::TestBackend,Terminal};use ratatui_image::picker::ProtocolType;
+        for protocol in [ProtocolType::Sixel,ProtocolType::Kitty]{let mut state=BrowseArtworkState::default();state.open_file_popup(PathBuf::from("/image/cover.png"));state.scanned=state.context.clone();state.viewer_max_area=Rect::new(0,0,60,24);state.viewer_decode_bounds=Some((480,288));state.viewer_background=Some([0,0,0]);let pixels=Arc::new(DynamicImage::new_rgb8(480,288));state.decoded=Some(pixels.clone());let mut picker=Picker::new((8,12));picker.protocol_type=protocol;let config=BrowseArtworkConfig::default();let mut terminal=Terminal::new(TestBackend::new(60,24)).unwrap();let background=Color::Rgb(0,0,0);for fullscreen in [false,true,false,true]{if state.fullscreen!=fullscreen{state.toggle_fullscreen();}let area=if fullscreen{Rect::new(0,0,60,24)}else{Rect::new(0,0,60,12)};state.set_desired_area(area,ImageVerticalPlacement::Center);state.prepare(&mut picker,0,0,&config,background);let deadline=Instant::now()+Duration::from_secs(10);while !state.native_frame_ready()&&Instant::now()<deadline{state.prepare(&mut picker,0,0,&config,background);std::thread::sleep(Duration::from_millis(2));}assert!(state.native_frame_ready());assert!(Arc::ptr_eq(state.decoded.as_ref().unwrap(),&pixels));terminal.draw(|frame|{assert!(state.render_image(frame,area,config.allow_upscale,ImageVerticalPlacement::Center,background));}).unwrap();}}
+    }
+
+    #[test]
     fn fullscreen_uses_whole_terminal_and_never_enlarges_small_images() {
         use ratatui::{backend::TestBackend, Terminal};
         use ratatui_image::picker::ProtocolType;
@@ -3466,6 +3576,7 @@ pub fn draw_popup(f: &mut ratatui::Frame, app: &mut super::app::AppState,
     use ratatui::{layout::Alignment, style::Style};
 
     let terminal = f.size();
+    app.browse_artwork.viewer_max_area = terminal;
     let fullscreen = app.browse_artwork.fullscreen;
     if terminal.width == 0 || terminal.height == 0
         || (!fullscreen && (terminal.width < 8 || terminal.height < 5))
@@ -3506,6 +3617,10 @@ pub fn draw_popup(f: &mut ratatui::Frame, app: &mut super::app::AppState,
         // Record current dimensions even when settings hides the image. A
         // height edit or terminal resize must not leave the old viewport as
         // the next encoding request after dismissal.
+        app.browse_artwork.set_desired_area(viewport, ImageVerticalPlacement::Center);
+        return;
+    }
+    if matches!(app.active_overlay, super::app::ActiveOverlay::EditImage(_)) {
         app.browse_artwork.set_desired_area(viewport, ImageVerticalPlacement::Center);
         return;
     }

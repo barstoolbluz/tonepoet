@@ -149,6 +149,9 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
         (key.code, key.modifiers),
         (KeyCode::Char('q'), KeyModifiers::CONTROL)
     ) {
+        if let ActiveOverlay::EditImage(state) = &mut app.active_overlay {
+            if state.cancel_running() { return; }
+        }
         super::command::request_application_quit(app, tx);
         return;
     }
@@ -6219,6 +6222,12 @@ mod inline_edit_behavior_tests {
         let draw_artwork = |app: &mut AppState, terminal: &mut Terminal<TestBackend>| {
             app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
                 &app.browse.artwork_config, app.theme.bg);
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(10);
+            while !app.browse_artwork.native_frame_ready()&&std::time::Instant::now()<deadline {
+                app.browse_artwork.prepare(&mut app.image_picker,0,0,&app.browse.artwork_config,app.theme.bg);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert!(app.browse_artwork.native_frame_ready(),"native worker must complete before drawing");
             let menu_open = matches!(&app.active_overlay, ActiveOverlay::ContextMenu { .. });
             terminal.draw(|frame| {
                 assert!(app.browse_artwork.render_image(frame, viewport,
@@ -6336,6 +6345,12 @@ mod inline_edit_behavior_tests {
         let mut draw_frame = |app: &mut AppState, menu_open: bool| {
             app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
                 &app.browse.artwork_config, app.theme.bg);
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(10);
+            while !app.browse_artwork.native_frame_ready()&&std::time::Instant::now()<deadline {
+                app.browse_artwork.prepare(&mut app.image_picker,0,0,&app.browse.artwork_config,app.theme.bg);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert!(app.browse_artwork.native_frame_ready(),"native worker must complete before drawing");
             let mut repaired = false;
             let buffer = terminal.draw(|frame| {
                 let screen = frame.size();
@@ -11555,6 +11570,15 @@ fn update_scrollable_message_offset(
 }
 
 fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
+    if matches!(app.active_overlay, ActiveOverlay::EditImage(_)) {
+        let old = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+        if let ActiveOverlay::EditImage(mut state) = old {
+            if super::edit_image::handle_key(app, &mut state, key) {
+                app.active_overlay = ActiveOverlay::EditImage(state);
+            } else { app.browse_artwork.edit_image_finished(state.wrote); }
+        }
+        return;
+    }
     if matches!(app.active_overlay, ActiveOverlay::ArtworkSettings(_)) {
         let old = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
         if let ActiveOverlay::ArtworkSettings(mut state) = old {
@@ -13128,7 +13152,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
         ActiveOverlay::MetadataEditor(_) => {
             unreachable!("metadata editor is handled by the owned fast path above")
         }
-        ActiveOverlay::None | ActiveOverlay::ArtworkSettings(_) => {}
+        ActiveOverlay::None | ActiveOverlay::ArtworkSettings(_) | ActiveOverlay::EditImage(_) => {}
     }
 }
 
@@ -72793,6 +72817,15 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         // Re-uploading on mouse movement can saturate the terminal during
         // startup and delay queued Esc/click input by many seconds. Explicit
         // image, resize and artwork-menu changes still restore their graphics.
+        return;
+    }
+    if matches!(app.active_overlay, ActiveOverlay::EditImage(_)) {
+        let old = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+        if let ActiveOverlay::EditImage(mut state) = old {
+            if super::edit_image::handle_mouse(app, &mut state, mouse) {
+                app.active_overlay = ActiveOverlay::EditImage(state);
+            } else { app.browse_artwork.edit_image_finished(state.wrote); }
+        }
         return;
     }
     if matches!(app.active_overlay, ActiveOverlay::ArtworkSettings(_)) {
