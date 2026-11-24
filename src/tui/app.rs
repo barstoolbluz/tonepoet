@@ -9196,6 +9196,8 @@ pub enum WizardTarget {
 #[derive(Debug, Clone)]
 pub enum ActiveOverlay {
     None,
+    /// Artwork settings and its ordered filename editor.
+    ArtworkSettings(Box<crate::tui::artwork_settings::ArtworkSettingsState>),
     /// Read-only filesystem folder properties; metadata editor remains separate.
     FolderProperties(Box<crate::tui::directory_properties::FolderPropertiesState>),
     /// Three-view theme builder overlay.
@@ -18466,7 +18468,8 @@ impl AppState {
     pub fn prepare_image_preview_protocols(&mut self) -> bool {
         if self.browse_artwork.popup_open
             && !matches!(self.active_overlay,
-                ActiveOverlay::None | ActiveOverlay::ContextMenu { .. })
+                ActiveOverlay::None | ActiveOverlay::ContextMenu { .. }
+                | ActiveOverlay::ArtworkSettings(_))
         {
             self.browse_artwork.close_popup();
         }

@@ -11549,6 +11549,15 @@ fn update_scrollable_message_offset(
 }
 
 fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
+    if matches!(app.active_overlay, ActiveOverlay::ArtworkSettings(_)) {
+        let old = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+        if let ActiveOverlay::ArtworkSettings(mut state) = old {
+            if super::artwork_settings::handle_key(app, &mut state, key) {
+                app.active_overlay = ActiveOverlay::ArtworkSettings(state);
+            }
+        }
+        return;
+    }
     // MetadataEditor can carry per-file artwork and other large payloads. Do
     // not deep-clone it just to satisfy the generic overlay dispatcher. Move
     // ownership out, let the reducer declare whether it kept or replaced the
@@ -13113,7 +13122,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
         ActiveOverlay::MetadataEditor(_) => {
             unreachable!("metadata editor is handled by the owned fast path above")
         }
-        ActiveOverlay::None => {}
+        ActiveOverlay::None | ActiveOverlay::ArtworkSettings(_) => {}
     }
 }
 
@@ -14248,7 +14257,8 @@ fn finish_artwork_context_menu(app: &mut AppState) {
     // keyboard dispatch temporarily takes ContextMenu out of active_overlay.
     let native = app.image_picker.protocol_type != ratatui_image::picker::ProtocolType::Halfblocks;
     let visible = app.current_screen == AppScreen::Browse
-        && matches!(app.active_overlay, ActiveOverlay::None | ActiveOverlay::ContextMenu { .. })
+        && matches!(app.active_overlay, ActiveOverlay::None | ActiveOverlay::ContextMenu { .. }
+            | ActiveOverlay::ArtworkSettings(_))
         && (app.browse_artwork.popup_open
             || (app.browse.info_enabled && !app.browse.info_collapsed
                 && app.browse.artwork_config.enabled));
@@ -72779,6 +72789,15 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         // image, resize and artwork-menu changes still restore their graphics.
         return;
     }
+    if matches!(app.active_overlay, ActiveOverlay::ArtworkSettings(_)) {
+        let old = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+        if let ActiveOverlay::ArtworkSettings(mut state) = old {
+            if super::artwork_settings::handle_mouse(app, &mut state, mouse) {
+                app.active_overlay = ActiveOverlay::ArtworkSettings(state);
+            }
+        }
+        return;
+    }
     // Properties owns every pointer event ahead of any parked text editor or
     // underlying Browse widget. Hitboxes come from the current painted frame.
     if matches!(app.active_overlay, ActiveOverlay::FolderProperties(_)) {
@@ -74748,7 +74767,21 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::PropertiesEditMetadata
             | TuiButton::PropertiesRecalculate
             | TuiButton::PropertiesCancel
-            | TuiButton::PropertiesOk => {}
+            | TuiButton::PropertiesOk
+            | TuiButton::ArtworkToggle(_)
+            | TuiButton::ArtworkFilenamesEdit
+            | TuiButton::ArtworkHeightDec(_)
+            | TuiButton::ArtworkHeightField(_)
+            | TuiButton::ArtworkHeightInc(_)
+            | TuiButton::ArtworkHeightBar(_, _)
+            | TuiButton::ArtworkRevert
+            | TuiButton::ArtworkClose
+            | TuiButton::ArtworkHelp
+            | TuiButton::ArtworkNameRow(_)
+            | TuiButton::ArtworkNameAction(_)
+            | TuiButton::ArtworkNameField
+            | TuiButton::ArtworkNameDone
+            | TuiButton::ArtworkNameHelp => {}
 
             // ── Template builder: open pills ──
             TuiButton::TemplateBuildFolderButton => {

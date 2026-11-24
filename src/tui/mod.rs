@@ -12,6 +12,7 @@ pub mod bookmarks_overlay;
 pub mod bookmark_workers;
 pub mod browse;
 pub mod browse_artwork;
+pub mod artwork_settings;
 mod kitty_transport;
 mod sixel_tmux;
 mod tmux_images;

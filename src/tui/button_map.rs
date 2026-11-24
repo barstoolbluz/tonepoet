@@ -366,6 +366,20 @@ pub enum TuiButton {
     BrowseInfoMeta(crate::tui::probe::MetadataField),
     // Browse info pane: foreground recursive accounting on demand.
     BrowseInfoArtworkArea,
+    ArtworkToggle(u8),
+    ArtworkFilenamesEdit,
+    ArtworkHeightDec(u8),
+    ArtworkHeightField(u8),
+    ArtworkHeightInc(u8),
+    ArtworkHeightBar(u8, u8),
+    ArtworkRevert,
+    ArtworkClose,
+    ArtworkHelp,
+    ArtworkNameRow(usize),
+    ArtworkNameAction(u8),
+    ArtworkNameField,
+    ArtworkNameDone,
+    ArtworkNameHelp,
     BrowseInfoRefresh,
     // Browse info pane: analyze pill (click → run audio analysis).
     BrowseInfoAnalyze,
@@ -859,6 +873,20 @@ impl TuiButton {
             | Self::BrowseOptionsArchiveChoice(_)
             | Self::BrowseInfoMeta(_)
             | Self::BrowseInfoArtworkArea
+            | Self::ArtworkToggle(_)
+            | Self::ArtworkFilenamesEdit
+            | Self::ArtworkHeightDec(_)
+            | Self::ArtworkHeightField(_)
+            | Self::ArtworkHeightInc(_)
+            | Self::ArtworkHeightBar(_, _)
+            | Self::ArtworkRevert
+            | Self::ArtworkClose
+            | Self::ArtworkHelp
+            | Self::ArtworkNameRow(_)
+            | Self::ArtworkNameAction(_)
+            | Self::ArtworkNameField
+            | Self::ArtworkNameDone
+            | Self::ArtworkNameHelp
             | Self::BrowseInfoRefresh
             | Self::BrowseInfoAnalyze
             | Self::BrowseInfoEditTags
