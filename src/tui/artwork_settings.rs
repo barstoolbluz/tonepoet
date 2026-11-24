@@ -518,6 +518,10 @@ pub fn handle_key(app: &mut AppState, state: &mut ArtworkSettingsState, key: Key
         match key.code {
             KeyCode::Esc => { state.height_edit = None; return true; }
             KeyCode::Enter => { commit_height(app, state); return true; }
+            KeyCode::Char('a') if key.modifiers == KeyModifiers::NONE => {
+                commit_height(app, state);
+                return false;
+            }
             KeyCode::Tab | KeyCode::BackTab => {
                 commit_height(app, state);
                 // Both directions leave DISPLAY, as with region navigation
@@ -548,6 +552,9 @@ pub fn handle_key(app: &mut AppState, state: &mut ArtworkSettingsState, key: Key
             // focused control's row until the region itself changes.
             set_focus(state, if state.focus < 2 { 2 } else { 0 });
         }
+        // Values are already saved on change. Apply commits any pending edit
+        // (if present) and closes; Esc Close retains its prior semantics.
+        KeyCode::Char('a') if key.modifiers == KeyModifiers::NONE => return false,
         KeyCode::Char('u') if state.changed(&app.browse.artwork_config) => {
             let restored = state.original_visible_values(&app.browse.artwork_config);
             changed_config(app, restored);
@@ -719,7 +726,7 @@ pub fn handle_mouse(app: &mut AppState, state: &mut ArtworkSettingsState, mouse:
             changed_config(app, restored);
             true
         }
-        Some(TuiButton::ArtworkClose) => return false,
+        Some(TuiButton::ArtworkApply) | Some(TuiButton::ArtworkClose) => return false,
         Some(TuiButton::ArtworkHelp) => { state.help = true; true }
         _ => at(state.area, mouse.column, mouse.row),
     };
@@ -898,6 +905,9 @@ pub fn draw(f: &mut Frame, state: &mut ArtworkSettingsState,
     button(f, area, 38, 11, 11, " Esc Close ", false,
         false, theme.chip_dismiss, theme);
     record(map, TuiButton::ArtworkClose, area, 38, 11, 11);
+    button(f, area, 50, 11, 11, " a Apply ", false,
+        state.hovered == Some(TuiButton::ArtworkApply), theme.chip_go, theme);
+    record(map, TuiButton::ArtworkApply, area, 50, 11, 11);
     paint(f, area, 63, 11, "?", theme.info, theme.panel_bg);
     paint(f, area, 65, 11, "all keys", theme.label, theme.panel_bg);
     record(map, TuiButton::ArtworkHelp, area, 63, 11, 10);
@@ -1016,6 +1026,7 @@ fn draw_help(f: &mut Frame, state: &ArtworkSettingsState, theme: Theme) {
         "Digits / Enter    Edit height; Enter commits",
         "Esc    Cancel edit or close window",
         "u    Revert changed settings",
+        "a    Apply and close (changes save immediately)",
         "?    Close all keys",
     ] };
     let screen = f.size();
@@ -1068,10 +1079,19 @@ mod tests {
             }
             assert_eq!(buffer.get(area.x + 49, area.y + 11).bg,
                        theme.panel_bg, "{slug} close chip ends at its fixed width");
+            for x in 50..61 {
+                assert_eq!(buffer.get(area.x + x, area.y + 11).bg,
+                           theme.chip_go, "{slug} Apply chip cell {x}");
+            }
+            assert_eq!(buffer.get(area.x + 61, area.y + 11).bg,
+                       theme.panel_bg, "{slug} Apply chip ends at its fixed width");
+            assert_eq!(map.button_rect(TuiButton::ArtworkApply),
+                       Some(Rect::new(area.x + 50, area.y + 11, 11, 1)),
+                       "{slug} Apply mouse target");
 
             state.help = true;
             terminal.draw(|frame| draw(frame, &mut state, &config, &mut map, theme)).unwrap();
-            let window_help = Rect::new(12, 6, 56, 12);
+            let window_help = Rect::new(12, 5, 56, 13);
             let buffer = terminal.backend().buffer();
             for y in 1..window_help.height - 1 {
                 let cell = buffer.get(window_help.right() - 1, window_help.y + y);
@@ -1108,6 +1128,50 @@ mod tests {
                 assert_eq!(cell.fg, readable(theme.title, theme.panel_bg), "{slug} all-keys border color at row {y}");
             }
         }
+    }
+
+    #[test]
+    fn apply_commits_pending_heights_and_closes_by_key_and_mouse() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use crate::tui::test_support::XdgConfigHomeGuard;
+
+        // Use the suite-wide config guard: persistence assertions must never
+        // touch the user's configuration or race other XDG-path tests.
+        let _home = XdgConfigHomeGuard::new("tonepoet-artwork-apply");
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.browse_artwork.open_file_popup(std::path::PathBuf::from("cover.png"));
+        let mut state = ArtworkSettingsState::new(&app.browse.artwork_config, Rect::default());
+        edit_height(&mut state, &app.browse.artwork_config, 0, None);
+        state.height_edit.as_mut().unwrap().text = "65".into();
+        assert!(!handle_key(&mut app, &mut state,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)));
+        assert!(state.height_edit.is_none());
+        assert_eq!(app.browse.artwork_config.pane_height_percent, 65);
+        assert!(app.browse_artwork.popup_open, "Apply must not close the viewer");
+        let saved = crate::config::TonepoetConfig::load().expect("saved Info height");
+        assert_eq!(saved.browsing.artwork.pane_height_percent, 65);
+
+        let mut state = ArtworkSettingsState::new(&app.browse.artwork_config, Rect::default());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state, &app.browse.artwork_config,
+            &mut app.button_map, app.theme)).unwrap();
+        let rect = app.button_map.button_rect(TuiButton::ArtworkApply).unwrap();
+        edit_height(&mut state, &app.browse.artwork_config, 1, None);
+        state.height_edit.as_mut().unwrap().text = "82".into();
+        let down = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + rect.width / 2, row: rect.y,
+            modifiers: KeyModifiers::NONE };
+        assert!(!handle_mouse(&mut app, &mut state, down),
+            "Clicking Apply must commit the pending value and close settings");
+        assert!(state.height_edit.is_none());
+        assert_eq!(app.browse.artwork_config.popup_height_percent, 82);
+        assert!(app.browse_artwork.popup_open, "mouse Apply must preserve the viewer");
+        let saved = crate::config::TonepoetConfig::load().expect("saved View height");
+        assert_eq!(saved.browsing.artwork.pane_height_percent, 65);
+        assert_eq!(saved.browsing.artwork.popup_height_percent, 82);
+        assert!(!handle_key(&mut app, &mut state,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            "Esc Close must continue to dismiss immediately");
     }
 
     #[test]

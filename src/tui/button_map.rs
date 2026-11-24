@@ -373,6 +373,7 @@ pub enum TuiButton {
     ArtworkHeightInc(u8),
     ArtworkHeightBar(u8, u8),
     ArtworkRevert,
+    ArtworkApply,
     ArtworkClose,
     ArtworkHelp,
     ArtworkNameRow(usize),
@@ -880,6 +881,7 @@ impl TuiButton {
             | Self::ArtworkHeightInc(_)
             | Self::ArtworkHeightBar(_, _)
             | Self::ArtworkRevert
+            | Self::ArtworkApply
             | Self::ArtworkClose
             | Self::ArtworkHelp
             | Self::ArtworkNameRow(_)

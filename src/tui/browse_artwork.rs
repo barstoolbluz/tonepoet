@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use image::{DynamicImage, ImageReader, Limits};
 use lofty::picture::PictureType;
-use ratatui::{buffer::Buffer, layout::Rect, style::Color};
+use ratatui::{buffer::Buffer, layout::Rect, style::Color, widgets::StatefulWidget};
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 
 use crate::config::BrowseArtworkConfig;
@@ -113,6 +113,28 @@ struct DecodeResult {
     cache_epoch: Option<u64>,
 }
 
+// Sixel/iTerm/Kitty resize+encode can take seconds for large artwork. A
+// settings interaction must never do that work inside the terminal draw.
+// The worker owns its protocol; only pre-rendered terminal cells cross back
+// to the UI thread. Revision + geometry reject superseded encodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EncodedFrameKey {
+    revision: u64,
+    area: Rect,
+    protocol_generation: usize,
+    retransmit_generation: usize,
+}
+
+struct EncodedFrame {
+    key: EncodedFrameKey,
+    cells: Buffer,
+    // Kitty uploads image bytes once. Render this second buffer from the SAME
+    // protocol after its first upload, so later frames contain only placement
+    // placeholders. Sixel/iTerm2 continue to reuse the initial payload.
+    placement_cells: Option<Buffer>,
+    upload_drawn: bool,
+}
+
 /// Non-clonable, session-only graphics state. This cache is deliberately not
 /// stored with a Browse tab or in persistent configuration.
 pub struct BrowseArtworkState {
@@ -151,6 +173,7 @@ pub struct BrowseArtworkState {
     retransmit_generation: usize,
     font_size: (u16, u16),
     prepared_protocol_has_fixed_origin: bool,
+    prepared_protocol_type: ratatui_image::picker::ProtocolType,
     kitty_upload_transport: bool,
     // An inline single-click cycles; a subsequent double-click must open the
     // image that was under the first click, not the next image.
@@ -180,6 +203,18 @@ pub struct BrowseArtworkState {
     artwork_menu_occludes_image: bool,
     repaint_image_after_menu: bool,
     native_image_restore_count: usize,
+    // Enable asynchronous native encoding after artwork settings is opened.
+    // The ordinary viewer follows its existing render path until then.
+    asynchronous_after_settings: bool,
+    settings_visible: bool,
+    // The first draw after settings closes owns the authoritative viewport.
+    // Do not schedule a native encode using the previous draw's dimensions.
+    awaiting_viewport_after_settings: bool,
+    encoding_revision: u64,
+    encode_rx: Option<Receiver<EncodedFrame>>,
+    encode_request: Option<EncodedFrameKey>,
+    encode_failed: Option<EncodedFrameKey>,
+    encoded_frame: Option<EncodedFrame>,
 }
 
 impl Default for BrowseArtworkState {
@@ -193,13 +228,19 @@ impl Default for BrowseArtworkState {
             protocol: None, desired_area: Rect::default(),
             vertical_placement: ImageVerticalPlacement::Center, protocol_area: Rect::default(),
             protocol_generation: 0, retransmit_generation: 0, font_size: (8, 12),
-            prepared_protocol_has_fixed_origin: false, kitty_upload_transport: false,
+            prepared_protocol_has_fixed_origin: false,
+            prepared_protocol_type: ratatui_image::picker::ProtocolType::Halfblocks,
+            kitty_upload_transport: false,
             inline_click_source: None, warning: None, popup_open: false,
             fullscreen: false, popup_rect: Rect::default(),
             needs_background_restore: false, background_restore_count: 0,
             native_placement_awaiting_render: false, post_native_repaint_redraw: false,
             artwork_menu_occludes_image: false, repaint_image_after_menu: false,
             native_image_restore_count: 0,
+            asynchronous_after_settings: false, settings_visible: false,
+            awaiting_viewport_after_settings: false,
+            encoding_revision: 0, encode_rx: None,
+            encode_request: None, encode_failed: None, encoded_frame: None,
         }
     }
 }
@@ -313,6 +354,8 @@ impl BrowseArtworkState {
     }
 
     pub fn invalidate_protocol(&mut self) {
+        self.encoding_revision = self.encoding_revision.wrapping_add(1);
+        self.encoded_frame = None;
         self.protocol = None;
         self.protocol_area = Rect::default();
         self.native_placement_awaiting_render = false;
@@ -348,6 +391,11 @@ impl BrowseArtworkState {
     pub fn set_desired_area(&mut self, area: Rect, placement: ImageVerticalPlacement) {
         self.desired_area = area;
         self.vertical_placement = placement;
+        // A draw with valid geometry releases the post-settings scheduling
+        // hold. A zero-sized viewport cannot authorize encoding old pixels.
+        if area.width > 0 && area.height > 0 {
+            self.awaiting_viewport_after_settings = false;
+        }
     }
 
     /// A normal click retains Browse Info's existing cycle behavior. Remember
@@ -426,6 +474,50 @@ impl BrowseArtworkState {
             self.desired_area = Rect::default();
             self.needs_background_restore = true;
             self.invalidate_protocol();
+        }
+    }
+
+    /// F toggles the already-open viewer between its ordinary and full-terminal
+    /// viewport. Leave the viewer open and let the established bounds-aware
+    /// decode worker prepare pixels for the new size.
+    pub fn toggle_fullscreen(&mut self) {
+        if !self.popup_open { return; }
+        if !self.fullscreen {
+            self.enter_fullscreen();
+        } else {
+            self.fullscreen = false;
+            self.popup_rect = Rect::default();
+            self.desired_area = Rect::default();
+            self.needs_background_restore = true;
+            self.invalidate_protocol();
+        }
+    }
+
+    /// Defer expensive native image encoding after the settings window opens.
+    /// Keep the previous encoded frame only while its revision remains valid.
+    pub fn artwork_settings_opened(&mut self) {
+        self.asynchronous_after_settings = true;
+        self.settings_visible = true;
+    }
+
+    pub fn set_artwork_settings_visible(&mut self, visible: bool) {
+        if self.settings_visible && !visible {
+            // Info and View both recalculate their artwork area during draw.
+            self.awaiting_viewport_after_settings = true;
+        }
+        self.settings_visible = visible;
+    }
+
+    /// The first Kitty upload may be withheld by tmux preflight. It has not
+    /// reached the terminal, so a subsequent draw must still offer that upload.
+    pub(super) fn kitty_upload_withheld(&mut self) {
+        let key = self.encoded_frame_key();
+        if let Some(frame) = self.encoded_frame.as_mut()
+            .filter(|frame| frame.key == key && frame.upload_drawn)
+        {
+            frame.upload_drawn = false;
+            self.native_placement_awaiting_render = true;
+            self.post_native_repaint_redraw = false;
         }
     }
 
@@ -516,6 +608,10 @@ impl BrowseArtworkState {
         self.popup_open = false;
         self.fullscreen = false;
         self.popup_rect = Rect::default();
+        self.asynchronous_after_settings = false;
+        self.settings_visible = false;
+        self.awaiting_viewport_after_settings = false;
+        self.encoded_frame = None;
         self.inline_click_source = None;
         self.artwork_menu_occludes_image = false;
         self.repaint_image_after_menu = false;
@@ -559,6 +655,11 @@ impl BrowseArtworkState {
         }
         let mut changed = post_render_repair;
         changed |= self.poll_workers();
+        changed |= self.poll_encoded_frame();
+        // Close / Apply can change a viewer height on the same input turn.
+        // The event loop prepares before drawing, so its previous desired_area
+        // must not spawn an expensive, immediately obsolete encoding job.
+        if self.awaiting_viewport_after_settings { return changed; }
         let viewer_background = self.popup_open.then(|| {
             let (r, g, b) = super::theme::rgb_tuple(background);
             [r, g, b]
@@ -603,8 +704,8 @@ impl BrowseArtworkState {
         // The popup is measured on its first draw. Do not decode at an
         // arbitrary 1600-pixel fallback then immediately decode again.
         if self.popup_open && self.decoded.is_some()
-            && self.viewer_decode_bounds.is_some()
-            && self.viewer_decode_bounds != Some(bounds)
+            && self.viewer_decode_bounds.is_some_and(|old|
+                bounds.0 > old.0 || bounds.1 > old.1)
         {
             self.needs_background_restore = true;
             self.generation = self.generation.wrapping_add(1);
@@ -662,6 +763,7 @@ impl BrowseArtworkState {
         self.kitty_upload_transport =
             picker.protocol_type == ratatui_image::picker::ProtocolType::Kitty
             && !matches!(std::env::var("TONEPOET_KITTY_ZLIB").as_deref(), Ok("0"));
+        self.prepared_protocol_type = picker.protocol_type;
         self.prepared_protocol_has_fixed_origin =
             picker.protocol_type != ratatui_image::picker::ProtocolType::Halfblocks
             && picker.protocol_type != ratatui_image::picker::ProtocolType::Kitty;
@@ -688,6 +790,8 @@ impl BrowseArtworkState {
             && (self.protocol.is_none() || self.protocol_area != desired
                 || self.protocol_generation != picker_generation || self.retransmit_generation != kitty)
         {
+            self.encoding_revision = self.encoding_revision.wrapping_add(1);
+            self.encoded_frame = None;
             self.protocol = self.decoded.as_ref().map(|image| picker.new_resize_protocol(image.as_ref().clone()));
             self.native_placement_awaiting_render =
                 picker.protocol_type != ratatui_image::picker::ProtocolType::Halfblocks;
@@ -701,7 +805,99 @@ impl BrowseArtworkState {
             self.retransmit_generation = kitty;
             changed = true;
         }
+        // Never use terminal draw to resize/encode after an artwork-settings
+        // interaction. One in-flight worker is allowed; stale results are
+        // dropped and the latest dimensions are encoded once it finishes.
+        if self.asynchronous_after_settings && !self.settings_visible
+            && picker.protocol_type != ratatui_image::picker::ProtocolType::Halfblocks
+            && self.protocol.is_some() && self.decoded.is_some()
+            && desired.width > 0 && desired.height > 0
+        {
+            let key = self.encoded_frame_key();
+            if self.encoded_frame.as_ref().is_some_and(|frame| frame.key != key) {
+                self.encoded_frame = None;
+            }
+            if self.encoded_frame.is_none() && self.encode_rx.is_none()
+                && self.encode_failed != Some(key)
+            {
+                let pixels = Arc::clone(self.decoded.as_ref().expect("checked"));
+                let mut picker = picker.clone();
+                let (r, g, b) = super::theme::rgb_tuple(background);
+                let compress_kitty = self.kitty_upload_transport;
+                let (tx, rx) = mpsc::channel();
+                self.encode_rx = Some(rx);
+                self.encode_request = Some(key);
+                thread::spawn(move || {
+                    let kitty = picker.protocol_type ==
+                        ratatui_image::picker::ProtocolType::Kitty;
+                    let mut protocol = picker.new_resize_protocol(pixels.as_ref().clone());
+                    let area = Rect::new(0, 0, key.area.width, key.area.height);
+                    // The image paints over a theme-colored panel. Both
+                    // transmission and placement-only frames need that ground.
+                    let blank = || {
+                        let mut cells = Buffer::empty(area);
+                        for y in 0..area.height {
+                            for x in 0..area.width {
+                                cells.get_mut(x, y).set_bg(Color::Rgb(r, g, b));
+                            }
+                        }
+                        cells
+                    };
+                    let mut cells = blank();
+                    ratatui_image::StatefulImage::new(Some(image::Rgb([r, g, b])))
+                        .render(area, &mut cells, &mut protocol);
+                    // StatefulProtocol sends Kitty's bytes on its first render
+                    // and only placeholders thereafter. Keep both renderings
+                    // rather than replaying the upload on every UI redraw.
+                    let placement_cells = if kitty {
+                        let mut placement = blank();
+                        ratatui_image::StatefulImage::new(Some(image::Rgb([r, g, b])))
+                            .render(area, &mut placement, &mut protocol);
+                        Some(placement)
+                    } else { None };
+                    if compress_kitty {
+                        let origin = cells.get_mut(0, 0);
+                        if let Some(compressed) =
+                            super::kitty_transport::compress_kitty_upload(origin.symbol()) {
+                            origin.set_symbol(&compressed);
+                        }
+                    }
+                    let _ = tx.send(EncodedFrame {
+                        key, cells, placement_cells, upload_drawn: false,
+                    });
+                });
+            }
+        }
         changed
+    }
+
+    fn encoded_frame_key(&self) -> EncodedFrameKey {
+        EncodedFrameKey {
+            revision: self.encoding_revision,
+            area: self.protocol_area,
+            protocol_generation: self.protocol_generation,
+            retransmit_generation: self.retransmit_generation,
+        }
+    }
+
+    fn poll_encoded_frame(&mut self) -> bool {
+        let Some(rx) = self.encode_rx.take() else { return false; };
+        match rx.try_recv() {
+            Ok(frame) => {
+                self.encode_request = None;
+                if self.asynchronous_after_settings && frame.key == self.encoded_frame_key() {
+                    self.encoded_frame = Some(frame);
+                    return true;
+                }
+            }
+            Err(TryRecvError::Empty) => { self.encode_rx = Some(rx); }
+            Err(TryRecvError::Disconnected) => {
+                // A failed worker leaves the image hidden. Do not immediately
+                // respawn for the same artwork/geometry on every UI tick.
+                self.encode_failed = self.encode_request.take();
+            }
+        }
+        false
     }
 
     fn poll_workers(&mut self) -> bool {
@@ -727,7 +923,7 @@ impl BrowseArtworkState {
                             self.decoded = None;
                             self.decoded_source = None;
                             self.decoded_embedded_path = None;
-                            self.protocol = None;
+                            self.invalidate_protocol();
                         }
                         self.warning = result.warning;
                         if direct_file {
@@ -782,7 +978,7 @@ impl BrowseArtworkState {
                                 self.decoded_source = Some(result.source);
                                 self.decoded_embedded_path = decoded.embedded_path;
                                 self.decoded = Some(decoded.image);
-                                self.protocol = None;
+                                self.invalidate_protocol();
                             }
                             Err(error) => {
                                 self.record_decode_failure(&result.source, error);
@@ -820,12 +1016,14 @@ impl BrowseArtworkState {
         }
     }
 
-    /// The renderer merely records the geometry and paints prepared protocol
-    /// state; no image file I/O, decode, or protocol construction occurs here.
+    /// The renderer records geometry and paints prepared protocol state.
+    /// After settings opens, native resize/encode is worker-owned; a pending
+    /// worker must never fall back to a blocking image encode here.
     pub fn render_image(&mut self, f: &mut ratatui::Frame, area: Rect,
                         allow_upscale: bool, placement: ImageVerticalPlacement,
                         background: Color) -> bool {
         self.set_desired_area(area, placement);
+        if self.settings_visible { return false; }
         if self.decoded.is_none() || self.protocol.is_none() { return false; }
         let image = self.decoded.as_ref().expect("checked");
         let target = fitted_image_area(area, image.width(), image.height(), self.font_size,
@@ -834,14 +1032,35 @@ impl BrowseArtworkState {
         // The image protocol needs the actual UI background when padding or
         // compositing source pixels, not the terminal's default background.
         let (r, g, b) = super::theme::rgb_tuple(background);
-        let widget = ratatui_image::StatefulImage::new(Some(image::Rgb([r, g, b])));
-        f.render_stateful_widget(widget, target,
-            self.protocol.as_mut().expect("checked"));
+        let async_native = self.asynchronous_after_settings
+            && self.prepared_protocol_type != ratatui_image::picker::ProtocolType::Halfblocks
+            && !self.settings_visible;
+        // When the async path is enabled, never fall back to synchronous
+        // native encoding on a cache miss. That would stall Esc or Apply.
+        if async_native {
+            let key = self.encoded_frame_key();
+            let Some(frame) = self.encoded_frame.as_mut()
+                .filter(|frame| frame.key == key) else { return false; };
+            let cells = if frame.upload_drawn {
+                frame.placement_cells.as_ref().unwrap_or(&frame.cells)
+            } else { &frame.cells };
+            for y in 0..target.height {
+                for x in 0..target.width {
+                    f.buffer_mut().get_mut(target.x + x, target.y + y)
+                        .clone_from(cells.get(x, y));
+                }
+            }
+            frame.upload_drawn = true;
+        } else {
+            let widget = ratatui_image::StatefulImage::new(Some(image::Rgb([r, g, b])));
+            f.render_stateful_widget(widget, target,
+                self.protocol.as_mut().expect("checked"));
+        }
         // ratatui-image 1.0.5 places its first Kitty upload and Unicode
         // placeholders in the image-origin cell. Transform that one-shot APC
         // without changing its ID, placement, cache, or subsequent redraws.
         // Failed/non-beneficial compression leaves the original bytes intact.
-        if self.kitty_upload_transport {
+        if self.kitty_upload_transport && !async_native {
             let cell = f.buffer_mut().get_mut(target.x, target.y);
             if let Some(compressed) = super::kitty_transport::compress_kitty_upload(cell.symbol()) {
                 cell.set_symbol(&compressed);
@@ -1265,6 +1484,477 @@ mod tests {
             .expect("downsample pre-composited artwork");
         assert_eq!((smaller.image.width(), smaller.image.height()), (2, 2));
         assert!(matches!(smaller.image.as_ref(), DynamicImage::ImageRgb8(_)));
+    }
+
+    #[test]
+    fn artwork_settings_escape_close_and_apply_preserve_the_viewer() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{backend::TestBackend, Terminal};
+        use crate::tui::{
+            app::{ActiveOverlay, AppScreen, AppState},
+            artwork_settings,
+            button_map::TuiButton,
+            context_menu::{execute_context_action, ContextAction},
+            keybindings,
+        };
+
+        for fullscreen in [false, true] {
+            // Esc key, Esc Close click, Apply click, Apply shortcut.
+            for dismiss in 0..4 {
+                let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+                app.current_screen = AppScreen::Browse;
+                app.browse_artwork.open_file_popup(PathBuf::from("front.png"));
+                if fullscreen { app.browse_artwork.enter_fullscreen(); }
+                let (tx, _rx) = tokio::sync::mpsc::channel(1);
+                execute_context_action(&mut app,
+                    ContextAction::BrowseArtworkOpenSettings, &tx, false);
+                assert!(matches!(app.active_overlay, ActiveOverlay::ArtworkSettings(_)));
+                assert!(app.browse_artwork.asynchronous_after_settings,
+                    "the production context action must enable non-blocking redraws");
+                if dismiss == 1 || dismiss == 2 {
+                    let config = app.browse.artwork_config.clone();
+                    let theme = app.theme;
+                    let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+                    terminal.draw(|frame| {
+                        if let ActiveOverlay::ArtworkSettings(settings) = &mut app.active_overlay {
+                            artwork_settings::draw(frame, settings, &config,
+                                &mut app.button_map, theme);
+                        }
+                    }).unwrap();
+                    let target = if dismiss == 1 {
+                        TuiButton::ArtworkClose
+                    } else { TuiButton::ArtworkApply };
+                    let hit = app.button_map.button_rect(target)
+                        .expect("The dismissal control must have a mouse target");
+                    keybindings::handle_mouse(&mut app, MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: hit.x + hit.width / 2, row: hit.y,
+                        modifiers: KeyModifiers::NONE,
+                    }, &tx);
+                } else {
+                    let key = if dismiss == 3 { KeyCode::Char('a') } else { KeyCode::Esc };
+                    keybindings::handle_key(&mut app,
+                        KeyEvent::new(key, KeyModifiers::NONE), &tx);
+                }
+                assert!(matches!(app.active_overlay, ActiveOverlay::None));
+                assert!(app.browse_artwork.popup_open,
+                    "dismissing settings must retain the viewer");
+                assert_eq!(app.browse_artwork.fullscreen, fullscreen);
+                assert!(app.browse_artwork.asynchronous_after_settings,
+                    "the first viewer repaint must not block input on an encode");
+            }
+        }
+    }
+
+    #[test]
+    fn settings_close_never_reenters_native_encode_during_draw() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use ratatui_image::picker::ProtocolType;
+
+        let area = Rect::new(2, 2, 40, 24);
+        let ground = Color::Rgb(26, 27, 38);
+        let config = BrowseArtworkConfig::default();
+        let mut state = BrowseArtworkState::default();
+        state.popup_open = true;
+        state.viewer_background = Some([26, 27, 38]);
+        state.decoded = Some(Arc::new(DynamicImage::new_rgb8(160, 160)));
+        state.set_desired_area(area, ImageVerticalPlacement::Center);
+        let mut picker = Picker::new((8, 12));
+        picker.protocol_type = ProtocolType::Sixel;
+        state.artwork_settings_opened();
+        assert!(state.prepare(&mut picker, 0, 0, &config, ground));
+        assert!(state.protocol.is_some());
+        let viewport = state.protocol_area;
+        let mut terminal = Terminal::new(TestBackend::new(60, 32)).unwrap();
+        terminal.draw(|frame| {
+            assert!(!state.render_image(frame, area, config.allow_upscale,
+                ImageVerticalPlacement::Center, ground));
+        }).unwrap();
+        assert!(state.native_placement_awaiting_render,
+            "the hidden image must not consume its native upload");
+
+        state.set_artwork_settings_visible(false);
+        // An encode cache miss must NOT run StatefulImage::render in UI draw.
+        // The slow native Sixel renderer would consume the placement flag.
+        terminal.draw(|frame| {
+            assert!(!state.render_image(frame, area, config.allow_upscale,
+                ImageVerticalPlacement::Center, ground));
+        }).unwrap();
+        assert!(state.native_placement_awaiting_render,
+            "closing the window must defer native rendering to its worker");
+
+        // Simulate the completed worker. The UI copies its already-encoded
+        // cells without invoking the native resize/encode path.
+        let mut cells = Buffer::empty(Rect::new(0, 0, viewport.width, viewport.height));
+        cells.get_mut(0, 0).set_symbol("native-test");
+        let key = state.encoded_frame_key();
+        state.encoded_frame = Some(EncodedFrame {
+            key, cells, placement_cells: None, upload_drawn: false,
+        });
+        terminal.draw(|frame| {
+            assert!(state.render_image(frame, area, config.allow_upscale,
+                ImageVerticalPlacement::Center, ground));
+        }).unwrap();
+        assert_eq!(terminal.backend().buffer().get(viewport.x, viewport.y).symbol(),
+                   "native-test");
+        assert!(!state.native_placement_awaiting_render);
+        state.invalidate_protocol();
+        assert!(state.encoded_frame.is_none(),
+            "resize/source invalidation must reject the old native command");
+    }
+
+    // A long native image encode must not own the application's input loop.
+    // Keep its sending end alive while driving the normal prepare/input/draw
+    // sequence. A blocking receive would hang this test instead of drawing.
+    #[test]
+    fn pending_native_encode_does_not_block_settings_input_or_dismissal() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{backend::TestBackend, Terminal};
+        use crate::tui::{
+            app::{ActiveOverlay, AppScreen, AppState},
+            button_map::TuiButton,
+            context_menu::{execute_context_action, ContextAction},
+            draw::draw_ui,
+            keybindings,
+        };
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        for fullscreen in [false, true] {
+            // Esc, Close click, Apply click, Apply key, and nondismissal Tab.
+            for action in 0..5 {
+                let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+                app.current_screen = AppScreen::Browse;
+                app.browse_artwork.popup_open = true;
+                app.browse_artwork.fullscreen = fullscreen;
+                app.browse_artwork.decoded = Some(Arc::new(DynamicImage::new_rgb8(240, 240)));
+                let (r, g, b) = super::super::theme::rgb_tuple(app.theme.bg);
+                app.browse_artwork.viewer_background = Some([r, g, b]);
+                let screen = Rect::new(0, 0, 100, 40);
+                let viewport = if fullscreen { screen } else {
+                    popup_rect(screen, app.browse.artwork_config.popup_height_percent)
+                };
+                app.browse_artwork.set_desired_area(viewport, ImageVerticalPlacement::Center);
+                app.prepare_image_preview_protocols();
+                execute_context_action(&mut app, ContextAction::BrowseArtworkOpenSettings,
+                    &tx, false);
+                let mut terminal = Terminal::new(TestBackend::new(screen.width, screen.height)).unwrap();
+                app.prepare_image_preview_protocols();
+                terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+                assert!(matches!(app.active_overlay, ActiveOverlay::ArtworkSettings(_)));
+
+                // Simulate a worker still encoding. Do not release its result
+                // during any of the following production update/draw passes.
+                let (send_later, pending) = mpsc::channel::<EncodedFrame>();
+                // The producer deliberately cannot reply during the draw.
+                // A generous deadlock watchdog only releases it if a future
+                // blocking receive regresses into the input path.
+                let (finished_tx, finished_rx) = mpsc::channel::<()>();
+                let watchdog = std::thread::spawn(move || {
+                    let blocked = finished_rx.recv_timeout(Duration::from_secs(10)).is_err();
+                    drop(send_later);
+                    blocked
+                });
+                let key = app.browse_artwork.encoded_frame_key();
+                app.browse_artwork.encode_rx = Some(pending);
+                app.browse_artwork.encode_request = Some(key);
+                app.browse_artwork.encoded_frame = None;
+                if action == 1 || action == 2 {
+                    let button = if action == 1 { TuiButton::ArtworkClose }
+                        else { TuiButton::ArtworkApply };
+                    let hit = app.button_map.button_rect(button).unwrap();
+                    keybindings::handle_mouse(&mut app, MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: hit.x + hit.width / 2, row: hit.y,
+                        modifiers: KeyModifiers::NONE,
+                    }, &tx);
+                } else {
+                    let key = match action {
+                        0 => KeyCode::Esc,
+                        3 => KeyCode::Char('a'),
+                        _ => KeyCode::Tab,
+                    };
+                    keybindings::handle_key(&mut app,
+                        KeyEvent::new(key, KeyModifiers::NONE), &tx);
+                }
+                let still_open = action == 4;
+                assert_eq!(matches!(app.active_overlay, ActiveOverlay::ArtworkSettings(_)), still_open);
+                // These are the same pre-draw / draw / post-draw steps as the
+                // event loop; they must finish before the encoder replies.
+                app.prepare_image_preview_protocols();
+                terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+                app.prepare_image_preview_protocols();
+                let visible = terminal.backend().buffer().content.iter()
+                    .map(|cell| cell.symbol()).collect::<Vec<_>>().join("");
+                assert_eq!(visible.contains("artwork settings"), still_open,
+                    "settings visibility must reflect the input before the encode finishes");
+                assert!(app.browse_artwork.popup_open);
+                assert!(app.browse_artwork.encode_rx.is_some(),
+                    "the result has intentionally not been delivered");
+                let _ = finished_tx.send(());
+                assert!(!watchdog.join().unwrap(),
+                    "input/draw waited for an unfinished native encoder");
+            }
+        }
+    }
+
+    #[test]
+    fn settings_close_defers_encoding_until_measured_viewport() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use ratatui_image::picker::ProtocolType;
+        use crate::tui::{app::{ActiveOverlay, AppScreen, AppState}, draw::draw_ui};
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let ground = app.theme.bg;
+        app.current_screen = AppScreen::Browse;
+        app.browse_artwork.popup_open = true;
+        let (r, g, b) = super::super::theme::rgb_tuple(app.theme.bg);
+        app.browse_artwork.viewer_background = Some([r, g, b]);
+        app.browse_artwork.decoded = Some(Arc::new(DynamicImage::new_rgb8(400, 400)));
+        let screen = Rect::new(0, 0, 100, 40);
+        let old_viewport = popup_rect(screen, 60);
+        app.browse_artwork.set_desired_area(old_viewport, ImageVerticalPlacement::Center);
+        let mut picker = Picker::new((8, 12));
+        picker.protocol_type = ProtocolType::Sixel;
+        app.browse_artwork.prepare(&mut picker, 0, 0,
+            &app.browse.artwork_config, ground);
+        let old_target = app.browse_artwork.protocol_area;
+        app.browse_artwork.artwork_settings_opened();
+        app.active_overlay = ActiveOverlay::ArtworkSettings(Box::new(
+            super::super::artwork_settings::ArtworkSettingsState::new(
+                &app.browse.artwork_config, Rect::default())));
+        let mut terminal = Terminal::new(TestBackend::new(screen.width, screen.height)).unwrap();
+        // Height increases while artwork is hidden. The actual popup draw
+        // records the new viewport, rather than the old view's coordinates.
+        app.browse.artwork_config.popup_height_percent = 80;
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+        let new_viewport = popup_rect(screen, 80);
+        let expected_target = fitted_image_area(new_viewport, 400, 400, picker.font_size,
+            app.browse.artwork_config.allow_upscale, ImageVerticalPlacement::Center);
+        assert_ne!(old_target, expected_target, "the fixture must distinguish old and new encodes");
+        assert_eq!(app.browse_artwork.desired_area, new_viewport);
+        app.active_overlay = ActiveOverlay::None;
+        app.browse_artwork.set_artwork_settings_visible(false);
+        assert!(app.browse_artwork.awaiting_viewport_after_settings);
+        app.browse_artwork.prepare(&mut picker, 0, 0,
+            &app.browse.artwork_config, ground);
+        assert!(app.browse_artwork.encode_request.is_none(),
+            "pre-draw preparation must never enqueue an old viewport");
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+        assert!(!app.browse_artwork.awaiting_viewport_after_settings);
+        app.browse_artwork.prepare(&mut picker, 0, 0,
+            &app.browse.artwork_config, ground);
+        assert!(app.browse_artwork.encode_request.is_some(),
+            "post-draw preparation must enqueue the measured viewport");
+        assert_eq!(app.browse_artwork.encode_request.unwrap().area, expected_target);
+        assert_eq!(app.browse_artwork.protocol_area, expected_target);
+        assert_eq!(app.browse_artwork.desired_area, new_viewport);
+
+        // A smaller terminal while settings is open is measured the same way.
+        app.active_overlay = ActiveOverlay::ArtworkSettings(Box::new(
+            super::super::artwork_settings::ArtworkSettingsState::new(
+                &app.browse.artwork_config, Rect::default())));
+        app.browse_artwork.set_artwork_settings_visible(true);
+        let mut narrower = Terminal::new(TestBackend::new(90, 34)).unwrap();
+        narrower.draw(|f| draw_ui(f, &mut app)).unwrap();
+        assert_eq!(app.browse_artwork.desired_area, popup_rect(Rect::new(0, 0, 90, 34), 80));
+    }
+
+    #[test]
+    fn smaller_viewport_keeps_a_suitable_decoded_image() {
+        let mut state = BrowseArtworkState::default();
+        state.popup_open = true;
+        state.viewer_background = Some([26, 27, 38]);
+        let pixels = Arc::new(DynamicImage::new_rgb8(400, 400));
+        state.decoded = Some(Arc::clone(&pixels));
+        state.viewer_decode_bounds = Some((800, 600));
+        state.set_desired_area(Rect::new(4, 4, 50, 24), ImageVerticalPlacement::Center);
+        let mut picker = Picker::new((8, 12));
+        state.prepare(&mut picker, 0, 0, &BrowseArtworkConfig::default(),
+            Color::Rgb(26, 27, 38));
+        assert!(Arc::ptr_eq(state.decoded.as_ref().expect("reused pixels"), &pixels));
+        assert!(state.decode_rx.is_none(), "shrink must not restart the decoder");
+    }
+
+    #[test]
+    fn pending_view_height_apply_skips_old_viewport_encode() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::{backend::TestBackend, Terminal};
+        use ratatui_image::picker::ProtocolType;
+        use crate::tui::{
+            app::{ActiveOverlay, AppScreen, AppState},
+            context_menu::{execute_context_action, ContextAction},
+            draw::draw_ui,
+            keybindings,
+            test_support::XdgConfigHomeGuard,
+        };
+        let _home = XdgConfigHomeGuard::new("tonepoet-artwork-apply-geometry");
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse_artwork.popup_open = true;
+        app.browse_artwork.decoded = Some(Arc::new(DynamicImage::new_rgb8(400, 400)));
+        let (r, g, b) = super::super::theme::rgb_tuple(app.theme.bg);
+        app.browse_artwork.viewer_background = Some([r, g, b]);
+        let screen = Rect::new(0, 0, 100, 40);
+        let old_viewport = popup_rect(screen, 60);
+        app.browse_artwork.set_desired_area(old_viewport, ImageVerticalPlacement::Center);
+        let mut picker = Picker::new((8, 12));
+        picker.protocol_type = ProtocolType::Sixel;
+        app.browse_artwork.prepare(&mut picker, 0, 0, &app.browse.artwork_config, app.theme.bg);
+        let old_target = app.browse_artwork.protocol_area;
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        execute_context_action(&mut app, ContextAction::BrowseArtworkOpenSettings,
+            &tx, false);
+        let mut terminal = Terminal::new(TestBackend::new(screen.width, screen.height)).unwrap();
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+        // SOURCE's first control is focused on entry. Move to View height,
+        // edit 80, then Apply from the actual keybinding dispatch.
+        for _ in 0..5 {
+            keybindings::handle_key(&mut app,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &tx);
+        }
+        keybindings::handle_key(&mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        for digit in ['8', '0'] {
+            keybindings::handle_key(&mut app,
+                KeyEvent::new(KeyCode::Char(digit), KeyModifiers::NONE), &tx);
+        }
+        assert_eq!(app.browse.artwork_config.popup_height_percent, 60);
+        keybindings::handle_key(&mut app,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), &tx);
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert_eq!(app.browse.artwork_config.popup_height_percent, 80);
+        assert!(app.browse_artwork.popup_open);
+        let saved = crate::config::TonepoetConfig::load().expect("saved Apply value");
+        assert_eq!(saved.browsing.artwork.popup_height_percent, 80);
+        app.browse_artwork.set_artwork_settings_visible(false);
+        app.browse_artwork.prepare(&mut picker, 0, 0, &app.browse.artwork_config, app.theme.bg);
+        assert!(app.browse_artwork.encode_request.is_none(),
+            "Apply must not start an obsolete old-sized worker before drawing");
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+        let new_viewport = popup_rect(screen, 80);
+        let expected_target = fitted_image_area(new_viewport, 400, 400, picker.font_size,
+            app.browse.artwork_config.allow_upscale, ImageVerticalPlacement::Center);
+        assert_ne!(old_target, expected_target);
+        assert_eq!(app.browse_artwork.desired_area, new_viewport);
+        app.browse_artwork.prepare(&mut picker, 0, 0, &app.browse.artwork_config, app.theme.bg);
+        assert_eq!(app.browse_artwork.encode_request.expect("new encode").area,
+            expected_target);
+    }
+
+    #[test]
+    fn kitty_worker_sends_upload_once_and_retries_withheld_upload() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use ratatui_image::picker::ProtocolType;
+
+        let background = Color::Rgb(26, 27, 38);
+        let config = BrowseArtworkConfig::default();
+        let mut state = BrowseArtworkState::default();
+        state.decoded = Some(Arc::new(DynamicImage::new_rgb8(192, 128)));
+        let viewport = Rect::new(2, 2, 30, 16);
+        state.set_desired_area(viewport, ImageVerticalPlacement::Center);
+        let mut picker = Picker::new((8, 12));
+        picker.protocol_type = ProtocolType::Kitty;
+        state.artwork_settings_opened();
+        state.set_artwork_settings_visible(false);
+        state.set_desired_area(viewport, ImageVerticalPlacement::Center);
+        assert!(state.prepare(&mut picker, 0, 0, &config, background));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state.encoded_frame.is_none() && Instant::now() < deadline {
+            state.poll_encoded_frame();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let encoded = state.encoded_frame.as_ref().expect("native worker result");
+        let first = encoded.cells.get(0, 0).symbol();
+        let repeated = encoded.placement_cells.as_ref().expect("Kitty placement buffer")
+            .get(0, 0).symbol();
+        assert!(first.contains("\x1b_G"), "first frame contains Kitty upload");
+        assert!(first.contains("o=z"), "the worker compresses the upload");
+        assert!(!repeated.contains("\x1b_G"), "placement cannot re-upload pixels");
+        assert!(first.ends_with(repeated), "image ID and placeholders are stable");
+
+        let mut terminal = Terminal::new(TestBackend::new(45, 25)).unwrap();
+        let target = state.protocol_area;
+        // Model the actual tmux preflight decision: suppress the first upload
+        // from the terminal buffer, then notify the prepared-frame owner.
+        terminal.draw(|frame| {
+            assert!(state.render_image(frame, viewport, config.allow_upscale,
+                ImageVerticalPlacement::Center, background));
+            assert!(super::super::kitty_transport::buffer_has_kitty_upload(frame.buffer_mut()));
+            super::super::kitty_transport::suppress_unverified_tmux_graphics(frame.buffer_mut());
+            state.kitty_upload_withheld();
+        }).unwrap();
+        assert!(!terminal.backend().buffer().get(target.x, target.y)
+            .symbol().contains("\x1b_G"), "withheld upload is absent from the sent frame");
+        assert!(!state.encoded_frame.as_ref().unwrap().upload_drawn);
+
+        // After verification, the FIRST accepted frame still uploads the
+        // compressed image, and the following frame only places placeholders.
+        terminal.draw(|frame| {
+            assert!(state.render_image(frame, viewport, config.allow_upscale,
+                ImageVerticalPlacement::Center, background));
+        }).unwrap();
+        assert!(terminal.backend().buffer().get(target.x, target.y)
+            .symbol().contains("\x1b_G"), "verification retry must contain image data");
+        state.prepare(&mut picker, 0, 0, &config, background);
+        assert!(state.encode_rx.is_none(), "background repair must reuse cached cells");
+        let first_key = state.encoded_frame_key();
+        terminal.draw(|frame| {
+            assert!(state.render_image(frame, viewport, config.allow_upscale,
+                ImageVerticalPlacement::Center, background));
+        }).unwrap();
+        assert!(!terminal.backend().buffer().get(target.x, target.y)
+            .symbol().contains("\x1b_G"), "ordinary redraw must only place the image");
+        assert_eq!(state.encoded_frame_key(), first_key,
+            "background repaint must not restart Kitty encoding");
+
+        // A genuine viewport change allocates a new protocol and permits
+        // another upload, with a new image identity.
+        let smaller_viewport = Rect::new(2, 2, 18, 9);
+        state.set_desired_area(smaller_viewport, ImageVerticalPlacement::Center);
+        state.prepare(&mut picker, 0, 0, &config, background);
+        assert_ne!(state.encoded_frame_key(), first_key);
+        assert!(state.encoded_frame.is_none());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state.encoded_frame.is_none() && Instant::now() < deadline {
+            state.poll_encoded_frame();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(state.encoded_frame.is_some(), "new geometry is encoded");
+        terminal.draw(|frame| {
+            assert!(state.render_image(frame, smaller_viewport, config.allow_upscale,
+                ImageVerticalPlacement::Center, background));
+        }).unwrap();
+        let new_target = state.protocol_area;
+        assert!(terminal.backend().buffer().get(new_target.x, new_target.y)
+            .symbol().contains("\x1b_G"), "new viewport must transmit new pixels");
+    }
+
+    #[test]
+    fn encoded_worker_rejects_superseded_geometry_and_bounds_retries() {
+        let mut state = BrowseArtworkState::default();
+        state.asynchronous_after_settings = true;
+        state.protocol_area = Rect::new(4, 6, 24, 12);
+        let old_key = state.encoded_frame_key();
+        let (tx, rx) = mpsc::channel();
+        state.encode_rx = Some(rx);
+        state.encode_request = Some(old_key);
+        state.invalidate_protocol();
+        tx.send(EncodedFrame { key: old_key,
+            cells: Buffer::empty(Rect::new(0, 0, 24, 12)),
+            placement_cells: None, upload_drawn: false,
+        }).unwrap();
+        assert!(!state.poll_encoded_frame(), "stale encode is not a draw event");
+        assert!(state.encoded_frame.is_none(), "stale native bytes must not display");
+        assert!(state.encode_rx.is_none());
+
+        let key = state.encoded_frame_key();
+        let (tx, rx) = mpsc::channel::<EncodedFrame>();
+        state.encode_rx = Some(rx);
+        state.encode_request = Some(key);
+        drop(tx);
+        assert!(!state.poll_encoded_frame());
+        assert_eq!(state.encode_failed, Some(key),
+            "a failed encode must not trigger a new worker on every UI tick");
     }
 
     #[test]
@@ -2813,9 +3503,11 @@ pub fn draw_popup(f: &mut ratatui::Frame, app: &mut super::app::AppState,
     app.browse_artwork.popup_rect = if fullscreen { terminal } else { rect };
     if let super::app::ActiveOverlay::ArtworkSettings(settings) = &mut app.active_overlay {
         settings.update_anchor(app.browse_artwork.popup_rect, terminal);
-        if settings.hide_image() {
-            return;
-        }
+        // Record current dimensions even when settings hides the image. A
+        // height edit or terminal resize must not leave the old viewport as
+        // the next encoding request after dismissal.
+        app.browse_artwork.set_desired_area(viewport, ImageVerticalPlacement::Center);
+        return;
     }
     f.render_widget(Clear, rect);
     // No border, label, caption row, or panel outside the image. The backing
