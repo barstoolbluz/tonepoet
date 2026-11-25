@@ -75,7 +75,7 @@ impl Preview {
         if let Some(p)=self.pending.as_ref() {match p.poll(){Ok(Ok(p))=>{self.after=Some(Arc::new(p));self.pending=None;if self.show_after {self.display(background);}changed=true;},Ok(Err(e))=>{self.error=Some(e);self.pending=None;changed=true;},Err(mpsc::TryRecvError::Disconnected)=>{self.error=Some("Preview worker exited".into());self.pending=None;changed=true;},Err(mpsc::TryRecvError::Empty)=>{}}}
         changed|self.viewer.lock().unwrap_or_else(|e|e.into_inner()).prepare(picker,generation,retransmit,&crate::config::BrowseArtworkConfig::default(),background)
     }
-    fn draw(&mut self,f:&mut Frame,theme:Theme) {let screen=f.size();f.render_widget(Clear,screen);ui::fill(f,screen,theme.bg);if screen.height<2 {return;}if self.show_help {let area=centered(screen,40,7);if area.width>0{ui::frame(f,area,"All keys",&[],theme);ui::paint(f,area,3,2,"Space  Before / After",theme.value,theme.panel_bg);ui::paint(f,area,3,3,"Esc    Return to preview",theme.value,theme.panel_bg);ui::paint(f,area,3,5," Done ",theme.panel_bg,theme.chip_go);}return;}let area=Rect::new(screen.x,screen.y,screen.width,screen.height-1);let mut viewer=self.viewer.lock().unwrap_or_else(|e|e.into_inner());if viewer.take_background_restore(){super::browse_artwork::repaint_image_background(f,area,theme.bg,viewer.background_restore_count());}let shown=(!self.show_after||self.after.is_some())&&viewer.render_image(f,area,false,ImageVerticalPlacement::Center,theme.bg);if !shown {let message=self.error.as_deref().unwrap_or("Preparing preview…");ui::paint(f,screen,screen.width.saturating_sub(dw::width(message) as u16)/2,area.height/2,message,theme.value,theme.bg);}let y=screen.height-1;let x=screen.width.saturating_sub(22)/2;ui::paint(f,screen,x,y,if self.show_after {"● After    ○ Before"}else{"○ After    ● Before"},theme.info,theme.bg);ui::paint(f,screen,screen.width.saturating_sub(10),y,"? all keys",theme.info,theme.bg);}
+    fn draw(&mut self,f:&mut Frame,theme:Theme) {let screen=f.size();f.render_widget(Clear,screen);ui::fill(f,screen,theme.bg);if screen.height<2 {return;}if self.show_help {let area=centered(screen,40,7);if area.width>0{ui::fixed_frame(f,area,"All keys",&[],theme);ui::paint(f,area,3,2,"Space  Before / After",theme.value,theme.panel_bg);ui::paint(f,area,3,3,"Esc    Return to preview",theme.value,theme.panel_bg);ui::paint(f,area,3,5," Done ",theme.panel_bg,theme.chip_go);}return;}let area=Rect::new(screen.x,screen.y,screen.width,screen.height-1);let mut viewer=self.viewer.lock().unwrap_or_else(|e|e.into_inner());if viewer.take_background_restore(){super::browse_artwork::repaint_image_background(f,area,theme.bg,viewer.background_restore_count());}let shown=(!self.show_after||self.after.is_some())&&viewer.render_image(f,area,false,ImageVerticalPlacement::Center,theme.bg);if !shown {let message=self.error.as_deref().unwrap_or("Preparing preview…");ui::paint(f,screen,screen.width.saturating_sub(dw::width(message) as u16)/2,area.height/2,message,theme.value,theme.bg);}let y=screen.height-1;let x=screen.width.saturating_sub(22)/2;ui::paint(f,screen,x,y,if self.show_after {"● After    ○ Before"}else{"○ After    ● Before"},theme.info,theme.bg);ui::paint(f,screen,screen.width.saturating_sub(10),y,"? all keys",theme.info,theme.bg);}
 }
 
 const SKIP_CURRENT: &str = "Current image skipped";
@@ -269,6 +269,8 @@ impl EditImageState {
     fn geometry(&self)->Option<pipe::Geometry>{self.current().map(|d|pipe::geometry(&self.settings,(d.pixels.width(),d.pixels.height())))}
     fn requested_geometry(&self)->Option<pipe::Geometry>{let mut requested=self.settings.clone();requested.no_upscale=false;self.current().map(|d|pipe::geometry(&requested,(d.pixels.width(),d.pixels.height())))}
     fn format(&self)->Format{self.settings.resolved_format(self.current().map(|d|d.format).unwrap_or(Format::Png))}
+    fn quality(&self)->u8{self.settings.quality_for(self.format())}
+    fn set_quality(&mut self,value:u8){let format=self.format();self.settings.set_quality_for(format,value);}
     fn files_visible(&self)->bool{!self.embedded||self.settings.write!=WriteMode::Embed}
     fn height(&self)->u16{if self.embedded{22}else{21}}
     fn preset_group(&self)->Option<usize>{match self.settings.mode{Mode::Scale=>Some(0),Mode::Percent=>Some(1),Mode::Long=>Some(2),_=>None}}
@@ -280,13 +282,13 @@ impl EditImageState {
     fn cycle(&mut self,t:Target,d:i32){match t {
         Target::Image=>{self.cycle_source(d);return;},Target::Ratio=>self.settings.ratio=step(self.settings.ratio,9,d),
         Target::Fill=>self.settings.fill=cycle_value(&FILLS,self.settings.fill,d),Target::Filter=>self.settings.filter=step(self.settings.filter,FILTERS.len(),d),
-        Target::Format=>{self.settings.format=cycle_value(&self.formats(),self.settings.format,d);},Target::Quality=>self.settings.quality=(i32::from(self.settings.quality)+5*d).clamp(1,100) as u8,
+        Target::Format=>{self.settings.format=cycle_value(&self.formats(),self.settings.format,d);},Target::Quality=>self.set_quality((i32::from(self.quality())+5*d).clamp(1,100) as u8),
         Target::Metadata=>self.settings.metadata=cycle_value(&META,self.settings.metadata,d),Target::Conflict=>self.settings.conflict=cycle_value(&CONFLICTS,self.settings.conflict,d),
         Target::Write=>{self.settings.write=cycle_value(&WRITES,self.settings.write,d);if self.settings.write!=WriteMode::File&&!matches!(self.settings.format,Format::Jpeg|Format::Png){self.settings.format=Format::Jpeg;}},
         Target::Rotate=>self.settings.rotation=step(self.settings.rotation,4,d),Target::Square=>self.settings.square=cycle_value(&SQUARES,self.settings.square,d),_=>{return;} }self.dirty();}
     fn is_cycler(t:Target)->bool{matches!(t,Target::Image|Target::Ratio|Target::Fill|Target::Filter|Target::Format|Target::Quality|Target::Metadata|Target::Conflict|Target::Write|Target::Rotate|Target::Square)}
     fn number(t:Target)->bool{matches!(t,Target::Custom|Target::W|Target::H|Target::A|Target::B|Target::Quality)}
-    fn numeric_text(&self,t:Target)->String{match t{Target::Custom=>self.preset_group().map(|g|self.customs[g].to_string()).unwrap_or_default(),Target::W=>self.settings.width.to_string(),Target::H=>if self.settings.ratio==8{self.settings.height.to_string()}else{self.requested_geometry().map(|g|g.target.1).unwrap_or(self.settings.height).to_string()},Target::A=>self.settings.ratio_terms().unwrap_or(self.settings.custom_ratio).0.to_string(),Target::B=>self.settings.ratio_terms().unwrap_or(self.settings.custom_ratio).1.to_string(),Target::Quality=>self.settings.quality.to_string(),_=>String::new()}}
+    fn numeric_text(&self,t:Target)->String{match t{Target::Custom=>self.preset_group().map(|g|self.customs[g].to_string()).unwrap_or_default(),Target::W=>self.settings.width.to_string(),Target::H=>if self.settings.ratio==8{self.settings.height.to_string()}else{self.requested_geometry().map(|g|g.target.1).unwrap_or(self.settings.height).to_string()},Target::A=>self.settings.ratio_terms().unwrap_or(self.settings.custom_ratio).0.to_string(),Target::B=>self.settings.ratio_terms().unwrap_or(self.settings.custom_ratio).1.to_string(),Target::Quality=>self.quality().to_string(),_=>String::new()}}
     fn start_field(&mut self,t:Target,digit:Option<char>){
         let prior_preset=if t==Target::Custom {self.preset_group().and_then(|g|{
             let previous=self.presets[g];if previous==4{return None;}
@@ -297,7 +299,7 @@ impl EditImageState {
     fn restore_preset(&mut self,prior:Option<(usize,usize)>){if let Some((g,previous))=prior{self.presets[g]=previous;self.update_preset(g);self.dirty();}}
     fn cancel_field(&mut self){if let Some(edit)=self.edit.take(){self.restore_preset(edit.prior_preset);}}
     fn commit_field(&mut self){let Some(edit)=self.edit.take()else{return;};let t=edit.target;if t==Target::Template{if self.settings.template!=edit.input.text{self.settings.template=edit.input.text;self.dirty();}return;}let Ok(v)=edit.input.text.parse::<f64>()else{self.restore_preset(edit.prior_preset);return;};if !v.is_finite(){self.restore_preset(edit.prior_preset);return;}
-        match t{Target::Custom=>{if let Some(g)=self.preset_group(){self.customs[g]=match g{0=>v.clamp(0.01,16.),1=>v.clamp(1.,1000.),_=>f64::from(pipe::snap8(v.clamp(8.,16384.)))};self.presets[g]=4;self.update_preset(g);}},Target::W=>self.settings.width=pipe::snap8(v.clamp(8.,16384.)),Target::H=>{self.settings.height=pipe::snap8(v.clamp(8.,16384.));self.settings.ratio=8;},Target::A|Target::B=>{let value=v.round().clamp(1.,16384.) as u32;if (t==Target::A)!=self.settings.portrait{self.settings.custom_ratio.0=value;}else{self.settings.custom_ratio.1=value;}},Target::Quality=>self.settings.quality=v.round().clamp(1.,100.) as u8,_=>{}}self.dirty();}
+        match t{Target::Custom=>{if let Some(g)=self.preset_group(){self.customs[g]=match g{0=>v.clamp(0.01,16.),1=>v.clamp(1.,1000.),_=>f64::from(pipe::snap8(v.clamp(8.,16384.)))};self.presets[g]=4;self.update_preset(g);}},Target::W=>self.settings.width=pipe::snap8(v.clamp(8.,16384.)),Target::H=>{self.settings.height=pipe::snap8(v.clamp(8.,16384.));self.settings.ratio=8;},Target::A|Target::B=>{let value=v.round().clamp(1.,16384.) as u32;if (t==Target::A)!=self.settings.portrait{self.settings.custom_ratio.0=value;}else{self.settings.custom_ratio.1=value;}},Target::Quality=>self.set_quality(v.round().clamp(1.,100.) as u8),_=>{}}self.dirty();}
     fn open_folder(&mut self,app:&AppState){let Some(source)=self.source()else{return;};let start=self.encoded.as_ref().and_then(|e|pipe::output_path(source,e,&self.settings.template).ok()).and_then(|p|p.parent().map(Path::to_path_buf)).unwrap_or_else(||source.path().parent().unwrap_or(Path::new(".")).to_path_buf());let start=start.ancestors().find(|p|p.is_dir()).unwrap_or(Path::new(".")).to_path_buf();self.folder=Some(FilePickerState::new(super::keybindings::file_picker_config_with_browse_sort(app,tui_file_picker::FilePickerConfig{start_dir:start,title:"Select image destination".into(),selection_mode:tui_file_picker::FilePickerSelectionMode::Directories,operation_policy:tui_file_picker::FileOperationPolicy::selection_only(app.file_task_verbose_degrade_notices),theme:super::keybindings::file_picker_theme_from_theme(&app.theme),..Default::default()})));}
     fn folder_action(&mut self,a:FilePickerAction){match a{FilePickerAction::Selected(p)=>{let name=self.settings.template.rsplit('/').next().unwrap_or("%NAME%.%EXT%");let dir=p.to_string_lossy().replace('\\',"/");self.settings.template=format!("{}/{name}",dir.trim_end_matches('/'));self.folder=None;self.dirty();},FilePickerAction::Cancelled=>self.folder=None,_=>{}}}
     fn popup_open(&mut self,p:Popup,focus:Target){if p==Popup::Help {self.help_return=self.popup.map(|old|(old,self.focus));}if self.popup.is_none(){self.popup_return=self.focus;}self.popup=Some(p);self.focus=focus;self.hover=None;}
@@ -374,7 +376,7 @@ impl EditImageState {
         if !matches!(m.kind,MouseEventKind::Down(MouseButton::Left)){return true;}
         if let Some(edit)=self.edit.as_ref(){if hit.is_some_and(|h|h.target==edit.target&&(h.target!=Target::Quality||(53..=57).contains(&(m.column-area.x)))){return true;}self.commit_field();}
         if !inside&&self.popup.is_some(){self.close_popup();return true;}
-        if let Some(h)=hit{self.focus=h.target;let x=m.column-area.x;if let Target::ColorChannel(c)=h.target{self.set_channel(c,(((x-h.x) as u32*255)/u32::from(h.w.saturating_sub(1).max(1))) as u8);return true;}if h.target==Target::TemplateField{self.template_input.place_cursor_from_view_column(54,usize::from(x.saturating_sub(h.x+1)));return true;}if h.target==Target::Quality{if (53..=57).contains(&x){return self.action(Target::Quality,app);}self.cycle(Target::Quality,if x<53{-1}else{1});return true;}if Self::is_cycler(h.target){self.cycle(h.target,if x==h.x{-1}else{1});return true;}if h.target==Target::QualityBar{self.settings.quality=((x-h.x+1)*10).min(100) as u8;self.focus=Target::Quality;self.dirty();return true;}return self.action(h.target,app);}true
+        if let Some(h)=hit{self.focus=h.target;let x=m.column-area.x;if let Target::ColorChannel(c)=h.target{self.set_channel(c,(((x-h.x) as u32*255)/u32::from(h.w.saturating_sub(1).max(1))) as u8);return true;}if h.target==Target::TemplateField{self.template_input.place_cursor_from_view_column(54,usize::from(x.saturating_sub(h.x+1)));return true;}if h.target==Target::Quality{if (53..=57).contains(&x){return self.action(Target::Quality,app);}self.cycle(Target::Quality,if x<53{-1}else{1});return true;}if Self::is_cycler(h.target){self.cycle(h.target,if x==h.x{-1}else{1});return true;}if h.target==Target::QualityBar{self.set_quality(((x-h.x+1)*10).min(100) as u8);self.focus=Target::Quality;self.dirty();return true;}return self.action(h.target,app);}true
     }
 }
 fn step(i:usize,n:usize,d:i32)->usize{(i as i32+d).rem_euclid(n as i32) as usize}
@@ -396,7 +398,7 @@ struct Form<'a,'b> { f:&'a mut Frame<'b>, state:&'a mut EditImageState, theme:Th
 impl Form<'_,'_> {
     fn text(&mut self,x:u16,y:u16,s:&str,color:Color){ui::paint(self.f,self.area,x,y,&dw::truncate_right(s,usize::from(self.area.width.saturating_sub(3).saturating_sub(x))),color,self.bg);}
     fn label(&mut self,x:u16,y:u16,s:&str){self.text(x,y,s,self.theme.label);}
-    fn soft(&mut self,x:u16,y:u16,s:&str){self.text(x,y,s,super::theme::mix_colors(ui::readable(self.theme.label,self.bg),self.theme.value,1,3));}
+    fn soft(&mut self,x:u16,y:u16,s:&str){self.text(x,y,s,super::theme::mix_colors(self.theme.label,self.theme.value,1,2));}
     fn hit(&mut self,t:Target,x:u16,y:u16,w:u16)->Color {self.state.hits.push(Hit::new(t,x,y,w,self.band));let bg=if self.state.focus==t&&(self.state.edit.is_none()||t==Target::Quality){self.theme.selection_bg}else if self.state.hover==Some(t){self.theme.hover_bg}else{self.bg};ui::fill(self.f,Rect::new(self.area.x+x,self.area.y+y,w,1),bg);bg}
     fn band(&mut self,b:u8,y:u16,h:u16,title:&str,focused:u8){self.band=b;self.bg=ui::band_color(self.theme,b==focused);ui::fill(self.f,Rect::new(self.area.x+1,self.area.y+y,self.area.width-2,h),self.bg);self.text(3,y,title,if b==focused{self.theme.header}else{self.theme.label});}
     fn radio(&mut self,t:Target,x:u16,y:u16,name:&str,on:bool){let w=2+dw::width(name) as u16;let bg=self.hit(t,x,y,w);ui::paint(self.f,self.area,x,y,if on{"●"}else{"○"},if on{self.theme.info}else{self.theme.label},bg);ui::paint(self.f,self.area,x+2,y,name,self.theme.value,bg);}
@@ -410,7 +412,7 @@ impl Form<'_,'_> {
     }
     fn cycler(&mut self,t:Target,x:u16,y:u16,w:u16,value:&str){let bg=self.hit(t,x,y,w+4);ui::paint(self.f,self.area,x,y,"◂",self.theme.info,bg);ui::paint(self.f,self.area,x+2,y,&dw::pad_or_truncate(value,w as usize,false),self.theme.value,bg);ui::paint(self.f,self.area,x+w+3,y,"▸",self.theme.info,bg);}
     fn field(&mut self,t:Target,x:u16,y:u16,w:u16,value:&str,readonly:bool){self.state.hits.push(Hit::new(t,x,y,w,self.band));self.field_well(t,x,y,w,value,readonly,true);}
-    fn field_well(&mut self,t:Target,x:u16,y:u16,w:u16,value:&str,readonly:bool,focus_marker:bool){let bg=ui::well(self.theme);ui::fill(self.f,Rect::new(self.area.x+x,self.area.y+y,w,1),bg);let edit=self.state.edit.as_ref().filter(|e|e.target==t);let (digits,caret)=if let Some(e)=edit{e.input.view(w as usize)}else{(dw::truncate_left(value,w as usize),0)};let used=dw::width(&digits) as u16;let start=x+w.saturating_sub(used+u16::from(used<w));ui::paint(self.f,self.area,start,y,&digits,if readonly&&edit.is_none(){super::theme::mix_colors(self.theme.label,self.theme.value,2,3)}else{self.theme.value},bg);if edit.is_some(){self.f.buffer_mut().get_mut(self.area.x+(start+caret).min(x+w-1),self.area.y+y).set_bg(self.theme.editing_cursor);}else if focus_marker&&self.state.focus==t{self.f.buffer_mut().get_mut(self.area.x+x,self.area.y+y).set_bg(self.theme.selection_bg);}}
+    fn field_well(&mut self,t:Target,x:u16,y:u16,w:u16,value:&str,readonly:bool,focus_marker:bool){let bg=ui::well(self.theme);ui::fill(self.f,Rect::new(self.area.x+x,self.area.y+y,w,1),bg);let edit=self.state.edit.as_ref().filter(|e|e.target==t);let (digits,caret)=if let Some(e)=edit{e.input.view(w as usize)}else{(dw::truncate_left(value,w as usize),0)};let used=dw::width(&digits) as u16;let start=x+w.saturating_sub(used+u16::from(used<w));ui::paint(self.f,self.area,start,y,&digits,if readonly&&edit.is_none(){super::theme::mix_colors(self.theme.label,self.theme.value,1,2)}else{self.theme.value},bg);if edit.is_some(){self.f.buffer_mut().get_mut(self.area.x+(start+caret).min(x+w-1),self.area.y+y).set_bg(self.theme.editing_cursor);}else if focus_marker&&self.state.focus==t{self.f.buffer_mut().get_mut(self.area.x+x,self.area.y+y).set_bg(self.theme.selection_bg);}}
 
     fn button(&mut self,t:Target,x:u16,y:u16,w:u16,text:&str,bg:Color,chip:bool){self.state.hits.push(Hit::new(t,x,y,w,self.band));let focus=self.state.focus==t;let hovered=self.state.hover==Some(t);let ground=if focus{self.theme.pill_active_bg}else if hovered&&!chip{self.theme.pill_neutral_hover_bg}else{bg};let fg=if focus{self.theme.pill_active_fg}else if chip{self.theme.panel_bg}else{self.theme.value};ui::fill(self.f,Rect::new(self.area.x+x,self.area.y+y,w,1),ground);ui::paint(self.f,self.area,x,y,&dw::pad_or_truncate(text,w as usize,false),fg,ground);}
     fn swatch(&mut self,x:u16,y:u16,w:u16,rgba:[u8;4],bg:Color){
@@ -418,11 +420,18 @@ impl Form<'_,'_> {
         let light=super::theme::mix_colors(bg,self.theme.value,1,2);
         for i in 0..w{let under=if i%2==0{bg}else{light};let shown=super::theme::mix_colors(under,color,u16::from(rgba[3]),255);ui::paint_raw(self.f,self.area,x+i,y,"█",shown,bg);}
     }
-    fn pad(&mut self,x:u16,y:u16){let bg=self.hit(Target::Pad,x,y,4);let rgba=self.state.effective_pad();ui::paint(self.f,self.area,x,y,"▕",self.theme.value,bg);self.swatch(x+1,y,2,rgba,bg);ui::paint(self.f,self.area,x+3,y,"▏",self.theme.value,bg);}
+    fn pad(&mut self,x:u16,y:u16){let bg=self.hit(Target::Pad,x,y,4);let rgba=self.state.effective_pad();ui::paint(self.f,self.area,x,y,"▕",self.theme.label,bg);self.swatch(x+1,y,2,rgba,bg);ui::paint(self.f,self.area,x+3,y,"▏",self.theme.label,bg);}
     fn help(&mut self,x:u16,y:u16){let bg=self.hit(Target::Help,x,y,10);ui::paint(self.f,self.area,x,y,"?",self.theme.info,bg);ui::paint(self.f,self.area,x+2,y,"all keys",self.theme.label,bg);}
 }
 fn centered(screen:Rect,w:u16,h:u16)->Rect{if screen.width<w||screen.height<h{return Rect::default();}Rect::new(screen.x+(screen.width-w)/2,screen.y+(screen.height-h)/2,w,h)}
 fn dim(f:&mut Frame,area:Rect,theme:Theme){let buffer=f.buffer_mut();for y in area.y..area.bottom(){for x in area.x..area.right(){let cell=buffer.get_mut(x,y);cell.set_fg(theme.text_dim);}}}
+fn dim_editor_popup(f:&mut Frame,area:Rect,theme:Theme){
+    let buffer=f.buffer_mut();
+    for y in area.y..area.bottom(){for x in area.x..area.right(){
+        let cell=buffer.get_mut(x,y);cell.set_fg(theme.text_dim);
+        cell.set_bg(super::theme::mix_colors(theme.panel_bg,cell.bg,1,3));
+    }}
+}
 fn band_for(t:Target)->u8{match t{Target::Picker|Target::Image|Target::Transform=>0,Target::Mode(_)|Target::Preset(_)|Target::Custom|Target::W|Target::H|Target::Ratio|Target::A|Target::B|Target::Orientation(_)|Target::Fill|Target::Pad|Target::Filter|Target::Linear|Target::Upscale=>1,Target::Format|Target::Quality|Target::QualityBar|Target::Metadata|Target::Conflict|Target::Write|Target::Template|Target::Browse=>2,_=>3}}
 fn transform_label(s:&Settings)->String{let mut v=Vec::new();if s.rotation>0{v.push(format!("Rotate {}",ROTATIONS[s.rotation]));}if s.flip_h{v.push("Flip horizontal".into());}if s.flip_v{v.push("Flip vertical".into());}if s.square!=Square::Off{v.push(format!("Square, {}",SQUARE_NAMES[SQUARES.iter().position(|v|*v==s.square).unwrap_or(0)].to_lowercase()));}if v.is_empty(){"none".into()}else{v.join(", ")}}
 fn size_label(size:usize)->String{let (n,unit)=if size>=1024*1024{(size as f64/(1024.*1024.),"MiB")}else if size>=1024{(size as f64/1024.,"KiB")}else{return format!("{size} B");};if n<100.{format!("{n:.1} {unit}")}else{format!("{n:.0} {unit}")}}
@@ -444,10 +453,10 @@ fn summary(state:&EditImageState)->(String,String,String,bool){
 fn draw_form(f:&mut Frame,s:&mut EditImageState,theme:Theme){
     let screen=f.size();s.area=if screen.width>=80&&screen.height>=s.height()+2{centered(screen,WIDTH,s.height())}else{Rect::default()};s.hits.clear();let area=s.area;
     if area.width==0 {let message=format!("Edit Image requires an 80 × {} terminal",s.height()+2);ui::paint(f,screen,screen.width.saturating_sub(dw::width(&message) as u16)/2,screen.height/2,&message,theme.value,theme.bg);return;}
-    let extra=if s.embedded{1}else{0};ui::frame(f,area,"edit image",&[4,11,16+extra,18+extra],theme);
+    let extra=if s.embedded{1}else{0};ui::fixed_frame(f,area,"edit image",&[4,11,16+extra,18+extra],theme);
     let settings=s.settings.clone();let focus=if s.popup.is_some(){s.popup_return}else{s.focus};let focused=band_for(focus);
     let geom=s.geometry();let requested_geom=s.requested_geometry();
-    let title=format!("[▾ {} ◆]",dw::truncate_middle(&safe_label(&source_title(s)),51));let source_label=s.source().map(|p|safe_label(&p.label())).unwrap_or_else(||"Loading…".into());let count=s.sources.len();let idx=s.index;
+    let source_name=safe_label(&source_title(s));let title=if s.alternate.is_some(){format!("[▾ {} ◆]",dw::truncate_middle(&source_name,51))}else{dw::truncate_middle(&source_name,57)};let source_label=s.source().map(|p|safe_label(&p.label())).unwrap_or_else(||"Loading…".into());let count=s.sources.len();let idx=s.index;
     let format=s.format();let template=template_display(&settings.template,43);let (input,output,tail,blocked)=summary(s);
     let mut v=Form{f,state:s,theme,area,band:0,bg:theme.panel_bg};
     if v.state.alternate.is_some(){v.state.hits.push(Hit::new(Target::Picker,15,0,dw::width(&title) as u16,0));}ui::paint(v.f,area,15,0,&title,theme.panel_bg,theme.title);
@@ -467,17 +476,32 @@ fn draw_form(f:&mut Frame,s:&mut EditImageState,theme:Theme){
     }else{v.label(3,8,"Size");v.soft(16,8,&geom.map(|g|format!("{} × {}",g.target.0,g.target.1)).unwrap_or_else(||"…".into()));}
     if settings.mode!=Mode::Off{v.label(3,10,"Filter");v.cycler(Target::Filter,16,10,10,FILTERS[settings.filter]);v.toggle(Target::Linear,40,10,"Linear light",settings.linear);if settings.mode!=Mode::Scale{v.toggle(Target::Upscale,58,10,"No upscale",settings.no_upscale);}}
     v.band(2,12,4+extra,"OUTPUT",focused);v.label(3,13,"Format");v.cycler(Target::Format,16,13,15,settings.format.label());
-    if format==Format::Jpeg{v.label(40,13,"Quality");let bg=v.hit(Target::Quality,51,13,9);ui::paint(v.f,area,51,13,"◂",theme.info,bg);ui::paint(v.f,area,59,13,"▸",theme.info,bg);v.field_well(Target::Quality,53,13,5,&settings.quality.to_string(),false,false);v.state.hits.push(Hit::new(Target::QualityBar,61,13,10,2));let n=(u16::from(settings.quality)+5)/10;ui::paint(v.f,area,61,13,&"█".repeat(n as usize),theme.info,v.bg);ui::paint_raw(v.f,area,61+n,13,&"░".repeat((10-n) as usize),theme.text_dim,v.bg);}
+    if format.has_quality(){let quality=settings.quality_for(format);v.label(40,13,"Quality");let bg=v.hit(Target::Quality,51,13,9);ui::paint(v.f,area,51,13,"◂",theme.info,bg);ui::paint(v.f,area,59,13,"▸",theme.info,bg);v.field_well(Target::Quality,53,13,5,&quality.to_string(),false,false);v.state.hits.push(Hit::new(Target::QualityBar,61,13,10,2));let n=(u16::from(quality)+5)/10;ui::paint_raw(v.f,area,61,13,&"█".repeat(n as usize),theme.info,v.bg);ui::paint_raw(v.f,area,61+n,13,&"░".repeat((10-n) as usize),theme.text_dim,v.bg);}
     v.label(3,14,"Metadata");v.cycler(Target::Metadata,16,14,13,label(&META,&META_NAMES,settings.metadata));if v.state.files_visible(){v.label(40,14,"If exists");v.cycler(Target::Conflict,51,14,12,label(&CONFLICTS,&CONFLICT_NAMES,settings.conflict));}
     if v.state.embedded{v.label(3,15,"Write");v.cycler(Target::Write,16,15,15,label(&WRITES,&WRITE_NAMES,settings.write));}
-    if v.state.files_visible(){let y=15+extra;v.label(3,y,"Save to");v.state.hits.push(Hit::new(Target::Template,16,y,45,2));let bg=ui::well(theme);ui::fill(v.f,Rect::new(area.x+16,area.y+y,45,1),bg);let edit=v.state.edit.as_ref().filter(|e|e.target==Target::Template);let text=edit.map(|e|e.input.view(43).0).unwrap_or(template);let mut x=17;let mut token=false;for segment in text.split_inclusive('%'){let color=if token||segment.starts_with('%'){theme.purple}else{theme.value};ui::paint(v.f,area,x,y,segment,color,bg);x+=dw::width(segment) as u16;if segment.ends_with('%'){token=!token;}}if let Some(e)=edit{let (_,cursor)=e.input.view(43);ui::fill(v.f,Rect::new(area.x+17+cursor.min(43),area.y+y,1,1),theme.editing_cursor);}v.button(Target::Browse,64,y,9," Browse… ",theme.pill_neutral_bg,false);}
+    if v.state.files_visible(){let y=15+extra;v.label(3,y,"Save to");v.state.hits.push(Hit::new(Target::Template,16,y,45,2));let bg=ui::well(theme);ui::fill(v.f,Rect::new(area.x+16,area.y+y,45,1),bg);let edit=v.state.edit.as_ref().filter(|e|e.target==Target::Template);let text=edit.map(|e|e.input.view(43).0).unwrap_or(template);let mut x=17;
+        // Paint a literal run, then the complete token including both delimiters.
+        // Splitting *after* '%' otherwise gives an opening delimiter to the
+        // preceding literal run. An unfinished token stays purple while typing.
+        let mut rest=text.as_str();
+        while let Some(start)=rest.find('%') {
+            let (literal,opening)=rest.split_at(start);
+            ui::paint(v.f,area,x,y,literal,theme.value,bg);
+            x+=dw::width(literal) as u16;
+            let end=opening[1..].find('%').map_or(opening.len(),|i|i+2);
+            let (token,tail)=opening.split_at(end);
+            ui::paint(v.f,area,x,y,token,theme.purple,bg);
+            x+=dw::width(token) as u16;
+            rest=tail;
+        }
+        ui::paint(v.f,area,x,y,rest,theme.value,bg);if let Some(e)=edit{let (_,cursor)=e.input.view(43);ui::fill(v.f,Rect::new(area.x+17+cursor.min(43),area.y+y,1,1),theme.editing_cursor);}v.button(Target::Browse,64,y,9," Browse… ",theme.pill_neutral_bg,false);}
     let y=17+extra;let mut whole=if input.is_empty(){output.clone()}else{format!("{input}  →  {output} · {tail}")};whole=dw::truncate_right(&whole,70);let x=(WIDTH-dw::width(&whole) as u16)/2;v.bg=theme.panel_bg;v.band=3;
     if input.is_empty()||dw::width(&format!("{input}  →  {output} · {tail}"))>70{v.text(x,y,&whole,if blocked{theme.error}else{theme.value});}else{v.soft(x,y,&input);let x=x+dw::width(&input) as u16;v.text(x+2,y,"→",theme.info);v.text(x+5,y,&output,theme.value);let x=x+5+dw::width(&output) as u16;ui::paint_raw(v.f,area,x,y," · ",theme.text_dim,theme.panel_bg);v.soft(x+3,y,&tail);}
     let y=19+extra;if !blocked&&!v.state.sources.is_empty(){v.button(Target::Ok,22,y,4," OK ",theme.chip_go,true);v.button(Target::Preview,28,y,11," p Preview ",theme.tab_active,true);}v.button(Target::Cancel,41,y,12," Esc Cancel ",theme.chip_dismiss,true);v.help(63,y);
     if v.state.popup.is_none()&&!v.state.hits.iter().any(|h|h.target==v.state.focus){if let Some(h)=v.state.hits.iter().find(|h|h.band==focused).or(v.state.hits.first()){v.state.focus=h.target;}}
 }
-fn draw_popup(f:&mut Frame,s:&mut EditImageState,theme:Theme){let Some(popup)=s.popup else{return;};dim(f,s.area,theme);s.hits.clear();let screen=f.size();let(w,h,title,rules) = match popup {Popup::Transform=>(46,11,"Transform",vec![8]),Popup::Source=>(52,6,"Source",vec![]),Popup::Color=>(48,12,"Pad color",vec![9]),Popup::Template=>(64,12,"Save to — template",vec![3,9]),Popup::Help=>(60,17,"All keys",vec![14])};let mut area=centered(screen,w,h);if popup==Popup::Transform&&area.width>0{area.y=(area.y+2).min(screen.bottom()-area.height);}s.popup_area=area;if area.width==0{return;}
-    ui::frame(f,area,title,&rules,theme);for y in 1..area.height-1{if !rules.contains(&y){ui::fill(f,Rect::new(area.x+1,area.y+y,area.width-2,1),theme.dropdown_bg);}}
+fn draw_popup(f:&mut Frame,s:&mut EditImageState,theme:Theme){let Some(popup)=s.popup else{return;};dim_editor_popup(f,s.area,theme);s.hits.clear();let screen=f.size();let(w,h,title,rules) = match popup {Popup::Transform=>(46,11,"Transform",vec![8]),Popup::Source=>(52,6,"Source",vec![]),Popup::Color=>(48,12,"Pad color",vec![9]),Popup::Template=>(64,12,"Save to — template",vec![3,9]),Popup::Help=>(60,17,"All keys",vec![14])};let mut area=centered(screen,w,h);if popup==Popup::Transform&&area.width>0{area.y=(area.y+2).min(screen.bottom()-area.height);}s.popup_area=area;if area.width==0{return;}
+    ui::fixed_frame(f,area,title,&rules,theme);for y in 1..area.height-1{if !rules.contains(&y){ui::fill(f,Rect::new(area.x+1,area.y+y,area.width-2,1),theme.dropdown_bg);}}
     let settings=s.settings.clone();let mut v=Form{f,state:s,theme,area,band:0,bg:theme.dropdown_bg};match popup{
         Popup::Transform=>{ui::fill(v.f,Rect::new(area.x+1,area.y+1,area.width-2,1),theme.surface);v.bg=theme.surface;v.soft(3,1,"Applied before resizing, in this order.");v.bg=theme.dropdown_bg;v.label(3,3,"Rotate");v.cycler(Target::Rotate,14,3,9,ROTATIONS[settings.rotation]);v.toggle(Target::FlipH,3,4,"Flip horizontal",settings.flip_h);v.toggle(Target::FlipV,3,5,"Flip vertical",settings.flip_v);v.label(3,6,"Square");v.cycler(Target::Square,14,6,11,label(&SQUARES,&SQUARE_NAMES,settings.square));if settings.square==Square::Pad{v.pad(31,6);}v.help(3,9);v.button(Target::Done,37,9,6," Done ",theme.chip_go,true);},
         Popup::Source=>{let title=source_title(v.state);let alt=v.state.alternate.as_ref().map(|s|if s.len()==1{v.state.clicked.file_name().unwrap_or_default().to_string_lossy().into_owned()}else{format!("{} images",s.len())}).unwrap_or_default();v.radio(Target::SourceChoice,3,1,&dw::truncate_middle(&title,43),true);v.radio(Target::AlternateChoice,3,2,&dw::truncate_middle(&alt,43),false);v.button(Target::Done,43,4,6," Done ",theme.chip_go,true);},
@@ -619,6 +643,121 @@ mod tests {
     fn press(app:&AppState,s:&mut EditImageState,code:KeyCode){assert!(s.key(app,KeyEvent::new(code,KeyModifiers::NONE)));}
     fn loaded_state(path:&Path)->EditImageState{let mut s=test_state();s.clicked=path.to_path_buf();let src=Source::File(path.to_path_buf());s.sources=vec![src.clone()];s.decoded=Some((src.clone(),pipe::decode(&src).unwrap()));s}
     #[test]
+    fn round3_title_picker_is_drawn_only_for_two_source_choices() {
+        let app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let mut term = Terminal::new(TestBackend::new(80,24)).unwrap();
+        for slug in ["tokyo-night", "tokyo-night-day"] {
+            let theme = crate::tui::theme::theme_by_slug_or_default(slug);
+            let mut s = test_state();
+            let title = |term: &Terminal<TestBackend>, area: Rect| (0..area.width)
+                .map(|x| term.backend().buffer().get(area.x+x,area.y).symbol()).collect::<String>();
+            let click = |s: &mut EditImageState, x| {
+                assert!(s.mouse(&app, MouseEvent { kind: MouseEventKind::Down(MouseButton::Left),
+                    column: s.area.x+x, row: s.area.y, modifiers: KeyModifiers::NONE }));
+            };
+            term.draw(|f| draw(f,&mut s,theme)).unwrap();
+            let row = title(&term,s.area);
+            assert!(row.starts_with("┌  edit image"));assert!(row.contains("cover.png"));
+            for glyph in ['[','▾','◆',']','▸'] { assert!(!row.contains(glyph), "{slug}: {row}"); }
+            assert!(!s.hits.iter().any(|h| h.y == 0));
+            click(&mut s, 1);click(&mut s,15);assert!(s.popup.is_none());
+            s.alternate=Some(vec![Source::File(s.clicked.clone()),Source::File("/tmp/other.png".into())]);
+            term.draw(|f| draw(f,&mut s,theme)).unwrap();
+            assert!(title(&term,s.area).contains("[▾ cover.png ◆]"));
+            assert!(!title(&term,s.area).contains('▸'));
+            let hit = *s.hits.iter().find(|h| h.target==Target::Picker).unwrap();
+            assert_eq!((hit.x,hit.y,hit.w),(15,0,15));
+            for x in [hit.x,hit.x+1,hit.x+hit.w-2,hit.x+hit.w-1] {
+                click(&mut s,x);assert_eq!(s.popup,Some(Popup::Source));
+                s.close_popup();term.draw(|f| draw(f,&mut s,theme)).unwrap();
+            }
+            click(&mut s,1);assert!(s.popup.is_none());
+            click_target(&app,&mut s,Target::Picker);
+            term.draw(|f| draw(f,&mut s,theme)).unwrap();
+            click_target(&app,&mut s,Target::AlternateChoice);
+            term.draw(|f| draw(f,&mut s,theme)).unwrap();
+            assert!(title(&term,s.area).contains("[▾ 2 images ◆]"));
+            s.alternate=None; // Also cover a multi-image selection with no alternate choice.
+            term.draw(|f| draw(f,&mut s,theme)).unwrap();
+            assert!(!title(&term,s.area).contains('▾'));
+            assert!(!s.hits.iter().any(|h| h.target==Target::Picker));
+            assert_ne!(s.focus,Target::Picker);
+        }
+    }
+
+    #[test]
+    fn ordinary_format_cycle_and_independent_webp_quality() {
+        let app=AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let mut s=test_state();
+        let formats=[Format::Same,Format::Jpeg,Format::Png,Format::WebpLossy,Format::Webp,Format::Gif,Format::Bmp];
+        assert_eq!(s.formats(),formats);
+        let mut term=Terminal::new(TestBackend::new(80,24)).unwrap();
+        for format in formats {
+            assert_eq!(s.settings.format,format);
+            term.draw(|f| draw(f,&mut s,app.theme)).unwrap();
+            assert_eq!(s.hits.iter().any(|h|h.target==Target::Quality),matches!(format,Format::Jpeg|Format::WebpLossy));
+            s.cycle(Target::Format,1);
+        }
+        assert_eq!(s.settings.format,Format::Same);
+        s.settings.format=Format::WebpLossy;
+        assert_eq!(s.quality(),85);
+        s.focus=Target::Quality;term.draw(|f| draw(f,&mut s,app.theme)).unwrap();
+        press(&app,&mut s,KeyCode::Char(']'));assert_eq!(s.quality(),90);
+        press(&app,&mut s,KeyCode::Char('7'));press(&app,&mut s,KeyCode::Char('3'));press(&app,&mut s,KeyCode::Enter);assert_eq!(s.quality(),73);
+        s.settings.format=Format::Jpeg;assert_eq!(s.quality(),90);s.cycle(Target::Quality,-1);assert_eq!(s.quality(),85);
+        s.settings.format=Format::WebpLossy;assert_eq!(s.quality(),73);
+        term.draw(|f|draw(f,&mut s,app.theme)).unwrap();
+        assert!(s.mouse(&app,MouseEvent{kind:MouseEventKind::Down(MouseButton::Left),column:s.area.x+66,row:s.area.y+13,modifiers:KeyModifiers::NONE}));
+        assert_eq!(s.settings.webp_quality,60);assert_eq!(s.settings.quality,85);
+        s.embedded=true;s.settings.write=WriteMode::Both;assert_eq!(s.formats(),vec![Format::Jpeg,Format::Png]);
+    }
+
+    #[test]
+    fn edit_preview_native_protocols_toggle_and_kitty_retries_withheld_upload() {
+        use ratatui_image::picker::{Picker,ProtocolType};
+        let d=tempfile::tempdir().unwrap();let path=d.path().join("cover.png");
+        image::DynamicImage::new_rgb8(192,128).save(&path).unwrap();
+        let app=AppState::new_for_test(crate::config::TonepoetConfig::default());
+        for protocol in [ProtocolType::Kitty,ProtocolType::Sixel] {
+            let mut s=loaded_state(&path);s.settings.mode=Mode::Long;s.settings.long=96;
+            s.settings.format=Format::WebpLossy;
+            s.encoded=Some(pipe::encode(s.current().unwrap(),&s.settings).unwrap());
+            let mut picker=Picker::new((8,12));picker.protocol_type=protocol;
+            let mut term=Terminal::new(TestBackend::new(80,24)).unwrap();
+            press(&app,&mut s,KeyCode::Char('p'));s.prepare(&mut picker,0,0,app.theme);
+            assert!(s.preview.is_some());
+            for after in [true,false,true] {
+                if s.preview.as_ref().unwrap().show_after!=after {press(&app,&mut s,KeyCode::Char(' '));}
+                let deadline=Instant::now()+Duration::from_secs(15);
+                // Draw sets the real preview viewport; do not consume the
+                // first ready native frame before inspecting its upload.
+                loop {
+                    s.prepare(&mut picker,0,0,app.theme);
+                    if s.preview.as_ref().unwrap().viewer.lock().unwrap().native_frame_ready() {break;}
+                    assert!(Instant::now()<deadline,"{protocol:?} preview worker did not complete");
+                    term.draw(|f|draw(f,&mut s,app.theme)).unwrap();
+                    thread::sleep(Duration::from_millis(2));
+                }
+                let p=s.preview.as_ref().unwrap();assert!(p.error.is_none());assert_eq!(p.show_after,after);
+                assert_eq!((p.before.width(),p.before.height()),(192,128));
+                let pixels=p.after.as_ref().unwrap();assert_eq!((pixels.width(),pixels.height()),(96,64));
+                if protocol==ProtocolType::Kitty {
+                    term.draw(|f|{
+                        draw(f,&mut s,app.theme);
+                        assert!(crate::tui::kitty_transport::buffer_has_kitty_upload(f.buffer_mut()));
+                        crate::tui::kitty_transport::suppress_unverified_tmux_graphics(f.buffer_mut());
+                        s.kitty_upload_withheld();
+                    }).unwrap();
+                    term.draw(|f|{draw(f,&mut s,app.theme);assert!(crate::tui::kitty_transport::buffer_has_kitty_upload(f.buffer_mut()));}).unwrap();
+                    term.draw(|f|{draw(f,&mut s,app.theme);assert!(!crate::tui::kitty_transport::buffer_has_kitty_upload(f.buffer_mut()));}).unwrap();
+                } else {term.draw(|f|draw(f,&mut s,app.theme)).unwrap();}
+            }
+            press(&app,&mut s,KeyCode::Esc);assert!(s.preview.is_none());assert!(!s.wrote);
+            assert_eq!(std::fs::read_dir(d.path()).unwrap().count(),1);
+        }
+    }
+
+    #[test]
     fn quality_stepper_is_one_logical_keyboard_and_mouse_control() {
         let d=tempfile::tempdir().unwrap();
         let first=d.path().join("first.jpg");let second=d.path().join("second.jpg");
@@ -688,6 +827,188 @@ mod tests {
                 s.settings.format=Format::Png;
                 term.draw(|f|draw(f,&mut s,theme)).unwrap();
                 assert!(!s.hits.iter().any(|h|matches!(h.target,Target::Quality|Target::QualityBar)));
+            }
+        }
+    }
+
+    #[test]
+    fn edit_image_mockup_cell_colours_in_both_themes() {
+        use crate::tui::theme::{contrast_ratio,rgb_tuple,theme_by_slug_or_default};
+        fn mix_reference(a:Color,b:Color,n:u32,d:u32)->Color {
+            let (ar,ag,ab)=rgb_tuple(a);let (br,bg,bb)=rgb_tuple(b);
+            let ch=|x:u8,y:u8|((u32::from(x)*(d-n)+u32::from(y)*n)/d) as u8;
+            Color::Rgb(ch(ar,br),ch(ag,bg),ch(ab,bb))
+        }
+        fn readable_reference(fg:Color,bg:Color)->Color {
+            // The guide requires the closest legible interpolation toward
+            // white or black. Exhaustive search is independent of UI's binary search.
+            if contrast_ratio(fg,bg)>=4.5{return fg;}
+            for amount in 1..=256 {
+                for pole in [Color::Rgb(255,255,255),Color::Rgb(0,0,0)] {
+                    let c=mix_reference(fg,pole,amount,256);
+                    if contrast_ratio(c,bg)>=4.5{return c;}
+                }
+            }
+            panic!("no legible colour for {fg:?} on {bg:?}");
+        }
+        let d=tempfile::tempdir().unwrap();let path=d.path().join("sleeve-scan.png");
+        image::DynamicImage::new_rgb8(2400,1800).save(&path).unwrap();
+        for slug in ["tokyo-night","tokyo-night-day"] {
+            let t=theme_by_slug_or_default(slug);
+            let (panel,rest,active,well,popup,neutral)=if t.dark {
+                (Color::Rgb(0x1a,0x1b,0x26),Color::Rgb(0x25,0x28,0x39),Color::Rgb(0x2a,0x2e,0x43),Color::Rgb(0x11,0x12,0x19),Color::Rgb(0x22,0x24,0x34),Color::Rgb(0x43,0x46,0x59))
+            }else{
+                (Color::Rgb(0xe1,0xe2,0xe7),Color::Rgb(0xd7,0xd9,0xe2),Color::Rgb(0xd2,0xd5,0xe0),Color::Rgb(0xf5,0xf5,0xf7),Color::Rgb(0xd9,0xdb,0xe3),Color::Rgb(0xa8,0xb6,0xd9))
+            };
+            // The Day mockup was authored with older illustrative accents.
+            // Spec section 12 explicitly makes the current theme.rs authoritative
+            // for Day roles. Do not introduce a second Day palette in the editor.
+            let soft=mix_reference(t.label,t.value,1,2);
+            if t.dark {assert_eq!(soft,Color::Rgb(0x9f,0xa9,0xd4));}
+            let mut term=Terminal::new(TestBackend::new(80,24)).unwrap();
+            let check=|term:&Terminal<TestBackend>,area:Rect,state:&str,x:u16,y:u16,symbol:&str,fg:Color,bg:Color,word:bool|{
+                let c=term.backend().buffer().get(area.x+x,area.y+y);
+                let expected=if word{readable_reference(fg,bg)}else{fg};
+                assert_eq!(c.symbol(),symbol,"{slug} {state} ({x},{y}) symbol");
+                assert_eq!((c.fg,c.bg),(expected,bg),"{slug} {state} ({x},{y}) colour");
+                if word {assert!(contrast_ratio(c.fg,c.bg)>=4.5,"{slug} {state} ({x},{y}) contrast");}
+            };
+            // Expected runs come directly from mockups A/B, C and D, not
+            // from the production token scanner. Check both delimiters and
+            // every intervening character, as well as literal separators.
+            let check_template=|term:&Terminal<TestBackend>,area:Rect,state:&str,y:u16,runs:&[(&str,Color)]|{
+                let mut x=17;
+                for &(run,fg) in runs {
+                    for ch in run.chars() {
+                        let glyph=ch.to_string();
+                        check(term,area,state,x,y,&glyph,fg,well,true);
+                        x+=dw::width(&glyph) as u16;
+                    }
+                }
+            };
+            let file_template=[("%DIR%",t.purple),("/",t.value),("%NAME%",t.purple),("_",t.value),("%W%",t.purple),("x",t.value),("%H%",t.purple),(".",t.value),("%EXT%",t.purple)];
+            let embedded_template=[("%ALBUMDIR%",t.purple),("/cover.",t.value),("%EXT%",t.purple)];
+            let selected_template=[("~/scans/upright/",t.value),("%NAME%",t.purple),(".",t.value),("%EXT%",t.purple)];
+            let mut s=loaded_state(&path);s.settings.format=Format::Jpeg;s.focus=Target::Preset(2);
+            // A: one image, Long edge, focused Resize region, JPEG controls.
+            term.draw(|f|draw(f,&mut s,t)).unwrap();let a=s.area;
+            check(&term,a,"A",0,0,"┌",t.title,panel,false);
+            check(&term,a,"A",3,0,"e",panel,t.title,true);
+            check(&term,a,"A",3,1,"S",t.label,rest,true);
+            check(&term,a,"A",16,2,"s",t.value,rest,true);
+            check(&term,a,"A",4,3,"T",t.value,neutral,true);
+            check(&term,a,"A",16,3,"n",soft,rest,true);
+            check(&term,a,"A",3,5,"R",t.header,active,true);
+            check(&term,a,"A",16,6,"○",t.label,active,true);
+            check(&term,a,"A",43,6,"●",t.info,active,true);
+            let preset=*s.hits.iter().find(|h|h.target==Target::Preset(2)).unwrap();
+            check(&term,a,"A",preset.x,preset.y,"●",t.info,t.selection_bg,true);
+            check(&term,a,"A",16,8,"1",soft,active,true);
+            check(&term,a,"A",41,10,"☑",t.info,active,true);
+            check(&term,a,"A",16,13,"◂",t.info,rest,true);
+            check(&term,a,"A",55,13,"9",t.value,well,true);
+            check(&term,a,"A",61,13,"█",t.info,rest,false);
+            check(&term,a,"A",70,13,"░",t.text_dim,rest,false);
+            check(&term,a,"A",17,15,"%",t.purple,well,true);
+            check_template(&term,a,"A template",15,&file_template);
+            check(&term,a,"A",23,19,"O",panel,t.chip_go,true);
+            check(&term,a,"A",29,19,"p",panel,t.tab_active,true);
+            check(&term,a,"A",42,19,"E",panel,t.chip_dismiss,true);
+            check(&term,a,"A",63,19,"?",t.info,panel,true);
+            // B: a read-only H and focused Ratio stepper, computed fill note.
+            s.settings.mode=Mode::Size;s.settings.ratio=1;s.settings.portrait=true;s.focus=Target::Ratio;
+            term.draw(|f|draw(f,&mut s,t)).unwrap();
+            check(&term,a,"B",30,7,"1",soft,well,true);
+            check(&term,a,"B",16,8,"◂",t.info,t.selection_bg,true);
+            check(&term,a,"B",18,8,"4",t.value,t.selection_bg,true);
+            check(&term,a,"B",53,8,"●",t.info,active,true);
+            check(&term,a,"B",40,9,"t",soft,active,true);
+            check_template(&term,a,"B template",15,&file_template);
+            // C: render a two-picture model without mutating a real audio tag.
+            let mut c=loaded_state(&path);c.embedded=true;c.settings=Settings::new(true);
+            c.clicked=d.path().join("album.flac");c.settings.write=WriteMode::Both;c.settings.square=Square::Crop;c.focus=Target::Write;
+            let picture=|index,kind|Source::Picture{path:c.clicked.clone(),tag:Some(lofty::tag::TagType::VorbisComments),index,kind,description:None,digest:[0;32],album:"Album".into(),artist:"Artist".into()};
+            c.sources=vec![picture(0,lofty::picture::PictureType::CoverFront),picture(1,lofty::picture::PictureType::CoverBack)];
+            let decoded=c.decoded.take().unwrap().1;c.decoded=Some((c.sources[0].clone(),decoded));
+            term.draw(|f|draw(f,&mut c,t)).unwrap();let ca=c.area;
+            check(&term,ca,"C",16,2,"◂",t.info,rest,true);
+            check(&term,ca,"C",44,2,"1",soft,rest,true);
+            check(&term,ca,"C",16,3,"S",t.value,rest,true);
+            check(&term,ca,"C",3,12,"O",t.header,active,true);
+            check(&term,ca,"C",16,15,"◂",t.info,t.selection_bg,true);
+            check(&term,ca,"C",18,15,"F",t.value,t.selection_bg,true);
+            check(&term,ca,"C",17,16,"%",t.purple,well,true);
+            check_template(&term,ca,"C template",16,&embedded_template);
+            check(&term,ca,"C",23,20,"O",panel,t.chip_go,true);
+            // D: source selection, resize off, PNG: absent quality/filter cells.
+            let mut s=loaded_state(&path);s.sources=(0..12).map(|i|Source::File(d.path().join(format!("scan-{i:02}.png")))).collect();
+            s.index=2;s.alternate=Some(vec![Source::File(path.clone())]);let decoded=s.decoded.take().unwrap().1;s.decoded=Some((s.sources[2].clone(),decoded));
+            s.settings.mode=Mode::Off;s.settings.rotation=1;s.settings.format=Format::Png;s.settings.conflict=Conflict::Skip;s.settings.template="~/scans/upright/%NAME%.%EXT%".into();s.focus=Target::Image;
+            term.draw(|f|draw(f,&mut s,t)).unwrap();let a=s.area;
+            check(&term,a,"D",3,1,"S",t.header,active,true);
+            check(&term,a,"D",16,2,"◂",t.info,t.selection_bg,true);
+            check(&term,a,"D",16,3,"R",t.value,active,true);
+            check(&term,a,"D",16,6,"●",t.info,rest,true);
+            check(&term,a,"D",17,15,"~",t.value,well,true);
+            check_template(&term,a,"D template",15,&selected_template);
+            for x in 51..=70 {let c=term.backend().buffer().get(a.x+x,a.y+13);assert_eq!((c.symbol(),c.bg),(" ",rest));}
+            assert!(!s.hits.iter().any(|h|matches!(h.target,Target::Quality|Target::QualityBar|Target::Filter)));
+            // Additional boundaries: adjacent tokens, a trailing literal,
+            // an unfinished token and a filename without tokens.
+            for (template,runs) in [
+                ("%NAME%%EXT%-copy", &[("%NAME%",t.purple),("%EXT%",t.purple),("-copy",t.value)][..]),
+                ("cover.%EX", &[("cover.",t.value),("%EX",t.purple)][..]),
+                ("cover.png", &[("cover.png",t.value)][..]),
+            ] {
+                s.settings.template=template.into();
+                term.draw(|f|draw(f,&mut s,t)).unwrap();
+                check_template(&term,s.area,template,15,runs);
+            }
+            // E: fixed popup with focused Square and attenuated parent bands.
+            let mut s=loaded_state(&path);s.settings.format=Format::Jpeg;s.settings.rotation=1;s.settings.square=Square::Crop;s.focus=Target::Transform;s.popup_open(Popup::Transform,Target::Square);
+            term.draw(|f|draw(f,&mut s,t)).unwrap();let a=s.area;let pa=s.popup_area;
+            check(&term,a,"E parent",0,0,"┌",t.text_dim,panel,false);
+            check(&term,a,"E parent",3,0,"e",t.text_dim,mix_reference(panel,t.title,1,3),false);
+            check(&term,a,"E parent",3,1,"S",t.text_dim,mix_reference(panel,active,1,3),false);
+            check(&term,pa,"E",0,0,"┌",t.title,panel,false);
+            check(&term,pa,"E",3,0,"T",panel,t.title,true);
+            check(&term,pa,"E",3,1,"A",soft,rest,true);
+            check(&term,pa,"E",3,3,"R",t.label,popup,true);
+            check(&term,pa,"E",14,3,"◂",t.info,popup,true);
+            check(&term,pa,"E",16,3,"9",t.value,popup,true);
+            check(&term,pa,"E",4,4,"☐",t.label,popup,true);
+            check(&term,pa,"E",7,4,"F",t.value,popup,true);
+            check(&term,pa,"E",14,6,"◂",t.info,t.selection_bg,true);
+            check(&term,pa,"E",16,6,"C",t.value,t.selection_bg,true);
+            check(&term,pa,"E",3,9,"?",t.info,popup,true);
+            check(&term,pa,"E",38,9,"D",panel,t.chip_go,true);
+            // G: format/ratio geometry, custom wells, opaque pad swatch.
+            s.close_popup();s.settings.rotation=0;s.settings.square=Square::Off;s.settings.mode=Mode::Size;s.focus=Target::Transform;
+            for format in [Format::Same,Format::Jpeg,Format::Webp,Format::WebpLossy] {
+                s.settings.format=format;term.draw(|f|draw(f,&mut s,t)).unwrap();let a=s.area;
+                check(&term,a,"G format",16,13,"◂",t.info,rest,true);
+                check(&term,a,"G format",34,13,"▸",t.info,rest,true);
+                let first=format.label().chars().next().unwrap().to_string();
+                check(&term,a,"G format",18,13,&first,t.value,rest,true);
+            }
+            s.settings.format=Format::Jpeg;
+            for ratio in [0,5,8,7] {
+                s.settings.ratio=ratio;s.settings.custom_ratio=(7,5);s.settings.width=1080;s.settings.height=592;s.settings.fill=Fill::Pad;
+                term.draw(|f|draw(f,&mut s,t)).unwrap();let a=s.area;
+                check(&term,a,"G ratio",16,8,"◂",t.info,rest,true);
+                check(&term,a,"G ratio",32,8,"▸",t.info,rest,true);
+                if ratio==7 {
+                    check(&term,a,"G custom ratio",21,8,"7",t.value,well,true);
+                    check(&term,a,"G custom ratio",24,8,":",soft,rest,true);
+                    check(&term,a,"G custom ratio",29,8,"5",t.value,well,true);
+                    check(&term,a,"G pad",34,9,"▕",t.label,rest,true);
+                    check(&term,a,"G pad",35,9,"█",Color::Rgb(0,0,0),rest,false);
+                    check(&term,a,"G pad",36,9,"█",Color::Rgb(0,0,0),rest,false);
+                    check(&term,a,"G pad",37,9,"▏",t.label,rest,true);
+                }else{
+                    let first=match ratio{0=>"S",5=>"1",8=>"F",_=>unreachable!()};
+                    check(&term,a,"G ratio",18,8,first,t.value,rest,true);
+                }
             }
         }
     }

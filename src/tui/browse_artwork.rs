@@ -3594,8 +3594,65 @@ mod tests {
 
     #[test]
     fn fullscreen_native_workers_reuse_pixels_and_render_matching_geometry() {
-        use ratatui::{backend::TestBackend,Terminal};use ratatui_image::picker::ProtocolType;
-        for protocol in [ProtocolType::Sixel,ProtocolType::Kitty]{let mut state=BrowseArtworkState::default();state.open_file_popup(PathBuf::from("/image/cover.png"));state.scanned=state.context.clone();state.viewer_max_area=Rect::new(0,0,60,24);state.viewer_decode_bounds=Some((480,288));state.viewer_background=Some([0,0,0]);let pixels=Arc::new(DynamicImage::new_rgb8(480,288));state.decoded=Some(pixels.clone());let mut picker=Picker::new((8,12));picker.protocol_type=protocol;let config=BrowseArtworkConfig::default();let mut terminal=Terminal::new(TestBackend::new(60,24)).unwrap();let background=Color::Rgb(0,0,0);for fullscreen in [false,true,false,true]{if state.fullscreen!=fullscreen{state.toggle_fullscreen();}let area=if fullscreen{Rect::new(0,0,60,24)}else{Rect::new(0,0,60,12)};state.set_desired_area(area,ImageVerticalPlacement::Center);state.prepare(&mut picker,0,0,&config,background);let deadline=Instant::now()+Duration::from_secs(10);while !state.native_frame_ready()&&Instant::now()<deadline{state.prepare(&mut picker,0,0,&config,background);std::thread::sleep(Duration::from_millis(2));}assert!(state.native_frame_ready());assert!(Arc::ptr_eq(state.decoded.as_ref().unwrap(),&pixels));terminal.draw(|frame|{assert!(state.render_image(frame,area,config.allow_upscale,ImageVerticalPlacement::Center,background));}).unwrap();}}
+        use ratatui::{backend::TestBackend, Terminal};
+        use ratatui_image::picker::ProtocolType;
+        for protocol in [ProtocolType::Sixel, ProtocolType::Kitty] {
+            let mut state = BrowseArtworkState::default();
+            state.open_file_popup(PathBuf::from("/image/cover.png"));
+            state.scanned = state.context.clone();
+            state.viewer_max_area = Rect::new(0, 0, 60, 24);
+            state.viewer_decode_bounds = Some((480, 288));
+            state.viewer_background = Some([0, 0, 0]);
+            let pixels = Arc::new(DynamicImage::new_rgb8(480, 288));
+            state.decoded = Some(pixels.clone());
+            let mut picker = Picker::new((8, 12));
+            picker.protocol_type = protocol;
+            let config = BrowseArtworkConfig::default();
+            let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+            let background = Color::Rgb(0, 0, 0);
+            let generation = state.generation;
+            let mut previous_kitty_placement = None;
+            for fullscreen in [false, true, false, true] {
+                if state.fullscreen != fullscreen { state.toggle_fullscreen(); }
+                let area = if fullscreen { Rect::new(0, 0, 60, 24) } else { Rect::new(0, 0, 60, 12) };
+                let allow_upscale = !fullscreen && config.allow_upscale;
+                state.set_desired_area(area, ImageVerticalPlacement::Center);
+                state.prepare(&mut picker, 0, 0, &config, background);
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !state.native_frame_ready() && Instant::now() < deadline {
+                    state.prepare(&mut picker, 0, 0, &config, background);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                assert!(state.native_frame_ready());
+                assert!(Arc::ptr_eq(state.decoded.as_ref().unwrap(), &pixels));
+                assert_eq!(state.generation, generation);
+                assert!(state.decode_rx.is_none());
+                assert_eq!(state.protocol_area, fitted_image_area(area, pixels.width(), pixels.height(), (8, 12), allow_upscale, ImageVerticalPlacement::Center));
+                let kitty = protocol == ProtocolType::Kitty;
+                terminal.draw(|frame| {
+                    assert!(state.render_image(frame, area, allow_upscale, ImageVerticalPlacement::Center, background));
+                    if kitty {
+                        assert!(super::super::kitty_transport::buffer_has_kitty_upload(frame.buffer_mut()));
+                    }
+                }).unwrap();
+                if kitty {
+                    // Kitty cannot reuse one-shot IDs from an earlier viewport.
+                    // Each transition uploads once, then draws placement only.
+                    let placement = state.encoded_frame.as_ref().unwrap().placement_cells.as_ref().unwrap()
+                        .get(0, 0).clone();
+                    if let Some(previous) = previous_kitty_placement.as_ref() {
+                        assert_ne!(&placement, previous, "geometry transition must use a fresh Kitty identity");
+                    }
+                    previous_kitty_placement = Some(placement);
+                    state.prepare(&mut picker, 0, 0, &config, background);
+                    assert!(state.encode_rx.is_none());
+                    terminal.draw(|frame| {
+                        assert!(state.render_image(frame, area, allow_upscale, ImageVerticalPlacement::Center, background));
+                        assert!(!super::super::kitty_transport::buffer_has_kitty_upload(frame.buffer_mut()));
+                    }).unwrap();
+                }
+            }
+        }
     }
 
     #[test]

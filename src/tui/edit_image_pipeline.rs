@@ -15,15 +15,16 @@ const MAX_WORK_BYTES: u64 = 768 * 1024 * 1024;
 const MAX_DIM: u32 = 32768;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Format { Same, Jpeg, Png, Webp, Gif, Bmp }
+pub(super) enum Format { Same, Jpeg, Png, WebpLossy, Webp, Gif, Bmp }
 impl Format {
-    pub const ALL: [Self; 6] = [Self::Same, Self::Jpeg, Self::Png, Self::Webp, Self::Gif, Self::Bmp];
-    pub fn label(self) -> &'static str { match self { Self::Same => "Same as source", Self::Jpeg => "JPEG", Self::Png => "PNG", Self::Webp => "WebP · lossless", Self::Gif => "GIF", Self::Bmp => "BMP" } }
-    pub fn short(self) -> &'static str { if self == Self::Webp { "WebP" } else { self.label() } }
-    pub fn extension(self) -> &'static str { match self { Self::Same => "", Self::Jpeg => "jpg", Self::Png => "png", Self::Webp => "webp", Self::Gif => "gif", Self::Bmp => "bmp" } }
+    pub const ALL: [Self; 7] = [Self::Same, Self::Jpeg, Self::Png, Self::WebpLossy, Self::Webp, Self::Gif, Self::Bmp];
+    pub fn label(self) -> &'static str { match self { Self::Same => "Same as source", Self::Jpeg => "JPEG", Self::Png => "PNG", Self::WebpLossy => "WebP · lossy", Self::Webp => "WebP · lossless", Self::Gif => "GIF", Self::Bmp => "BMP" } }
+    pub fn short(self) -> &'static str { if matches!(self, Self::Webp | Self::WebpLossy) { "WebP" } else { self.label() } }
+    pub fn extension(self) -> &'static str { match self { Self::Same => "", Self::Jpeg => "jpg", Self::Png => "png", Self::Webp | Self::WebpLossy => "webp", Self::Gif => "gif", Self::Bmp => "bmp" } }
     pub fn from_image(f: ImageFormat) -> Option<Self> { match f { ImageFormat::Jpeg => Some(Self::Jpeg), ImageFormat::Png => Some(Self::Png), ImageFormat::WebP => Some(Self::Webp), ImageFormat::Gif => Some(Self::Gif), ImageFormat::Bmp => Some(Self::Bmp), _ => None } }
-    fn image(self) -> ImageFormat { match self { Self::Jpeg => ImageFormat::Jpeg, Self::Png => ImageFormat::Png, Self::Webp => ImageFormat::WebP, Self::Gif => ImageFormat::Gif, Self::Bmp => ImageFormat::Bmp, Self::Same => unreachable!("resolve first") } }
-    pub(super) fn alpha(self) -> bool { matches!(self, Self::Png | Self::Webp | Self::Gif) }
+    fn image(self) -> ImageFormat { match self { Self::Jpeg => ImageFormat::Jpeg, Self::Png => ImageFormat::Png, Self::Webp | Self::WebpLossy => ImageFormat::WebP, Self::Gif => ImageFormat::Gif, Self::Bmp => ImageFormat::Bmp, Self::Same => unreachable!("resolve first") } }
+    pub(super) fn has_quality(self) -> bool { matches!(self, Self::Jpeg | Self::WebpLossy) }
+    pub(super) fn alpha(self) -> bool { matches!(self, Self::Png | Self::Webp | Self::WebpLossy | Self::Gif) }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Mode { Off, Scale, Percent, Long, Size }
@@ -46,7 +47,7 @@ pub(super) struct Settings {
     pub ratio: usize, pub custom_ratio: (u32, u32), pub portrait: bool,
     pub fill: Fill, pub filter: usize, pub linear: bool, pub no_upscale: bool,
     pub rotation: usize, pub flip_h: bool, pub flip_v: bool, pub square: Square,
-    pub pad: Option<[u8; 4]>, pub format: Format, pub quality: u8,
+    pub pad: Option<[u8; 4]>, pub format: Format, pub quality: u8, pub webp_quality: u8,
     pub metadata: Metadata, pub write: WriteMode, pub conflict: Conflict, pub template: String,
     pub working_root: Option<PathBuf>,
 }
@@ -56,7 +57,7 @@ impl Settings {
         ratio: 0, custom_ratio: (1, 1), portrait: false, fill: Fill::Crop, filter: 0,
         linear: true, no_upscale: true, rotation: 0, flip_h: false, flip_v: false,
         square: Square::Off, pad: None, format: if embedded { Format::Jpeg } else { Format::Same },
-        quality: 90, metadata: if embedded { Metadata::Strip } else { Metadata::Icc },
+        quality: 90, webp_quality: 85, metadata: if embedded { Metadata::Strip } else { Metadata::Icc },
         write: WriteMode::File, conflict: Conflict::Ask,
         template: if embedded { "%ALBUMDIR%/cover.%EXT%" } else { "%DIR%/%NAME%_%W%x%H%.%EXT%" }.into(),
         working_root: None,
@@ -66,6 +67,8 @@ impl Settings {
         Some(if self.portrait { (b,a) } else { (a,b) })
     }
     pub fn resolved_format(&self, source: Format) -> Format { if self.format == Format::Same { source } else { self.format } }
+    pub(super) fn quality_for(&self, format: Format) -> u8 { if format == Format::WebpLossy { self.webp_quality } else { self.quality } }
+    pub(super) fn set_quality_for(&mut self, format: Format, value: u8) { if format == Format::WebpLossy { self.webp_quality = value; } else { self.quality = value; } }
     pub(super) fn pad_color(&self, format: Format) -> Rgba<u8> { let mut p = self.pad.unwrap_or(if format.alpha() { [0,0,0,0] } else { [0,0,0,255] }); if !format.alpha() { p[3] = 255; } Rgba(p) }
 }
 
@@ -184,6 +187,7 @@ const XMP_JPEG: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
 const XMP_PNG: &[u8] = b"XML:com.adobe.xmp";
 #[derive(Clone, Debug, Default)]
 struct ExtraMetadata {
+    webp_lossy: bool,
     records: Vec<Vec<u8>>,
     descriptive: Vec<PngDescription>,
     color: Vec<Vec<u8>>,
@@ -316,7 +320,7 @@ fn container_metadata(bytes: &[u8], format: Format) -> Result<ExtraMetadata, Str
                 pos = end;
             }
         }
-        Format::Webp => {
+        Format::Webp | Format::WebpLossy => {
             let mut pos = 12;
             while pos + 8 <= bytes.len() {
                 let n = le32(&bytes[pos+4..pos+8]) as usize;
@@ -325,7 +329,8 @@ fn container_metadata(bytes: &[u8], format: Format) -> Result<ExtraMetadata, Str
                 let body=&bytes[pos+8..pos+8+n];
                 match &bytes[pos..pos+4] {
                     b"ANIM" | b"ANMF" => return Err("Animated WebP editing is not supported".into()),
-                    b"VP8 " | b"VP8L" | b"VP8X" | b"ALPH" | b"ICCP" => {},
+                    b"VP8 " => extra.webp_lossy = true,
+                    b"VP8L" | b"VP8X" | b"ALPH" | b"ICCP" => {},
                     b"EXIF"=>{if extra.exif.is_some(){extra.refuse("multiple WebP EXIF chunks");}else{extra.exif=Some(body.strip_prefix(b"Exif\0\0").unwrap_or(body).to_vec());}},
                     b"XMP "=>extra.set_xmp(body)?,
                     _=>extra.refuse("unknown WebP metadata chunk"),
@@ -402,19 +407,26 @@ fn png_chunk(kind:&[u8;4],data:&[u8])->Vec<u8> {
 }
 fn webp_metadata(out:&mut Vec<u8>,kind:&[u8;4],data:&[u8],dims:(u32,u32))->Result<(),String> {
     if out.len()<20||&out[..4]!=b"RIFF"||&out[8..12]!=b"WEBP" {return Err("Invalid encoded WebP container".into());}
-    let flag=if kind==b"EXIF" {0x08}else{0x04};
+    let flag=match kind { b"ICCP"=>0x20, b"EXIF"=>0x08, b"XMP "=>0x04, _=>return Err("Unsupported WebP metadata chunk".into()) };
     if &out[12..16]==b"VP8X" {
         if out.len()<30||le32(&out[16..20])!=10{return Err("Invalid WebP extended header".into());}
         out[20]|=flag;
     } else {
-        // Lossless bitstream header: bit 28 records whether alpha is used.
-        if &out[12..16]!=b"VP8L"||out.get(20)!=Some(&0x2f)||out.len()<25{return Err("Unexpected encoded lossless WebP header".into());}
-        let alpha=if le32(&out[21..25])&(1<<28)!=0 {0x10}else{0};
+        // Simple VP8 is opaque; VP8L carries the alpha bit in its header.
+        // A lossy image with alpha already has VP8X and ALPH.
+        let alpha=match &out[12..16] {
+            b"VP8 "=>0,
+            b"VP8L" if out.len()>=25 && out[20]==0x2f => if le32(&out[21..25])&(1<<28)!=0 {0x10}else{0},
+            _=>return Err("Unexpected encoded WebP bitstream header".into()),
+        };
         let mut header=b"VP8X".to_vec();header.extend(10u32.to_le_bytes());header.extend([flag|alpha,0,0,0]);
         header.extend(&(dims.0-1).to_le_bytes()[..3]);header.extend(&(dims.1-1).to_le_bytes()[..3]);
         out.splice(12..12,header);
     }
-    out.extend(kind);out.extend(u32::try_from(data.len()).map_err(err)?.to_le_bytes());out.extend(data);if data.len()%2!=0 {out.push(0);}
+    let mut chunk=Vec::with_capacity(8+data.len()+data.len()%2);
+    chunk.extend(kind);chunk.extend(u32::try_from(data.len()).map_err(err)?.to_le_bytes());chunk.extend(data);if data.len()%2!=0 {chunk.push(0);}
+    // ICCP must precede ALPH/VP8/VP8L; EXIF and XMP follow image data.
+    if kind==b"ICCP" {out.splice(30..30,chunk);} else {out.extend(chunk);}
     let len=u32::try_from(out.len()-8).map_err(err)?;out[4..8].copy_from_slice(&len.to_le_bytes());Ok(())
 }
 fn bmp_icc(out:&mut Vec<u8>,icc:&[u8])->Result<(),String> {
@@ -431,6 +443,7 @@ pub(super) fn decode(source:&Source)->Result<Decoded,String> {
     let bytes=source.bytes()?;
     let format=image::guess_format(&bytes).ok().and_then(Format::from_image).ok_or("Unsupported image format")?;
     let mut extra=container_metadata(&bytes,format)?;
+    let format = if format == Format::Webp && extra.webp_lossy { Format::WebpLossy } else { format };
     let mut reader=ImageReader::with_format(Cursor::new(&bytes),format.image());
     let mut limits=Limits::default(); limits.max_alloc=Some(512*1024*1024); limits.max_image_width=Some(MAX_DIM); limits.max_image_height=Some(MAX_DIM); reader.limits(limits);
     let mut decoder=reader.into_decoder().map_err(err)?;
@@ -573,6 +586,13 @@ pub(super) fn encode_checked(input:&Decoded,s:&Settings,check:&impl Fn()->Result
     };
     if gray&&!matches!(format,Format::Png|Format::Jpeg){return Err("Output format requires RGB samples; cannot keep a grayscale ICC profile. Choose PNG, JPEG or Strip all".into());}
     admit_work(input,plan,if high_precision {8}else{4},s,gray)?;
+    if format==Format::WebpLossy {
+        // libwebp's VP8 limit is smaller than the editor's raster limit.
+        if plan.target.0>16383 || plan.target.1>16383 {return Err("Lossy WebP dimensions exceed 16383 pixels; choose a smaller target".into());}
+        // Allow for codec-owned RGBA/YUV, transform and compressed buffers.
+        let retained=area((input.pixels.width(),input.pixels.height()))*u64::from(input.pixels.color().bytes_per_pixel());
+        if retained+area(plan.target)*24+MAX_BYTES>MAX_WORK_BYTES {return Err("Lossy WebP exceeds the editor's working-memory limit; choose a smaller target".into());}
+    }
     let mut out=Vec::new();
     let (w,h)=plan.target;
     if high_precision {
@@ -603,6 +623,12 @@ pub(super) fn encode_checked(input:&Decoded,s:&Settings,check:&impl Fn()->Result
                 enc.write_image(pixels.as_bytes(),w,h,pixels.color().into()).map_err(err)?;
             },
             Format::Webp=>{check()?;let mut enc=image::codecs::webp::WebPEncoder::new_lossless(&mut out);if let Some(icc)=icc {enc.set_icc_profile(icc).map_err(err)?;}enc.write_image(pixels.as_raw(),w,h,image::ExtendedColorType::Rgba8).map_err(err)?;},
+            Format::WebpLossy=>{
+                check()?;
+                out=encode_lossy_webp(&pixels,s.webp_quality)?;
+                check()?;
+                if let Some(icc)=icc {webp_metadata(&mut out,b"ICCP",&icc,(w,h))?;}
+            },
             Format::Gif|Format::Bmp=>{if format==Format::Gif&&icc.is_some(){return Err("GIF encoder cannot keep ICC; choose Strip all".into());}let p=if format.alpha(){DynamicImage::ImageRgba8(pixels)}else{DynamicImage::ImageRgb8(flatten(&pixels,pad))};check()?;p.write_to(&mut Cursor::new(&mut out),format.image()).map_err(err)?;if let Some(icc)=icc {bmp_icc(&mut out,&icc)?;}},
             Format::Same=>unreachable!(),
         }
@@ -611,6 +637,30 @@ pub(super) fn encode_checked(input:&Decoded,s:&Settings,check:&impl Fn()->Result
     if s.metadata==Metadata::All {write_metadata(&mut out,input,format,plan.target,s.rotation)?;}
     check()?;
     Ok(Encoded { geometry:plan,format,bytes:Arc::new(out) })
+}
+/// The reference libwebp encoder allocates its output with WebPMalloc.
+/// Keep ownership in this scope and free with the matching allocator, even
+/// on an error or unwind. No Rust allocation crosses the FFI boundary.
+fn encode_lossy_webp(pixels:&RgbaImage, quality:u8)->Result<Vec<u8>,String> {
+    struct WebpBuffer(*mut u8);
+    impl Drop for WebpBuffer {
+        fn drop(&mut self) {
+            if !self.0.is_null() {unsafe {libwebp_sys::WebPFree(self.0.cast());}}
+        }
+    }
+    let (w,h)=pixels.dimensions();
+    if !(1..=16383).contains(&w)||!(1..=16383).contains(&h)||!(1..=100).contains(&quality) {
+        return Err("Invalid lossy WebP dimensions or quality".into());
+    }
+    let mut output=WebpBuffer(std::ptr::null_mut());
+    // SAFETY: RgbaImage owns w*h*4 contiguous initialized bytes. Dimensions
+    // and stride fit c_int; output points to writable storage for one pointer.
+    let len=unsafe {libwebp_sys::WebPEncodeRGBA(pixels.as_raw().as_ptr(),w as i32,h as i32,(w*4) as i32,f32::from(quality),&mut output.0)};
+    if len==0||output.0.is_null() {return Err("Lossy WebP encoding failed".into());}
+    if len as u64>MAX_BYTES {return Err("Encoded WebP exceeds 100 MiB".into());}
+    // SAFETY: on success libwebp returns an initialized buffer of len bytes,
+    // which remains owned by output until this copy completes.
+    Ok(unsafe {std::slice::from_raw_parts(output.0,len)}.to_vec())
 }
 fn gray_incompatible()->String {"Colored padding or RGB samples cannot keep a grayscale ICC profile; choose neutral padding or Strip all".into()}
 fn gray_alpha<T:Sample>(pixels:&Raster<T>,check:&impl Fn()->Result<(),String>)->Result<image::ImageBuffer<image::LumaA<T>,Vec<T>>,String> where Rgba<T>:image::Pixel<Subpixel=T> {
@@ -744,9 +794,9 @@ fn validate_metadata(input:&Decoded,format:Format)->Result<(),String> {
     let refuse=|what:&str|Err(format!("Cannot keep {what} in {} output; choose Keep ICC only or Strip all",format.short()));
     if let Some(what)=&extra.unsupported {return refuse(what);}
     if format!=input.format&&!extra.records.is_empty(){return refuse("container-specific descriptive metadata");}
-    if input.exif.is_some()&&!matches!(format,Format::Jpeg|Format::Png|Format::Webp){return refuse("EXIF metadata");}
-    if extra.xmp.is_some()&&!matches!(format,Format::Jpeg|Format::Png|Format::Webp){return refuse("XMP metadata");}
-    if !extra.descriptive.is_empty()&&!matches!(format,Format::Jpeg|Format::Png|Format::Webp){return refuse("PNG descriptive text");}
+    if input.exif.is_some()&&!matches!(format,Format::Jpeg|Format::Png|Format::Webp|Format::WebpLossy){return refuse("EXIF metadata");}
+    if extra.xmp.is_some()&&!matches!(format,Format::Jpeg|Format::Png|Format::Webp|Format::WebpLossy){return refuse("XMP metadata");}
+    if !extra.descriptive.is_empty()&&!matches!(format,Format::Jpeg|Format::Png|Format::Webp|Format::WebpLossy){return refuse("PNG descriptive text");}
     if !extra.comments.is_empty()&&!matches!(format,Format::Jpeg|Format::Png|Format::Gif){return refuse("comment metadata");}
     if format==Format::Png&&extra.comments.iter().any(|v|v.contains(&0)){return refuse("binary comments in PNG text");}
     if format!=Format::Png&&!extra.color.is_empty()&&input.icc.is_none() {
@@ -764,15 +814,15 @@ fn validate_metadata(input:&Decoded,format:Format)->Result<(),String> {
 }
 fn write_metadata(out:&mut Vec<u8>,input:&Decoded,format:Format,dims:(u32,u32),rotation:usize)->Result<(),String> {
     let extra=&input.extra;
-    if input.exif.is_some()||(format==Format::Webp&&extra.density.is_some()) {let mut exif=input.exif.as_ref().map(|exif|exif.strip_prefix(b"Exif\0\0").unwrap_or(exif).to_vec()).unwrap_or_else(||b"II\x2a\0\x08\0\0\0\0\0\0\0\0\0".to_vec());normalize_exif(&mut exif,Some(dims))?;
-        if format==Format::Webp {if let Some((mut x,mut y,physical))=extra.density {if rotation%2==1 {std::mem::swap(&mut x,&mut y);}set_exif_density(&mut exif,x,y,physical)?;}}
-        match format {Format::Jpeg=>{let mut body=b"Exif\0\0".to_vec();body.extend(exif);insert_jpeg_metadata(out,jpeg_segment(0xe1,&body)?);},Format::Png=>{out.splice(33..33,png_chunk(b"eXIf",&exif));},Format::Webp=>webp_metadata(out,b"EXIF",&exif,dims)?,_=>unreachable!()}
+    if input.exif.is_some()||(matches!(format,Format::Webp|Format::WebpLossy)&&extra.density.is_some()) {let mut exif=input.exif.as_ref().map(|exif|exif.strip_prefix(b"Exif\0\0").unwrap_or(exif).to_vec()).unwrap_or_else(||b"II\x2a\0\x08\0\0\0\0\0\0\0\0\0".to_vec());normalize_exif(&mut exif,Some(dims))?;
+        if matches!(format,Format::Webp|Format::WebpLossy) {if let Some((mut x,mut y,physical))=extra.density {if rotation%2==1 {std::mem::swap(&mut x,&mut y);}set_exif_density(&mut exif,x,y,physical)?;}}
+        match format {Format::Jpeg=>{let mut body=b"Exif\0\0".to_vec();body.extend(exif);insert_jpeg_metadata(out,jpeg_segment(0xe1,&body)?);},Format::Png=>{out.splice(33..33,png_chunk(b"eXIf",&exif));},Format::Webp|Format::WebpLossy=>webp_metadata(out,b"EXIF",&exif,dims)?,_=>unreachable!()}
     }
     let fields=if format==Format::Png {&[][..]}else{extra.descriptive.as_slice()};
     if let Some(xmp)=updated_xmp(extra.xmp.as_deref(),fields,dims)? {match format {
         Format::Jpeg=>{let mut body=XMP_JPEG.to_vec();body.extend(&xmp);insert_jpeg_metadata(out,jpeg_segment(0xe1,&body)?);},
         Format::Png=>{let mut body=XMP_PNG.to_vec();body.extend([0,0,0,0,0]);body.extend(&xmp);out.splice(33..33,png_chunk(b"iTXt",&body));},
-        Format::Webp=>webp_metadata(out,b"XMP ",&xmp,dims)?,_=>unreachable!()
+        Format::Webp|Format::WebpLossy=>webp_metadata(out,b"XMP ",&xmp,dims)?,_=>unreachable!()
     }}
     if format==Format::Png {for field in &extra.descriptive{out.splice(33..33,field.raw.iter().copied());}}
     for comment in &extra.comments {match format {
@@ -803,7 +853,7 @@ fn write_metadata(out:&mut Vec<u8>,input:&Decoded,format:Format,dims:(u32,u32),r
                     if marker==0xe0&&n>=16&&out[pos+4..].starts_with(b"JFIF\0") {out[pos+11]=unit;out[pos+12..pos+14].copy_from_slice(&x.to_be_bytes());out[pos+14..pos+16].copy_from_slice(&y.to_be_bytes());found=true;break;}pos+=2+n;
                 }
                 if !found {let mut body=b"JFIF\0\x01\x02".to_vec();body.push(unit);body.extend(x.to_be_bytes());body.extend(y.to_be_bytes());body.extend([0,0]);out.splice(2..2,jpeg_segment(0xe0,&body)?);}
-            },Format::Webp=>{},_=>unreachable!()
+            },Format::Webp|Format::WebpLossy=>{},_=>unreachable!()
         }
     }
     Ok(())
@@ -1199,7 +1249,16 @@ pub(super) fn write_image_with_commit_reporting(path: &Path, bytes: &[u8], repla
     let preservation = if replace { Some(EditPublicationMetadata::capture(path)?) } else { None };
     let stage = publication_stage(path, other, configured, report)?;
     let result = (|| -> Result<bool, String> {
-        let mut tmp = tempfile::NamedTempFile::new_in(stage.path()).map_err(err)?;
+        let mut builder = tempfile::Builder::new();
+        #[cfg(unix)]
+        if !replace {
+            use std::os::unix::fs::PermissionsExt;
+            // Both stage roots are private directories. Ask the kernel for
+            // ordinary file permissions at creation, so the process umask
+            // applies without reading or changing the process-global umask.
+            builder.permissions(fs::Permissions::from_mode(0o666));
+        }
+        let mut tmp = builder.tempfile_in(stage.path()).map_err(err)?;
         for chunk in bytes.chunks(1024 * 1024) {
             check()?; tmp.write_all(chunk).map_err(err)?;
             #[cfg(test)] fallback_checkpoint("writing", stage.path());
@@ -1469,7 +1528,7 @@ mod tests {
     const FALLBACK_FIXTURE: &str = "TONEPOET_EDIT_IMAGE_FALLBACK_FIXTURE";
     fn fallback_child(root: &Path, test: &str, mode: &str) -> std::process::Command {
         let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
-        cmd.arg("--exact").arg(test).arg("--nocapture")
+        cmd.stdin(std::process::Stdio::null()).arg("--exact").arg(test).arg("--nocapture")
             .env(FALLBACK_FIXTURE, root)
             .env("TONEPOET_FILE_OPERATION_JOURNAL_DIR", root.join("journal"))
             .env("TONEPOET_CONCURRENCY_DIR", root.join("coordination"))
@@ -1479,6 +1538,57 @@ mod tests {
             .env_remove("TONEPOET_EDIT_IMAGE_FALLBACK_AFTER");
         cmd
     }
+    #[cfg(unix)]
+    #[test]
+    fn image_publication_honors_umask_on_both_staging_paths() {
+        use std::os::unix::fs::PermissionsExt;
+        const TEST: &str = "tui::edit_image_pipeline::tests::image_publication_honors_umask_on_both_staging_paths";
+        if let Some(root) = std::env::var_os(FALLBACK_FIXTURE) {
+            let root = PathBuf::from(root);
+            // Only this single-test child changes its process-global umask.
+            let _coordination = crate::concurrency::isolated_test_coordination_root();
+            let (_, output, _, _) = fallback_fixture(&root);
+            let source = fs::read(root.join("new.png")).unwrap();
+            let replacement = fs::read(output.join("cover.png")).unwrap();
+            let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+            let original_mask = unsafe { libc::umask(0o002) };
+            for (mask, expected) in [(0o002, 0o664), (0o077, 0o600)] {
+                unsafe { libc::umask(mask); }
+                for fallback in [false, true] {
+                    let root_path = root.join("private");
+                    let roots = if fallback { vec![] } else { vec![root_path.clone()] };
+                    let path = output.join(format!("new-{mask:o}-{fallback}.png"));
+                    with_test_stage_roots(roots, || {
+                        let observe = || {
+                            // Called after the staging file exists, before publishing it.
+                            assert_eq!(fallback_stage_in(&output).is_some(), fallback);
+                            Ok(())
+                        };
+                        assert!(write_image_with_commit(&path, &source, false, None, None, &|| Ok(()), &observe).unwrap());
+                        let ordinary = root.join(format!("ordinary-{mask:o}-{fallback}"));
+                        fs::OpenOptions::new().write(true).create_new(true).open(&ordinary).unwrap();
+                        assert_eq!(mode(&ordinary), expected);
+                        assert_eq!(mode(&path), expected, "new image, fallback={fallback}");
+                        assert_eq!(fs::read(&path).unwrap(), source);
+                        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+                        assert!(write_image_with_commit(&path, &replacement, true, None, None, &|| Ok(()), &observe).unwrap());
+                        assert_eq!(mode(&path), 0o640, "replacement, fallback={fallback}");
+                        assert_eq!(fs::read(&path).unwrap(), replacement);
+                        assert!(!write_image_with_commit(&path, &replacement, true, None, None, &|| Ok(()), &|| Ok(())).unwrap());
+                        assert_eq!(mode(&path), 0o640);
+                        assert!(fallback_stage_in(&output).is_none());
+                    });
+                }
+            }
+            unsafe { libc::umask(original_mask); }
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let status = fallback_child(root.path(), TEST, "permissions")
+            .stdin(std::process::Stdio::null()).status().unwrap();
+        assert!(status.success(), "isolated permission test failed: {status}");
+    }
+
     fn fallback_fixture(root: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
         let album = root.join("album"); let output = root.join("output");
         for dir in [&album, &output] {
@@ -1875,6 +1985,79 @@ mod tests {
     fn scan_5000_to_1080_png_and_jpeg(){let dir=tempfile::tempdir().unwrap();let mut s=Settings::new(false);s.long=1080;for format in [Format::Png,Format::Jpeg]{let path=dir.path().join(format!("scan.{}",format.extension()));let pixels=image::RgbImage::from_fn(5000,5000,|x,y|image::Rgb([(x%256) as u8,(y%256) as u8,((x+y)%256) as u8]));DynamicImage::ImageRgb8(pixels).save_with_format(&path,format.image()).unwrap();let start=std::time::Instant::now();let input=decode(&Source::File(path)).unwrap();let decoded=start.elapsed();let e=encode(&input,&s).unwrap();assert_eq!(e.geometry.target,(1080,1080));assert_eq!(image::load_from_memory(&e.bytes).unwrap().width(),1080);eprintln!("{:?}: decode {:?}, encode {:?}",format,decoded,start.elapsed()-decoded);}}
 
     #[test]
+    fn lossy_webp_roundtrip_quality_alpha_and_publication() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("source.png");
+        // Deterministic textured grayscale avoids chroma subsampling dominating
+        // the quality comparison. Vary alpha independently of RGB.
+        let pixels = RgbaImage::from_fn(128, 96, |x, y| {
+            let v = ((x * 37 + y * 19 + (x * y) % 127) % 256) as u8;
+            Rgba([v, v, v, (64 + (x * 7 + y * 3) % 192) as u8])
+        });
+        pixels.save(&path).unwrap();
+        let mut input = decode(&Source::File(path.clone())).unwrap();
+        // A minimal RGB profile-shaped payload tests the container transport;
+        // it is not a color-management transform or a claim of ICC conformance.
+        let mut icc = vec![0u8; 132];
+        icc[..4].copy_from_slice(&132u32.to_be_bytes());
+        icc[16..20].copy_from_slice(b"RGB ");icc[36..40].copy_from_slice(b"acsp");
+        input.icc = Some(icc.clone());
+        let mut settings = Settings::new(false);
+        settings.mode = Mode::Off;settings.format = Format::WebpLossy;
+        settings.metadata = Metadata::Icc;
+        assert_eq!(settings.webp_quality, 85);
+        let mut sizes = Vec::new();let mut errors = Vec::new();
+        for quality in [15, 95] {
+            settings.webp_quality = quality;
+            let encoded = encode(&input, &settings).unwrap();
+            assert_eq!(encoded.format, Format::WebpLossy);
+            assert_eq!(encode(&input, &settings).unwrap().bytes, encoded.bytes);
+            let data = encoded.bytes.as_slice();
+            assert_eq!(&data[..4], b"RIFF");assert_eq!(&data[8..12], b"WEBP");
+            assert_eq!(le32(&data[4..8]) as usize + 8, data.len());
+            let mut pos = 12;let mut chunks = Vec::new();
+            while pos + 8 <= data.len() {
+                let len = le32(&data[pos+4..pos+8]) as usize;
+                chunks.push(&data[pos..pos+4]);pos += 8 + len + len % 2;
+            }
+            assert_eq!(pos, data.len());
+            assert_eq!(chunks, vec![b"VP8X".as_slice(), b"ICCP", b"ALPH", b"VP8 "]);
+            let dest = d.path().join(format!("quality-{quality}.webp"));
+            // Exercise the actual publication path without touching the real cache.
+            with_test_stage_roots(vec![d.path().join("private")], || {
+                // The private root must not be inside the protected output parent.
+                // Use an isolated sibling instead, below the test temp directory.
+                let out = d.path().join("out");fs::create_dir_all(&out).unwrap();
+                let dest = out.join(dest.file_name().unwrap());
+                assert!(write_image_with_commit(&dest, data, false, None, None, &|| Ok(()), &|| Ok(())).unwrap());
+                let decoded = decode(&Source::File(dest)).unwrap();
+                assert_eq!(decoded.icc.as_deref(), Some(icc.as_slice()));
+                assert_eq!(decoded.format, Format::WebpLossy);
+                assert_eq!(Settings::new(false).resolved_format(decoded.format), Format::WebpLossy);
+                let actual = decoded.pixels.to_rgba8();
+                assert_eq!(actual.dimensions(), pixels.dimensions());
+                let mut error = 0u64;
+                for (a, b) in actual.pixels().zip(pixels.pixels()) {
+                    assert_eq!(a[3], b[3]);
+                    error += u64::from(a[0].abs_diff(b[0])).pow(2);
+                }
+                errors.push(error);sizes.push(data.len());
+            });
+        }
+        assert!(sizes[1] > sizes[0], "higher quality must change encoded size: {sizes:?}");
+        assert!(errors[1] < errors[0], "higher quality must lower fixture error: {errors:?}");
+        // Opaque simple VP8 needs a new VP8X header for ICC metadata.
+        let opaque = RgbaImage::from_pixel(8, 8, Rgba([30, 40, 50, 255]));
+        let mut bytes = encode_lossy_webp(&opaque, 85).unwrap();
+        assert_eq!(&bytes[12..16], b"VP8 ");
+        webp_metadata(&mut bytes, b"ICCP", &icc, (8,8)).unwrap();
+        assert_eq!(&bytes[12..16], b"VP8X");assert_eq!(bytes[20], 0x20);
+        assert_eq!(&bytes[30..34], b"ICCP");
+        assert_eq!(image::load_from_memory(&bytes).unwrap().width(), 8);
+    }
+
+    #[test]
     fn png_descriptions_survive_jpeg_and_webp_conversion() {
         let d=tempfile::tempdir().unwrap();let path=d.path().join("source.png");
         DynamicImage::new_rgb8(32,16).save(&path).unwrap();let mut png=fs::read(&path).unwrap();
@@ -1883,7 +2066,7 @@ mod tests {
         let mut description=b"Description\0\0\0\0\0".to_vec();description.extend("Artwork \u{266a}".as_bytes());png.splice(33..33,png_chunk(b"iTXt",&description));fs::write(&path,png).unwrap();
         let input=decode(&Source::File(path)).unwrap();assert_eq!(input.extra.descriptive.len(),3);
         let mut settings=Settings::new(false);settings.mode=Mode::Off;
-        for format in [Format::Jpeg,Format::Webp,Format::Png]{settings.format=format;for policy in [Metadata::All,Metadata::Icc,Metadata::Strip]{settings.metadata=policy;let output=encode(&input,&settings).unwrap();let extra=container_metadata(&output.bytes,format).unwrap();
+        for format in [Format::Jpeg,Format::Webp,Format::WebpLossy,Format::Png]{settings.format=format;for policy in [Metadata::All,Metadata::Icc,Metadata::Strip]{settings.metadata=policy;let output=encode(&input,&settings).unwrap();let extra=container_metadata(&output.bytes,format).unwrap();
             if policy!=Metadata::All{assert!(extra.descriptive.is_empty());assert!(extra.xmp.is_none());}
             else if format==Format::Png{for original in &input.extra.descriptive{assert!(extra.descriptive.iter().any(|field|field.raw==original.raw));}}
             else{let xmp=String::from_utf8(extra.xmp.unwrap()).unwrap();assert!(xmp.contains("Café &amp; &lt;Music&gt;"));assert!(xmp.contains("<dc:creator><rdf:Seq><rdf:li>Artist</rdf:li>"));assert!(xmp.contains("Artwork \u{266a}"));assert!(xmp.contains("<dc:description><rdf:Alt>"));}
@@ -1896,7 +2079,7 @@ mod tests {
         let packet=br#"<?xpacket begin=""?><x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:t="http://ns.adobe.com/tiff/1.0/" xmlns:e="http://ns.adobe.com/exif/1.0/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:xmp="http://ns.adobe.com/xap/1.0/" t:ImageWidth="32" t:Orientation='6'><e:PixelXDimension>32</e:PixelXDimension><e:PixelYDimension>16</e:PixelYDimension><dc:title><rdf:Alt><rdf:li xml:lang="x-default">ImageWidth &amp; Orientation</rdf:li></rdf:Alt></dc:title><xmp:Thumbnails><rdf:Alt><rdf:li>OLD THUMBNAIL</rdf:li></rdf:Alt></xmp:Thumbnails><rdf:Description xmlns:t="urn:unrelated" t:ImageWidth="123"/></rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end="w"?>"#;
         let mut body=XMP_JPEG.to_vec();body.extend(packet);insert_jpeg_metadata(&mut jpeg,jpeg_segment(0xe1,&body).unwrap());fs::write(&path,jpeg).unwrap();let input=decode(&Source::File(path)).unwrap();
         let mut settings=Settings::new(false);settings.metadata=Metadata::All;settings.long=16;
-        for format in [Format::Jpeg,Format::Png,Format::Webp]{settings.format=format;for mode in [Mode::Off,Mode::Long]{settings.mode=mode;let e=encode(&input,&settings).unwrap();let dims=e.geometry.target;let extra=container_metadata(&e.bytes,format).unwrap();let xml=String::from_utf8(extra.xmp.unwrap()).unwrap();
+        for format in [Format::Jpeg,Format::Png,Format::Webp,Format::WebpLossy]{settings.format=format;for mode in [Mode::Off,Mode::Long]{settings.mode=mode;let e=encode(&input,&settings).unwrap();let dims=e.geometry.target;let extra=container_metadata(&e.bytes,format).unwrap();let xml=String::from_utf8(extra.xmp.unwrap()).unwrap();
             assert!(xml.contains(&format!("t:ImageWidth=\"{}\"",dims.0)));assert!(xml.contains("t:Orientation='1'"));assert!(xml.contains(&format!("<e:PixelXDimension>{}</e:PixelXDimension>",dims.0)));assert!(xml.contains(&format!("<e:PixelYDimension>{}</e:PixelYDimension>",dims.1)));assert!(xml.contains("ImageWidth &amp; Orientation"));assert!(xml.contains("xmlns:t=\"urn:unrelated\" t:ImageWidth=\"123\""));assert!(!xml.contains("OLD THUMBNAIL"));assert!(!xml.contains("xmp:Thumbnails"));
         }}
         settings.metadata=Metadata::Icc;assert!(container_metadata(&encode(&input,&settings).unwrap().bytes,Format::Webp).unwrap().xmp.is_none());

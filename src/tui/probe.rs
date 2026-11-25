@@ -23686,10 +23686,35 @@ mod tests {
 
     #[test]
     fn editor_reads_native_ape_artwork_when_lofty_cannot() {
-        use lofty::{file::{AudioFile,TaggedFileExt},picture::{Picture,PictureType,MimeType}};
+        use lofty::picture::PictureType;
+        use crate::metadata_persistence::APE_ITEM_TYPE_BINARY;
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let (_temp,path)=copy_numbering_fixture("artwork-invalid-key.wv",APE_NUMBERING_FIXTURE);
         let mut bytes=Vec::new();image::DynamicImage::new_rgb8(8,8).write_to(&mut std::io::Cursor::new(&mut bytes),image::ImageFormat::Png).unwrap();
-        let mut tagged=lofty::read_from_path(&path).unwrap();tagged.primary_tag_mut().unwrap().push_picture(Picture::new_unchecked(PictureType::CoverFront,Some(MimeType::Png),None,bytes.clone()));tagged.save_to_path(&path,lofty::config::WriteOptions::default()).unwrap();append_invalid_key_ape_item(&path);
+        // APEv2 artwork is a binary item: filename, NUL, image bytes.
+        // Build the physical tag independently of Lofty's tag projection.
+        let native=read_native_ape_tag(&path).unwrap().expect("fixture APE tag");
+        let mut payload=b"cover.png\0".to_vec();payload.extend_from_slice(&bytes);
+        let mut cover=(payload.len() as u32).to_le_bytes().to_vec();
+        cover.extend_from_slice(&APE_ITEM_TYPE_BINARY.to_le_bytes());
+        cover.extend_from_slice(b"Cover Art (Front)\0");cover.extend_from_slice(&payload);
+        let mut items=native.items.iter().map(|item|item.raw.clone()).collect::<Vec<_>>();
+        items.push(cover.clone());
+        let replacement=serialize_native_ape_tag(&items,native.had_header).unwrap();
+        let mut file=std::fs::read(&path).unwrap();
+        file.splice(native.replace_start as usize..native.footer_end as usize,replacement);
+        std::fs::write(&path,file).unwrap();
+        assert!(lofty::read_from_path(&path).is_ok(), "healthy fixture must be readable before corruption");
+        // Reserved ID3 is an illegal APE key in Lofty 0.21.1, not merely
+        // a non-ASCII key that its BestAttempt reader might tolerate.
+        let invalid=inject_invalid_ape_key_item_for_test(&path,b"ID3",b"1977").unwrap();
+        assert!(lofty::read_from_path(&path).is_err(),"fixture must actually defeat Lofty");
+        let physical=read_native_ape_tag(&path).unwrap().unwrap();
+        assert!(physical.items.iter().any(|item|item.raw==cover && item.item_type()==APE_ITEM_TYPE_BINARY && item.value==payload));
+        assert!(physical.items.iter().any(|item|item.raw==invalid && item.key.is_none()));
+        // Malformed native key makes the normal projection untrustworthy.
+        // Prove the actual production dispatch, not merely the lower-level parser.
+        assert!(matches!(read_artwork_container(&path).unwrap(),ArtworkContainer::NativeApe(_)));
         assert_eq!(read_embedded_picture_bytes(&path,PictureType::CoverFront).unwrap(),bytes);
         let (pictures,_,_)=editor_pictures(&path).unwrap();let p=pictures.iter().find(|p|p.picture.pic_type()==PictureType::CoverFront).unwrap();assert_eq!(p.picture.data(),bytes.as_slice());assert!(p.tag.is_none());
     }

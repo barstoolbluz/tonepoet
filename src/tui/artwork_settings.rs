@@ -344,23 +344,34 @@ pub(super) fn fill(f: &mut Frame, rect: Rect, color: Color) {
 }
 
 pub(super) fn frame(f: &mut Frame, area: Rect, title: &str, rules: &[u16], theme: Theme) {
+    frame_with_size_glyph(f, area, title, rules, theme, true);
+}
+
+/// Fixed-size editor chrome has no inert maximize affordance.
+pub(super) fn fixed_frame(f: &mut Frame, area: Rect, title: &str, rules: &[u16], theme: Theme) {
+    frame_with_size_glyph(f, area, title, rules, theme, false);
+}
+
+fn frame_with_size_glyph(f: &mut Frame, area: Rect, title: &str, rules: &[u16], theme: Theme, size_glyph: bool) {
     // Style-only blocks preserve old symbols. Clear once for all three modal
     // frames; the subsequent region fills are intentionally style-only.
     f.render_widget(Clear, area);
     fill(f, area, theme.panel_bg);
-    paint(f, area, 0, 0, "┌", theme.title, theme.panel_bg);
+    let border_paint: fn(&mut Frame, Rect, u16, u16, &str, Color, Color) = if size_glyph { paint } else { paint_raw };
+    border_paint(f, area, 0, 0, "┌", theme.title, theme.panel_bg);
     fill(f, Rect::new(area.x + 1, area.y, area.width - 2, 1), theme.title);
-    paint(f, area, 1, 0, &format!("▸ {title}"), theme.panel_bg, theme.title);
-    paint(f, area, area.width - 1, 0, "┐", theme.title, theme.panel_bg);
+    if size_glyph { paint(f, area, 1, 0, &format!("▸ {title}"), theme.panel_bg, theme.title); }
+    else { paint(f, area, 3, 0, title, theme.panel_bg, theme.title); }
+    border_paint(f, area, area.width - 1, 0, "┐", theme.title, theme.panel_bg);
     for y in 1..area.height - 1 {
         if rules.contains(&y) {
-            paint(f, area, 0, y, &format!("├{}┤", "─".repeat((area.width - 2) as usize)), theme.title, theme.panel_bg);
+            border_paint(f, area, 0, y, &format!("├{}┤", "─".repeat((area.width - 2) as usize)), theme.title, theme.panel_bg);
         } else {
-            paint(f, area, 0, y, "│", theme.title, theme.panel_bg);
-            paint(f, area, area.width - 1, y, "│", theme.title, theme.panel_bg);
+            border_paint(f, area, 0, y, "│", theme.title, theme.panel_bg);
+            border_paint(f, area, area.width - 1, y, "│", theme.title, theme.panel_bg);
         }
     }
-    paint(f, area, 0, area.height - 1, &format!("└{}┘", "─".repeat((area.width - 2) as usize)), theme.title, theme.panel_bg);
+    border_paint(f, area, 0, area.height - 1, &format!("└{}┘", "─".repeat((area.width - 2) as usize)), theme.title, theme.panel_bg);
 }
 
 fn button(f: &mut Frame, area: Rect, x: u16, y: u16, width: u16, label: &str,
