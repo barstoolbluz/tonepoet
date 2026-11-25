@@ -13,6 +13,8 @@ pub mod bookmark_workers;
 pub mod browse;
 pub mod browse_artwork;
 pub mod artwork_settings;
+mod edit_image;
+mod edit_image_pipeline;
 mod kitty_transport;
 mod sixel_tmux;
 mod tmux_images;

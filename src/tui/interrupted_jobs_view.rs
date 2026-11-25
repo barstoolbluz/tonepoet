@@ -468,6 +468,10 @@ fn job_display_name(entry: &RecoveryEntry) -> String {
                 .unwrap_or_else(|| source.to_string());
         }
     }
+    if record.is_edit_image_cleanup() {
+        return record.temp_artifacts.first().and_then(|artifact| artifact.destination.file_name())
+            .map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "Edit Image".into());
+    }
     let Some(first) = record.mappings.first() else { return entry.kind_label().into(); };
     let name = first.source.file_name().unwrap_or(first.source.as_os_str()).to_string_lossy();
     if record.mappings.len() > 1 { format!("{} +{}", name, record.mappings.len() - 1) }
@@ -522,6 +526,9 @@ fn entry_progress(entry: &RecoveryEntry) -> String {
             .map(|ratio| format!("{}%", (ratio * 100.0).round() as u64))
             .unwrap_or_else(|| "still running".into());
     }
+    if entry.record.as_ref().is_some_and(DurableFileTaskRecord::is_edit_image_cleanup) {
+        return "cleanup pending".into();
+    }
     let total = entry.item_count();
     if total == 0 { return "items unknown".into(); }
     let unit = if entry.kind_label() == "extract" { "tracks" } else { "items" };
@@ -543,6 +550,13 @@ fn job_status(entry: &RecoveryEntry, entries: &[RecoveryEntry]) -> (String, Stri
             "It can't tell which files were touched. Some may be partial.".into());
     };
     let state = ui_state(entry, entries);
+    if record.is_edit_image_cleanup() {
+        return if entry.is_live() {
+            ("Edit Image worker owns its staging.".into(), "Cleanup follows worker termination.".into())
+        } else {
+            ("Edit Image staging cleanup remains.".into(), "Tidy up removes staging only; published results are preserved.".into())
+        };
+    }
     let ago = age_label(record.updated_unix_ms);
     let unit = if record.is_native_extraction() { "tracks" } else { "items" };
     let completed = entry.completed_count();

@@ -103,6 +103,7 @@ impl RecoveryEntry {
 
     pub(super) fn kind_label(&self) -> &'static str {
         match self.record.as_ref() {
+            Some(record) if record.is_edit_image_cleanup() => "edit image",
             Some(record) if record.is_native_extraction() => "extract",
             Some(record) if record.is_move => "move",
             Some(_) => "copy",
@@ -112,6 +113,7 @@ impl RecoveryEntry {
 
     fn item_count(&self) -> usize {
         self.record.as_ref().map_or(0, |record| {
+            if record.is_edit_image_cleanup() { return record.temp_artifacts.len(); }
             if record.is_native_extraction() {
                 return super::native_extract_task::recorded_selection_counts(record)
                     .map_or(0, |(_, _, total)| total);
@@ -335,6 +337,10 @@ pub struct RecoveryUiState {
     pub incomplete_sizes: BTreeMap<PathBuf, Option<u64>>,
     pub size_requests: BTreeSet<PathBuf>,
     pub discard_in_flight: BTreeSet<PathBuf>,
+    /// One automatic cleanup attempt per interrupted Edit Image record per
+    /// session. An unavailable endpoint stays visible for ordinary Tidy up;
+    /// do not repeatedly probe a disconnected network/removable volume.
+    edit_image_cleanup_attempted: BTreeSet<PathBuf>,
     /// Confirmed stop-and-undo requests wait for the worker's durable lease
     /// to be released before entering the existing discard machinery.
     pub stop_and_undo_pending: BTreeSet<PathBuf>,
@@ -361,6 +367,7 @@ impl Default for RecoveryUiState {
             incomplete_sizes: BTreeMap::new(),
             size_requests: BTreeSet::new(),
             discard_in_flight: BTreeSet::new(),
+            edit_image_cleanup_attempted: BTreeSet::new(),
             stop_and_undo_pending: BTreeSet::new(),
             stop_requested_at: BTreeMap::new(),
             aside_in_flight: BTreeSet::new(),
@@ -763,6 +770,17 @@ pub fn refresh_live_observation(app: &mut AppState) -> bool {
 /// Once the worker releases its durable lease, use precisely the established
 /// discard implementation. A running process is never cleaned up underfoot.
 pub fn advance_stop_and_undo(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
+    // Cleanup-only Edit Image journals require no resume/undo decision: the
+    // original or published output is never part of the obligation. Admit
+    // them through this existing lease-gated, asynchronous discard path.
+    let cleanup = app.recovery_ui.entries.iter()
+        .filter(|entry| entry.can_discard() && entry.record.as_ref().is_some_and(DurableFileTaskRecord::is_edit_image_cleanup))
+        .map(|entry| entry.journal_path.clone()).collect::<Vec<_>>();
+    for path in cleanup {
+        if app.recovery_ui.edit_image_cleanup_attempted.insert(path.clone()) {
+            app.recovery_ui.stop_and_undo_pending.insert(path);
+        }
+    }
     let pending = app.recovery_ui.stop_and_undo_pending.iter().cloned().collect::<Vec<_>>();
     for path in pending {
         let selected = app.recovery_ui.entries.iter().find(|entry| entry.journal_path == path);
@@ -1314,6 +1332,26 @@ pub fn complete_discard(
     result: Result<super::file_task_runtime::RecoveryDiscardSummary, String>,
 ) {
     app.recovery_ui.discard_in_flight.remove(&journal_path);
+    let edit_image_cleanup = app.recovery_ui.edit_image_cleanup_attempted.contains(&journal_path)
+        || app.recovery_ui.entries.iter().any(|entry| entry.journal_path == journal_path
+            && entry.record.as_ref().is_some_and(DurableFileTaskRecord::is_edit_image_cleanup));
+    if edit_image_cleanup {
+        let succeeded = result.is_ok();
+        refresh_from_runtime(app);
+        if succeeded {
+            app.recovery_ui.edit_image_cleanup_attempted.remove(&journal_path);
+            if app.recovery_ui.entries.is_empty() && matches!(app.active_overlay, ActiveOverlay::FileRecovery) {
+                app.active_overlay = ActiveOverlay::None;
+            }
+            app.set_status("Interrupted Edit Image staging cleaned up; published files preserved");
+        } else if let Err(error) = result {
+            // An automatic attempt must not interrupt another modal editor.
+            // The normal Tidy up action remains available after reattachment.
+            app.recovery_ui.edit_image_cleanup_attempted.insert(journal_path);
+            app.set_status(format!("Edit Image cleanup pending; use Interrupted jobs after the destination is available: {}", user_safe_discard_error(&error)));
+        }
+        return;
+    }
     match result {
         Ok(summary) => {
             refresh_from_runtime(app);

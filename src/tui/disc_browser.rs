@@ -1810,12 +1810,12 @@ fn destination_directory_writable(path: &Path) -> bool {
 }
 
 #[cfg(unix)]
-fn same_filesystem_paths(a: &Path, b: &Path) -> bool {
+pub(super) fn same_filesystem_paths(a: &Path, b: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     match (fs::metadata(a), fs::metadata(b)) { (Ok(a), Ok(b)) => a.dev() == b.dev(), _ => false }
 }
 #[cfg(windows)]
-fn same_filesystem_paths(a: &Path, b: &Path) -> bool {
+pub(super) fn same_filesystem_paths(a: &Path, b: &Path) -> bool {
     // GetFileInformationByHandle accepts directory handles opened with
     // FILE_FLAG_BACKUP_SEMANTICS. Neither that flag nor access_mode(0)
     // requires nightly Rust or read permission on the directory contents.
@@ -1892,7 +1892,7 @@ fn same_filesystem_paths(a: &Path, b: &Path) -> bool {
     }
 }
 #[cfg(not(any(unix, windows)))]
-fn same_filesystem_paths(_a: &Path, _b: &Path) -> bool { false }
+pub(super) fn same_filesystem_paths(_a: &Path, _b: &Path) -> bool { false }
 
 #[cfg(all(test, windows))]
 mod windows_native_volume_tests {

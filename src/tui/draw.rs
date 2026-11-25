@@ -133,7 +133,7 @@ pub fn draw_ui(f: &mut Frame, app: &mut AppState) {
         && app.browse_artwork.popup_open
         && matches!(app.active_overlay,
             super::app::ActiveOverlay::None | super::app::ActiveOverlay::ContextMenu { .. }
-            | super::app::ActiveOverlay::ArtworkSettings(_))
+            | super::app::ActiveOverlay::ArtworkSettings(_) | super::app::ActiveOverlay::EditImage(_))
     {
         super::browse_artwork::draw_popup(f, app, theme);
     }
@@ -177,6 +177,7 @@ pub fn draw_ui(f: &mut Frame, app: &mut AppState) {
             // Do not consume its one-shot worker frame until it is delivered.
             if native == Some(super::tmux_images::NativeProtocol::Kitty) {
                 app.browse_artwork.kitty_upload_withheld();
+                if let super::app::ActiveOverlay::EditImage(state) = &mut app.active_overlay { state.kitty_upload_withheld(); }
             }
             super::kitty_transport::suppress_unverified_tmux_graphics(f.buffer_mut());
         }

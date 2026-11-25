@@ -375,7 +375,7 @@ impl TemplateBuilderState {
             for cat in categories {
                 if idx < cat.tokens.len() {
                     let token = cat.tokens[idx];
-                    self.template_input.insert_string(&format!("%{}%", token));
+                    insert_token(&mut self.template_input,token);
                     return;
                 }
                 idx -= cat.tokens.len();
@@ -389,6 +389,9 @@ impl TemplateBuilderState {
         }
     }
 }
+
+/// Insert a template token using the shared text-input selection semantics.
+pub(super) fn insert_token(input:&mut TextInputState, token:&str) { input.insert_string(&format!("%{token}%")); }
 
 // =========================================================================
 // Drawing

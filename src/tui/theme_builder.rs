@@ -1995,14 +1995,15 @@ fn hex_line(
     Line::from(spans)
 }
 
-fn slider_line(label: &str, value: u8, channel: usize, focused: bool, editable: bool, theme: theme::Theme) -> Line<'static> {
+pub(super) fn slider_line(label: &str, value: u8, channel: usize, focused: bool, editable: bool, theme: theme::Theme) -> Line<'static> {
     let filled = ((usize::from(value) * 18) / 255).min(18);
     let empty = 18usize.saturating_sub(filled);
     let channel_color = if editable {
         match channel {
             0 => Color::Rgb(value, 0, 0),
             1 => Color::Rgb(0, value, 0),
-            _ => Color::Rgb(0, 0, value),
+            2 => Color::Rgb(0, 0, value),
+            _ => theme.info,
         }
     } else {
         theme.text_dim

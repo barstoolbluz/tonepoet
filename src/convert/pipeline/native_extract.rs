@@ -3236,7 +3236,7 @@ fn sanitize_component(value: &str) -> String {
 /// Canonicalize the existing prefix of a not-yet-created destination. Any
 /// uncreated suffix must consist of ordinary directory/file names; this
 /// prevents `..` from bypassing the staging-outside-destination check.
-fn resolved_future_path(path: &Path) -> Result<PathBuf, String> {
+pub(crate) fn resolved_future_path(path: &Path) -> Result<PathBuf, String> {
     if !path.is_absolute() { return Err("Destination must be an absolute path".into()); }
     let ancestor = nearest_existing_ancestor(path)?;
     let mut result = fs::canonicalize(ancestor)
