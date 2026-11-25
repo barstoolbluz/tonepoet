@@ -939,7 +939,10 @@ fn acquire_dsf_write_lock(path: &Path) -> Result<(DsfWriteLock, PathBuf), String
             )?,
         )
     };
-    let (store_lock, _store_resolved) = crate::config::StoreFileLock::acquire_for_path(&resolved)
+    let lock = dsf_store_lock_path(&resolved)?;
+    let parent = lock.parent().ok_or("DSF lock storage has no parent")?;
+    crate::concurrency::create_private_dir(parent)?;
+    let store_lock = crate::config::StoreFileLock::acquire_at(parent, &resolved, lock.clone())
         .map_err(|error| {
             format!(
                 "acquire bounded DSF metadata-write lock for '{}': {error}",
@@ -1056,13 +1059,17 @@ fn legacy_tail_journal_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.tonepoet-dsf-tail.journal"))
 }
 
+fn dsf_store_lock_path(path: &Path) -> Result<PathBuf, String> {
+    let target = std::fs::canonicalize(path).map_err(|error|
+        format!("resolve DSF lock target '{}': {error}", path.display()))?;
+    let digest = crate::config::native_os_str_sha256_hex(
+        b"tonepoet-dsf-store-lock-v2\0", target.as_os_str());
+    Ok(crate::concurrency::coordination_root().join("dsf-locks")
+        .join(format!("{digest}.save.lock")))
+}
+
 pub(crate) fn write_authority_paths(path: &Path) -> Result<Vec<PathBuf>, String> {
-    let lock = crate::config::store_lock_authority_path(path).map_err(|error| {
-        format!(
-            "derive metadata-write lock authority for '{}': {error}",
-            path.display()
-        )
-    })?;
+    let lock = dsf_store_lock_path(path)?;
     let mut authorities = vec![tail_journal_path(path), lock];
     let legacy = legacy_tail_journal_path(path);
     if legacy.exists() {
@@ -2676,6 +2683,21 @@ fn recover_tail_journal(path: &Path) -> Result<bool, String> {
             path.display()
         )),
     }
+}
+
+/// Atomic replacement of a private edited copy must not invalidate a pending
+/// recovery generation on the original. Leave recovery to the existing DSF
+/// recovery surface rather than guessing or making an unrequested write.
+pub(crate) fn check_editor_replacement_ready(path: &Path) -> Result<(), String> {
+    for artifact in [tail_journal_path(path), legacy_tail_journal_path(path),
+        crate::db::Database::backup_path_for(path)] {
+        match std::fs::symlink_metadata(&artifact) {
+            Ok(_) => return Err(format!("DSF recovery is required before replacing '{}'; inspect '{}' with dsf-recover", path.display(), artifact.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(format!("inspect DSF recovery state: {error}")),
+        }
+    }
+    Ok(())
 }
 
 fn preflight_dsf_write_artifacts(path: &Path) -> Result<(), String> {

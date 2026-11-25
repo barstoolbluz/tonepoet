@@ -3295,14 +3295,16 @@ pub fn execute_context_action(
             if app.current_screen == AppScreen::Browse && !app.browse.is_in_archive() {
                 app.browse_artwork.artwork_settings_opened();
                 app.active_overlay = ActiveOverlay::EditImage(Box::new(
-                    super::edit_image::EditImageState::files(clicked, selection)));
+                    super::edit_image::EditImageState::files(clicked, selection)
+                        .with_working_root(app.config.conversion.scratch_directory.clone())));
             }
         }
         ContextAction::BrowseEditArtwork { path, embedded } => {
             if app.current_screen == AppScreen::Browse && !app.browse.is_in_archive() {
                 app.browse_artwork.artwork_settings_opened();
                 app.active_overlay = ActiveOverlay::EditImage(Box::new(
-                    super::edit_image::EditImageState::artwork(path, embedded)));
+                    super::edit_image::EditImageState::artwork(path, embedded)
+                        .with_working_root(app.config.conversion.scratch_directory.clone())));
             }
         }
         ContextAction::BrowseImageActions => {

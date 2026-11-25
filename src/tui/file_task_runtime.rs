@@ -308,6 +308,12 @@ pub struct DurableFileTaskRecord {
 }
 
 impl DurableFileTaskRecord {
+    /// Edit Image owns only disposable, independently published staging trees.
+    /// No output or original file is a recovery/rollback candidate.
+    pub fn is_edit_image_cleanup(&self) -> bool {
+        self.job.get("edit_image_cleanup").and_then(serde_json::Value::as_bool) == Some(true)
+    }
+
     pub fn is_native_extraction(&self) -> bool {
         self.job.get("native_extraction").is_some_and(serde_json::Value::is_object)
     }
@@ -585,6 +591,10 @@ fn permits_same_process_recovery_handoff(
     journal_path: &Path,
     record: &DurableFileTaskRecord,
 ) -> bool {
+    // Edit Image uses an in-process worker, not a reaped helper with a
+    // surviving controller handle. Never grant recovery while its lease is
+    // still held, including during cleanup and terminal retirement.
+    if record.is_edit_image_cleanup() { return false; }
     let root = journal_path.parent().unwrap_or_else(|| Path::new("."));
     if abandon_marker_path(root, &record.job_id, record.generation).exists() {
         return true;
@@ -620,6 +630,47 @@ impl FileTaskJournalHandle {
         retry_plan: Option<BrowsePasteRetryPlan>,
         job: serde_json::Value,
     ) -> Result<Self, String> {
+        Self::create_inner(job_id, generation, session_id, is_move, verification,
+            stall_timeout_secs, mappings, retry_plan, job, None)
+    }
+
+    /// Reserve one destination-volume staging tree before it exists. Seed the
+    /// normal durable snapshot with the exact cleanup obligation and attached
+    /// endpoint, rather than the non-fsync per-file transfer hint. Only the
+    /// staging subtree is reserved: Edit Image already owns the actual output
+    /// mutation, and recovery must never acquire rollback authority over it.
+    pub(super) fn create_edit_image_stage(
+        artifact: DurableTempArtifact,
+        endpoint: DurableEndpointIdentity,
+    ) -> Result<Self, String> {
+        let job_id = artifact.owner_job_id.clone();
+        let generation = artifact.owner_generation;
+        if artifact.kind != DurableTempArtifactKind::Directory
+            || !artifact.is_safe_private_artifact(&job_id)
+            || endpoint.role != DurableEndpointRole::Destination
+            || artifact.destination.parent() != Some(endpoint.operation_root.as_path())
+            || endpoint.anchor_path != endpoint.operation_root
+        {
+            return Err("invalid Edit Image staging cleanup identity".into());
+        }
+        Self::create_inner(job_id, generation, 0, false,
+            tui_file_picker::VerificationMode::Standard, DEFAULT_FILE_TASK_STALL_TIMEOUT_SECS,
+            Vec::new(), None, serde_json::json!({"edit_image_cleanup": true}),
+            Some((artifact, endpoint)))
+    }
+
+    fn create_inner(
+        job_id: String,
+        generation: u64,
+        session_id: u64,
+        is_move: bool,
+        verification: tui_file_picker::VerificationMode,
+        stall_timeout_secs: u64,
+        mappings: Vec<tui_file_picker::PasteMapping>,
+        retry_plan: Option<BrowsePasteRetryPlan>,
+        job: serde_json::Value,
+        initial_cleanup: Option<(DurableTempArtifact, DurableEndpointIdentity)>,
+    ) -> Result<Self, String> {
         let root = file_task_journal_dir();
         create_private_journal_directory(&root)
             .map_err(|error| format!("create file-operation journal directory: {error}"))?;
@@ -633,12 +684,26 @@ impl FileTaskJournalHandle {
         let FileTaskPathAdmission {
             claims,
             admitted_mappings,
-        } = if job.get("native_extraction").is_some() {
+        } = if let Some((artifact, _)) = &initial_cleanup {
+            FileTaskPathAdmission {
+                claims: vec![PathClaim::resolve_with_semantics(&artifact.path,
+                    ClaimMode::Write, ClaimScope::Subtree, PathResolutionSemantics::NamespaceObject)?],
+                admitted_mappings: Vec::new(),
+            }
+        } else if job.get("native_extraction").is_some() {
             native_extraction_path_admission(&mappings, &job)?
         } else {
             file_task_path_admission(is_move, &mappings)?
         };
-        let admitted_destination_root = file_task_destination_root_from_job(&job, &mappings)?;
+        let admitted_destination_root = match &initial_cleanup {
+            Some((_, endpoint)) => endpoint.operation_root.clone(),
+            None => file_task_destination_root_from_job(&job, &mappings)?,
+        };
+        let cleanup_only = initial_cleanup.is_some();
+        let (temp_artifacts, endpoint_identities) = match initial_cleanup {
+            Some((artifact, endpoint)) => (vec![artifact], vec![endpoint]),
+            None => (Vec::new(), Vec::new()),
+        };
         let record = DurableFileTaskRecord {
             schema: FILE_TASK_JOURNAL_SCHEMA,
             job_id: job_id.clone(),
@@ -646,7 +711,7 @@ impl FileTaskJournalHandle {
             session_id,
             created_unix_ms: now,
             updated_unix_ms: now,
-            lifecycle: DurableFileTaskLifecycle::Planned,
+            lifecycle: if cleanup_only { DurableFileTaskLifecycle::Running } else { DurableFileTaskLifecycle::Planned },
             is_move,
             verification,
             stall_timeout_secs: stall_timeout_secs.max(1),
@@ -662,13 +727,13 @@ impl FileTaskJournalHandle {
             native_prepared_cues: Vec::new(),
             retry_plan,
             roots: Vec::new(),
-            temp_artifacts: Vec::new(),
+            temp_artifacts,
             artifact_generations: vec![generation],
             quarantine_artifacts: Vec::new(),
             endpoint_identity_protocol: true,
-            endpoint_identities: Vec::new(),
+            endpoint_identities,
             native_rename_intents: Vec::new(),
-            last_status: Some("planned".to_string()),
+            last_status: Some(if cleanup_only { "Edit Image staging" } else { "planned" }.to_string()),
             abandoned_reason: None,
             origin_owner: Some(OwnerProcessIdentity::current()),
             lease_descriptor: None,
@@ -714,6 +779,9 @@ impl FileTaskJournalHandle {
         job: serde_json::Value,
     ) -> Result<Self, String> {
         let previous = load_record(&path)?;
+        if previous.is_edit_image_cleanup() {
+            return Err("Edit Image staging can be cleaned up, not resumed".into());
+        }
         let job_uuid = uuid::Uuid::parse_str(&previous.job_id)
             .map_err(|error| format!("invalid file-operation job UUID {}: {error}", previous.job_id))?;
         let family = LeaseFamily::JournalOperation { job_id: job_uuid };
@@ -836,6 +904,10 @@ impl FileTaskJournalHandle {
         Ok(()) // self is consumed; the journal remains an inspection receipt.
     }
 
+
+    pub(super) fn mutation_claims(&self) -> &[PathClaim] {
+        match &self.lease { Some(lease) => lease.claims(), None => &[] }
+    }
 
     pub fn path(&self) -> &Path {
         &self.path
@@ -1864,7 +1936,7 @@ fn recovery_record_is_discarded(record: &DurableFileTaskRecord) -> bool {
 }
 
 pub(super) fn recovery_record_is_discard_cleanup(record: &DurableFileTaskRecord) -> bool {
-    recovery_record_is_discarding(record) || recovery_record_is_discarded(record)
+    record.is_edit_image_cleanup() || recovery_record_is_discarding(record) || recovery_record_is_discarded(record)
 }
 
 fn recovery_descriptor_path(
@@ -2348,6 +2420,7 @@ fn finish_discarded_recovery_retirement(
     super::file_task_live::retire_job_live_directories(path, &record.job_id);
     match fs::remove_file(path) {
         Ok(()) => {
+            #[cfg(unix)]
             if let Some(parent) = path.parent() {
                 File::open(parent)
                     .and_then(|dir| dir.sync_all())
@@ -2530,11 +2603,12 @@ pub fn startup_file_task_recovery_inventory() -> StartupFileTaskRecoveryInventor
 
 /// A native extraction completed while the UI was closed leaves a retained
 /// result in Recovery. It is inspectable, but must not reserve the serial
-/// file-task slot or stop unrelated copy/move work.
+/// file-task slot or stop unrelated copy/move work. Edit Image cleanup owns
+/// only its exact staging subtree, not a slot in that transfer queue.
 pub fn recovery_reservation_count(records: &[RecoverySurfaceRecord]) -> usize {
     records.iter().filter(|entry| {
-        !entry.record.as_ref().is_some_and(|record| record.is_native_extraction()
-            && record.lifecycle == DurableFileTaskLifecycle::Completed)
+        !entry.record.as_ref().is_some_and(|record| record.is_edit_image_cleanup()
+            || (record.is_native_extraction() && record.lifecycle == DurableFileTaskLifecycle::Completed))
     }).count()
 }
 

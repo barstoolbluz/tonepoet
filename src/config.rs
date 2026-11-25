@@ -773,12 +773,18 @@ impl StoreFileLock {
     }
 
     fn acquire(parent: &Path, target_path: &Path) -> anyhow::Result<Self> {
+        Self::acquire_at(parent, target_path, store_lock_path(parent, target_path))
+    }
+
+    /// Library writers must not create persistent lock files in album folders.
+    /// The caller supplies a stable, private lock pathname derived from the
+    /// canonical target, not a disposable temp name.
+    pub(crate) fn acquire_at(parent: &Path, target_path: &Path, lock_path: PathBuf) -> anyhow::Result<Self> {
         // StoreFileLock is deliberately a same-store serialization primitive,
         // not a user-library path-registry boundary. Library metadata callers
         // acquire their complete shared mutation set before entering backend
         // writers; config, preset, and secret-store users retain only this
         // established local/cross-process store lock.
-        let lock_path = store_lock_path(parent, target_path);
         validate_lock_path_before_open(&lock_path)?;
 
         let file = match open_store_lock(&lock_path, true) {

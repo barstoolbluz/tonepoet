@@ -1192,11 +1192,22 @@ enum ArtworkContainer {
 
 fn read_artwork_container(path: &Path) -> Result<ArtworkContainer, String> {
     recover_metadata_before_read(path)?;
+    // Lofty's relaxed reader may succeed without projecting artwork or may
+    // discard malformed APE keys. For the actual native APE tail carriers,
+    // inspect the bounded physical tag before granting any writer authority.
+    if is_native_ape_tail_carrier(path) && validate_native_ape_carrier_magic(path).is_ok() {
+        if let Ok(Some(native)) = read_native_ape_tag(path) {
+            if native.items.iter().any(|item| item.key.is_none()) || !native.repair_warnings.is_empty() {
+                return read_neutral_native_ape_fallback(path).map(ArtworkContainer::NativeApe);
+            }
+        }
+    }
     match lofty::read_from_path(path) {
         Ok(tagged) => Ok(ArtworkContainer::Tagged(tagged, !rf64_metadata::has_rf64_magic(path))),
         Err(_) if rf64_metadata::has_rf64_magic(path) =>
             rf64_metadata::read_tags(path).map(|tagged| ArtworkContainer::Tagged(tagged, false)),
-        Err(error) if native_ape_fallback_is_eligible(path, &error) =>
+        Err(error) if native_ape_fallback_is_eligible(path, &error)
+            || (is_native_ape_tail_carrier(path) && validate_native_ape_carrier_magic(path).is_ok()) =>
             read_neutral_native_ape_fallback(path).map(ArtworkContainer::NativeApe).map_err(|native_error|
                 format!("Failed to read artwork from '{}': {error}; native APEv2 fallback also refused: {native_error}", path.display())),
         Err(error) => Err(format!("Failed to read artwork from '{}': {error}", path.display())),
@@ -1270,6 +1281,22 @@ pub(super) fn replace_editor_picture_native(
         return Err("RF64 artwork is readable, but this build has no RF64 artwork writer".into());
     }
     Ok(false)
+}
+
+/// Preserve the existing native writer's filesystem metadata contract when
+/// Edit Image publishes a private replacement of the entire audio file.
+pub(super) struct EditPublicationMetadata(flac_metadata_writer::OriginalFileMetadata);
+
+impl EditPublicationMetadata {
+    pub(super) fn capture(path: &Path) -> Result<Self, String> {
+        let metadata = std::fs::symlink_metadata(path).map_err(|error|
+            format!("stat edit image target '{}': {error}", path.display()))?;
+        flac_metadata_writer::OriginalFileMetadata::capture(path, &metadata).map(Self)
+    }
+
+    pub(super) fn apply(&self, path: &Path) -> Result<(), String> {
+        self.0.apply_to_replacement(path)
+    }
 }
 
 /// Synthesize source-level metadata for a SACD ISO from the Master
@@ -3472,7 +3499,7 @@ mod flac_metadata_writer {
     }
 
     #[cfg(unix)]
-    struct OriginalFileMetadata {
+    pub(super) struct OriginalFileMetadata {
         mode: u32,
         uid: u32,
         gid: u32,
@@ -3503,7 +3530,7 @@ mod flac_metadata_writer {
 
     #[cfg(unix)]
     impl OriginalFileMetadata {
-        fn capture(path: &Path, metadata: &std::fs::Metadata) -> Result<Self, String> {
+        pub(super) fn capture(path: &Path, metadata: &std::fs::Metadata) -> Result<Self, String> {
             use std::os::unix::fs::MetadataExt;
             Ok(Self {
                 mode: metadata.mode() & 0o7777,
@@ -3518,7 +3545,7 @@ mod flac_metadata_writer {
             })
         }
 
-        fn apply_to_replacement(&self, tmp_path: &Path) -> Result<(), String> {
+        pub(super) fn apply_to_replacement(&self, tmp_path: &Path) -> Result<(), String> {
             let tmp_c = c_path(tmp_path)?;
             // Ownership and mode are security-relevant. The temp is created 0600;
             // if the original has a different owner/group and the platform refuses
@@ -3551,17 +3578,17 @@ mod flac_metadata_writer {
     }
 
     #[cfg(not(unix))]
-    struct OriginalFileMetadata {
+    pub(super) struct OriginalFileMetadata {
         permissions: std::fs::Permissions,
     }
 
     #[cfg(not(unix))]
     impl OriginalFileMetadata {
-        fn capture(_path: &Path, metadata: &std::fs::Metadata) -> Result<Self, String> {
+        pub(super) fn capture(_path: &Path, metadata: &std::fs::Metadata) -> Result<Self, String> {
             Ok(Self { permissions: metadata.permissions() })
         }
 
-        fn apply_to_replacement(&self, tmp_path: &Path) -> Result<(), String> {
+        pub(super) fn apply_to_replacement(&self, tmp_path: &Path) -> Result<(), String> {
             std::fs::set_permissions(tmp_path, self.permissions.clone())
                 .map_err(|err| format!("preserve FLAC permissions on rewrite temp '{}': {err}", tmp_path.display()))
         }
@@ -17496,7 +17523,7 @@ fn replace_generic_metadata_file(
 
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct GenericMetadataReplacementSnapshot {
+pub(super) struct GenericMetadataReplacementSnapshot {
     dev: u64,
     ino: u64,
     len: u64,
@@ -17518,7 +17545,7 @@ impl GenericMetadataReplacementSnapshot {
         self.len
     }
 
-    fn capture(path: &std::path::Path) -> Result<Self, String> {
+    pub(super) fn capture(path: &std::path::Path) -> Result<Self, String> {
         use std::os::unix::fs::MetadataExt;
 
         let link_metadata = std::fs::symlink_metadata(path)
@@ -17561,7 +17588,7 @@ impl GenericMetadataReplacementSnapshot {
         })
     }
 
-    fn validate_unchanged(&self, path: &std::path::Path) -> Result<(), String> {
+    pub(super) fn validate_unchanged(&self, path: &std::path::Path) -> Result<(), String> {
         use std::os::unix::fs::MetadataExt;
 
         let link_metadata = std::fs::symlink_metadata(path)
@@ -17611,7 +17638,7 @@ impl GenericMetadataReplacementSnapshot {
         ))
     }
 
-    fn apply_to_temp(&self, path: &std::path::Path) -> Result<(), String> {
+    pub(super) fn apply_to_temp(&self, path: &std::path::Path) -> Result<(), String> {
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::MetadataExt;
 
@@ -17802,7 +17829,7 @@ fn windows_metadata_identity(
 
 #[cfg(windows)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct GenericMetadataReplacementSnapshot {
+pub(super) struct GenericMetadataReplacementSnapshot {
     identity: WindowsMetadataIdentity,
     permissions: std::fs::Permissions,
 }
@@ -17813,7 +17840,7 @@ impl GenericMetadataReplacementSnapshot {
         self.identity.len
     }
 
-    fn capture(path: &std::path::Path) -> Result<Self, String> {
+    pub(super) fn capture(path: &std::path::Path) -> Result<Self, String> {
         let link_metadata = std::fs::symlink_metadata(path)
             .map_err(|error| format!("stat metadata target '{}': {error}", path.display()))?;
         if link_metadata.file_type().is_symlink() || !link_metadata.is_file() {
@@ -17836,7 +17863,7 @@ impl GenericMetadataReplacementSnapshot {
         })
     }
 
-    fn validate_unchanged(&self, path: &std::path::Path) -> Result<(), String> {
+    pub(super) fn validate_unchanged(&self, path: &std::path::Path) -> Result<(), String> {
         let link_metadata = std::fs::symlink_metadata(path)
             .map_err(|error| format!("revalidate metadata target '{}': {error}", path.display()))?;
         if link_metadata.file_type().is_symlink() || !link_metadata.is_file() {
@@ -17858,7 +17885,7 @@ impl GenericMetadataReplacementSnapshot {
         Ok(())
     }
 
-    fn apply_to_temp(&self, path: &std::path::Path) -> Result<(), String> {
+    pub(super) fn apply_to_temp(&self, path: &std::path::Path) -> Result<(), String> {
         std::fs::set_permissions(path, self.permissions.clone()).map_err(|error| {
             format!(
                 "preserve permissions on metadata temp '{}': {error}",
@@ -17870,7 +17897,7 @@ impl GenericMetadataReplacementSnapshot {
 
 #[cfg(not(any(unix, windows)))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct GenericMetadataReplacementSnapshot;
+pub(super) struct GenericMetadataReplacementSnapshot;
 
 #[cfg(not(any(unix, windows)))]
 impl GenericMetadataReplacementSnapshot {
@@ -17878,21 +17905,21 @@ impl GenericMetadataReplacementSnapshot {
         0
     }
 
-    fn capture(path: &std::path::Path) -> Result<Self, String> {
+    pub(super) fn capture(path: &std::path::Path) -> Result<Self, String> {
         Err(format!(
             "refusing journal-free metadata replacement for '{}': this platform has no supported stable file-identity and hardlink-count implementation; use Strong verification",
             path.display(),
         ))
     }
 
-    fn validate_unchanged(&self, path: &std::path::Path) -> Result<(), String> {
+    pub(super) fn validate_unchanged(&self, path: &std::path::Path) -> Result<(), String> {
         Err(format!(
             "refusing metadata replacement for '{}': stable file identity is unsupported on this platform",
             path.display(),
         ))
     }
 
-    fn apply_to_temp(&self, path: &std::path::Path) -> Result<(), String> {
+    pub(super) fn apply_to_temp(&self, path: &std::path::Path) -> Result<(), String> {
         Err(format!(
             "refusing metadata replacement for '{}': attribute-preserving atomic replacement is unsupported on this platform",
             path.display(),

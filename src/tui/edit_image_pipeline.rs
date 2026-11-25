@@ -48,6 +48,7 @@ pub(super) struct Settings {
     pub rotation: usize, pub flip_h: bool, pub flip_v: bool, pub square: Square,
     pub pad: Option<[u8; 4]>, pub format: Format, pub quality: u8,
     pub metadata: Metadata, pub write: WriteMode, pub conflict: Conflict, pub template: String,
+    pub working_root: Option<PathBuf>,
 }
 impl Settings {
     pub fn new(embedded: bool) -> Self { Self {
@@ -58,6 +59,7 @@ impl Settings {
         quality: 90, metadata: if embedded { Metadata::Strip } else { Metadata::Icc },
         write: WriteMode::File, conflict: Conflict::Ask,
         template: if embedded { "%ALBUMDIR%/cover.%EXT%" } else { "%DIR%/%NAME%_%W%x%H%.%EXT%" }.into(),
+        working_root: None,
     } }
     pub fn ratio_terms(&self) -> Option<(u32,u32)> {
         let (a,b) = match self.ratio { 1 => (5,4), 2 => (4,3), 3 => (3,2), 4 => (16,10), 5 => (16,9), 6 => (21,9), 7 => self.custom_ratio, _ => return None };
@@ -905,68 +907,428 @@ pub(super) fn destination(path:&Path,bytes:&[u8],policy:Conflict)->Result<Destin
         if n==0 { match policy { Conflict::Ask=>return Ok(Destination::Conflict(candidate)),Conflict::Replace=>return Ok(Destination::Write(candidate,true)),Conflict::Skip=>return Ok(Destination::Skip),Conflict::Number=>{} } }
     } Err("No available numbered filename".into())
 }
-/// Stage in the destination filesystem, publish atomically, and let the RAII
-/// guard remove the temporary file on every ordinary error path. No sidecars.
+// Tests redirect only this thread's private defaults, never the real cache or
+// process-wide environment. The ordinary test fallback is already isolated by
+// the application's coordination fixture.
+#[cfg(test)]
+thread_local! {
+    static TEST_STAGE_ROOTS: std::cell::RefCell<Option<Vec<PathBuf>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(super) fn with_test_stage_roots<T>(roots: Vec<PathBuf>, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Vec<PathBuf>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_STAGE_ROOTS.with(|slot| { slot.replace(self.0.take()); });
+        }
+    }
+    let _restore = Restore(TEST_STAGE_ROOTS.with(|slot| slot.replace(Some(roots))));
+    f()
+}
+
+fn default_private_stage_roots() -> Vec<PathBuf> {
+    #[cfg(test)]
+    {
+        TEST_STAGE_ROOTS.with(|slot| slot.borrow().clone()).unwrap_or_else(|| {
+            // Only the re-executed fallback fixtures set this environment
+            // variable. It also applies to their real Edit Image worker thread.
+            if std::env::var_os("TONEPOET_EDIT_IMAGE_FALLBACK_FIXTURE").is_some() {
+                Vec::new()
+            } else {
+                vec![crate::concurrency::coordination_root().join("edit-image")]
+            }
+        })
+    }
+    #[cfg(not(test))]
+    {
+        dirs::cache_dir().into_iter().chain(dirs::data_local_dir())
+            .map(|p| p.join("tonepoet").join("edit-image")).collect()
+    }
+}
+
+/// The fast path keeps the original TempDir with no recovery bookkeeping.
+/// A fallback owns a normal durable file-task journal until all staged handles
+/// are closed. Only its exact staging tree (never the destination) is recorded.
+enum PublicationStage {
+    Private(tempfile::TempDir),
+    Fallback(FallbackStage),
+}
+
+struct FallbackStage {
+    path: PathBuf,
+    journal: Option<super::file_task_runtime::FileTaskJournalHandle>,
+}
+
+impl FallbackStage {
+    fn close(&mut self) -> Result<(), String> {
+        if let Some(journal) = self.journal.take() {
+            super::keybindings::finish_edit_image_stage(journal).map(|_| ())
+        } else { Ok(()) }
+    }
+}
+impl Drop for FallbackStage {
+    fn drop(&mut self) {
+        // Covers unwinding as well as explicit ordinary completion. No TUI
+        // thread ever deletes a live worker's tree; the lease stays held here.
+        if let Err(error) = self.close() {
+            log::warn!("Edit Image staging cleanup remains pending for {}: {error}", self.path.display());
+        }
+    }
+}
+impl PublicationStage {
+    fn path(&self) -> &Path {
+        match self { Self::Private(dir) => dir.path(), Self::Fallback(stage) => &stage.path }
+    }
+    fn with_authority<T>(&self, operation: impl FnOnce() -> T) -> T {
+        match self {
+            Self::Private(_) => operation(),
+            Self::Fallback(stage) => crate::concurrency::with_scoped_mutation_claims(
+                stage.journal.as_ref().expect("live staging journal").mutation_claims(), operation),
+        }
+    }
+    fn finish(mut self, report: &impl Fn(String)) {
+        if let Self::Fallback(stage) = &mut self {
+            if let Err(error) = stage.close() {
+                let warning = format!("Edit Image staging cleanup remains pending for {}: {error}", stage.path.display());
+                log::warn!("{warning}");
+                report(warning);
+            }
+        }
+    }
+}
+
+/// Reserve the same generation-qualified directory name understood by the
+/// existing recovery validator. A UUID keeps names short and unique even
+/// when the original filename is at the filesystem's length limit.
+fn destination_volume_stage(parent: &Path, path: &Path, report: &impl Fn(String))
+    -> Result<PublicationStage, String>
+{
+    use super::file_task_runtime::{DurableEndpointRole, DurableTempArtifact,
+        DurableTempArtifactKind, FileTaskJournalHandle};
+    let destination = parent.join(path.file_name().ok_or("Missing output filename")?);
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let generation = 1;
+    let stage_path = parent.join(format!(".edit-image.tonepoet-tree-{job_id}-{generation}-{}-0.tmp", std::process::id()));
+    match fs::symlink_metadata(&stage_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        Ok(_) => return Err("Edit Image staging name already exists".into()),
+        Err(error) => return Err(err(error)),
+    }
+    let endpoint = super::keybindings::capture_file_task_endpoint_identity(
+        DurableEndpointRole::Destination, parent, parent)?;
+    let artifact = DurableTempArtifact {
+        path: stage_path.clone(), destination, kind: DurableTempArtifactKind::Directory,
+        owner_job_id: job_id, owner_generation: generation,
+    };
+    // The initial journal snapshot contains both the exact directory and the
+    // volume identity, and is durable before mkdir is even attempted.
+    let journal = FileTaskJournalHandle::create_edit_image_stage(artifact, endpoint.clone())?;
+    let mut stage = FallbackStage { path: stage_path, journal: Some(journal) };
+    #[cfg(test)] fallback_checkpoint("registered", &stage.path);
+    // Do not create on a substitute mount if the endpoint detached while the
+    // local journal was being committed.
+    if let Err(error) = super::keybindings::verify_file_task_endpoint_attached(&endpoint) {
+        PublicationStage::Fallback(stage).finish(report);
+        return Err(error);
+    }
+    if let Err(error) = super::keybindings::create_private_file_task_directory(&stage.path) {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            // mkdir did not acquire this name. Never delete a pre-existing
+            // object, even in the practically impossible UUID collision case.
+            let handle = stage.journal.take().expect("live staging journal");
+            if let Err(cleanup) = handle.clear_recovered_temp_artifact(&stage.path)
+                .and_then(|()| super::file_task_runtime::commit_recovery_discard(handle))
+            {
+                let warning = format!("Edit Image staging reservation cleanup failed: {cleanup}");
+                log::warn!("{warning}"); report(warning);
+            }
+        } else {
+            // The normal cleanup path verifies attachment even if mkdir
+            // failed: an unavailable volume must not erase the obligation.
+            PublicationStage::Fallback(stage).finish(report);
+        }
+        return Err(format!("Create destination-volume Edit Image staging: {error}"));
+    }
+    Ok(PublicationStage::Fallback(stage))
+}
+
+#[cfg(test)]
+fn private_stage(path: &Path, other: Option<&Path>, configured: Option<&Path>)
+    -> Result<PublicationStage, String>
+{
+    publication_stage(path, other, configured, &|_| {})
+}
+
+/// Same device is not sufficient on Linux: a bind mount or another mount
+/// of the same filesystem has a separate rename boundary. statx supplies
+/// that identity with two inexpensive metadata calls; older kernels fall
+/// back to the existing device check and the atomic primitive still refuses
+/// unsafe cross-device publication.
+fn same_publication_mount(a: &Path, b: &Path) -> bool {
+    if !super::disc_browser::same_filesystem_paths(a, b) { return false; }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        fn mount_id(path: &Path) -> Option<u64> {
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+            let mut stat = std::mem::MaybeUninit::<libc::statx>::zeroed();
+            // SAFETY: the path is NUL-terminated and statx receives writable
+            // storage for the kernel ABI's complete statx result structure.
+            let result = unsafe { libc::syscall(libc::SYS_statx, libc::AT_FDCWD,
+                path.as_ptr(), 0, libc::STATX_MNT_ID, stat.as_mut_ptr()) };
+            if result != 0 { return None; }
+            let stat = unsafe { stat.assume_init() };
+            (stat.stx_mask & libc::STATX_MNT_ID != 0).then_some(stat.stx_mnt_id)
+        }
+        if let (Some(a), Some(b)) = (mount_id(a), mount_id(b)) { return a == b; }
+    }
+    true
+}
+
+/// Prefer existing same-volume private roots, retaining their order and
+/// protection checks. Only after all are unsuitable reserve an owned sibling
+/// staging tree. The publication primitives themselves do not change.
+fn publication_stage(path: &Path, other: Option<&Path>, configured: Option<&Path>,
+    report: &impl Fn(String)) -> Result<PublicationStage, String>
+{
+    use crate::convert::pipeline::native_extract::resolved_future_path;
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let parent = fs::canonicalize(parent).map_err(err)?;
+    if !parent.is_dir() { return Err("Output parent is not a directory".into()); }
+    let mut protected = vec![parent.clone()];
+    if let Some(other) = other {
+        let p = other.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        protected.push(fs::canonicalize(p).map_err(err)?);
+    }
+    let roots = configured.into_iter().map(|p| p.join("tonepoet-edit-image"))
+        .chain(default_private_stage_roots());
+    let mut seen = std::collections::HashSet::new();
+    let mut reasons = Vec::new();
+    for root in roots {
+        if !seen.insert(root.clone()) { continue; }
+        let attempt = (|| -> Result<tempfile::TempDir, String> {
+            let root = if root.is_absolute() { root.clone() } else { std::env::current_dir().map_err(err)?.join(&root) };
+            let resolved = resolved_future_path(&root)?;
+            if protected.iter().any(|p| resolved.starts_with(p)) {
+                return Err("working storage is inside a protected user folder".into());
+            }
+            let ancestor = resolved.ancestors().find(|p| p.exists()).ok_or("Working storage has no existing ancestor")?;
+            if !super::disc_browser::same_filesystem_paths(ancestor, &parent) {
+                return Err("working storage is on another filesystem".into());
+            }
+            crate::concurrency::create_private_dir(&resolved)?;
+            let actual = fs::canonicalize(&resolved).map_err(err)?;
+            if actual != resolved || protected.iter().any(|p| actual.starts_with(p))
+                || !same_publication_mount(&actual, &parent) {
+                return Err("working storage changed during setup".into());
+            }
+            tempfile::Builder::new().prefix("job-").tempdir_in(actual).map_err(err)
+        })();
+        match attempt {
+            Ok(stage) => return Ok(PublicationStage::Private(stage)),
+            Err(error) => reasons.push(format!("{}: {error}", root.display())),
+        }
+    }
+    destination_volume_stage(&parent, path, report).map_err(|error| format!(
+        "No safe Edit Image staging for '{}': {error}. Private roots: {}", path.display(), reasons.join("; ")))
+}
+
+#[cfg(test)]
+fn fallback_checkpoint(phase: &str, stage: &Path) {
+    let Some(root) = std::env::var_os("TONEPOET_EDIT_IMAGE_FALLBACK_FIXTURE") else { return; };
+    if std::env::var("TONEPOET_EDIT_IMAGE_FALLBACK_PHASE").ok().as_deref() != Some(phase)
+        || !stage.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(".edit-image.tonepoet-tree-"))
+    { return; }
+    let root = PathBuf::from(root);
+    // For batch Abort, leave the first publication entirely unblocked.
+    if let Some(previous) = std::env::var_os("TONEPOET_EDIT_IMAGE_FALLBACK_AFTER") {
+        if !Path::new(&previous).is_file() { return; }
+    }
+    let ready = root.join("ready");
+    if ready.exists() { return; }
+    fs::write(root.join("ready.tmp"), stage.to_str().expect("fixture paths are Unicode")).unwrap();
+    fs::rename(root.join("ready.tmp"), &ready).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !root.join("release").is_file() {
+        assert!(std::time::Instant::now() < deadline, "fallback fixture did not release checkpoint");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+fn claim_output(path: &Path) -> Result<Option<crate::concurrency::MutationClaimGuard>, String> {
+    use crate::concurrency::{ClaimMode, ClaimScope, PathClaim, PathResolutionSemantics, MutationClaimGuard};
+    let claim = PathClaim::resolve_with_semantics(path, ClaimMode::Write, ClaimScope::Exact,
+        PathResolutionSemantics::NamespaceObject)?;
+    if crate::concurrency::current_mutation_authority_covers(&claim)? { Ok(None) }
+    else { MutationClaimGuard::acquire_ephemeral(vec![claim]).map(Some) }
+}
+
+fn flush_publication(path: &Path, stage: &Path) {
+    // Publication already succeeded. A directory flush failure is a durability
+    // warning, not permission to report that no output was written or retry a
+    // completed mutation. Ordinary process death is atomic even without it.
+    for dir in [path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")), stage] {
+        if let Err(error) = crate::config::sync_parent_dir(dir) {
+            log::warn!("Edit Image published '{}'; directory flush for '{}' failed: {error}", path.display(), dir.display());
+        }
+    }
+}
+
 #[cfg(test)]
 fn write_image(path:&Path,bytes:&[u8],replace:bool)->Result<(),String> { write_image_checked(path,bytes,replace,&||Ok(())) }
 #[cfg(test)]
 fn write_image_checked(path:&Path,bytes:&[u8],replace:bool,check:&impl Fn()->Result<(),String>)->Result<(),String> {
-    write_image_with_commit(path,bytes,replace,check,check).map(|_|())
+    write_image_with_commit(path,bytes,replace,None,None,check,check).map(|_|())
 }
-pub(super) fn write_image_with_commit(path:&Path,bytes:&[u8],replace:bool,check:&impl Fn()->Result<(),String>,commit:&impl Fn()->Result<(),String>)->Result<bool,String> {
-    check()?;
-    if replace && identical(path,bytes)? {return Ok(false);}
-    let parent=path.parent().ok_or("Missing output directory")?;
-    // A nonexistent folder is an explicit blocker; avoid creating unintended
-    // directory trees or leaving them behind after a failed write.
-    let mut tmp=tempfile::NamedTempFile::new_in(parent).map_err(err)?;
-    tmp.write_all(bytes).map_err(err)?; tmp.as_file().sync_all().map_err(err)?;
-    commit()?;
-    if replace { let md=fs::symlink_metadata(path).map_err(err)?; if !md.is_file() {return Err("Destination changed before replacement".into());} tmp.as_file().set_permissions(md.permissions()).map_err(err)?; tmp.persist(path).map_err(err)?; }
-    else { tmp.persist_noclobber(path).map_err(err)?; }
-    Ok(true)
+#[cfg(test)]
+pub(super) fn write_image_with_commit(path: &Path, bytes: &[u8], replace: bool,
+    other: Option<&Path>, configured: Option<&Path>, check: &impl Fn()->Result<(),String>,
+    commit: &impl Fn()->Result<(),String>) -> Result<bool,String>
+{
+    write_image_with_commit_reporting(path, bytes, replace, other, configured, check, commit, &|_| {})
 }
-/// Native FLAC and DSF writes use their existing journaled writers. Only
-/// established Lofty-writable carriers use an isolated same-filesystem
-/// copy, published after the tag and picture verification.
-pub(super) fn reembed_checked(source:&Source,encoded:&Encoded,check:&impl Fn()->Result<(),String>,cancel:&super::probe::MetadataWriteCancelFlag)->Result<bool,String> {
+pub(super) fn write_image_with_commit_reporting(path: &Path, bytes: &[u8], replace: bool,
+    other: Option<&Path>, configured: Option<&Path>, check: &impl Fn()->Result<(),String>,
+    commit: &impl Fn()->Result<(),String>, report: &impl Fn(String)) -> Result<bool,String>
+{
+    use super::probe::{EditPublicationMetadata, GenericMetadataReplacementSnapshot};
     check()?;
+    let _claim = claim_output(path)?;
+    if replace && identical(path,bytes)? { return Ok(false); }
+    let original = if replace { Some(GenericMetadataReplacementSnapshot::capture(path)?) } else { None };
+    let preservation = if replace { Some(EditPublicationMetadata::capture(path)?) } else { None };
+    let stage = publication_stage(path, other, configured, report)?;
+    let result = (|| -> Result<bool, String> {
+        let mut tmp = tempfile::NamedTempFile::new_in(stage.path()).map_err(err)?;
+        for chunk in bytes.chunks(1024 * 1024) {
+            check()?; tmp.write_all(chunk).map_err(err)?;
+            #[cfg(test)] fallback_checkpoint("writing", stage.path());
+        }
+        if let Some(preservation) = &preservation {
+            // Keep owner/group/permissions and supported extended metadata. Advance modification time so a new
+            // image cannot reuse an old Browse cache entry of the same size.
+            preservation.apply(tmp.path())?;
+            tmp.as_file().set_modified(std::time::SystemTime::now()).map_err(err)?;
+        }
+        tmp.as_file().sync_all().map_err(err)?;
+        #[cfg(test)] fallback_checkpoint("prepared", stage.path());
+        commit()?;
+        if let Some(original) = &original {
+            original.validate_unchanged(path)?;
+            tmp.persist(path).map_err(err)?;
+        } else { tmp.persist_noclobber(path).map_err(err)?; }
+        flush_publication(path, stage.path());
+        #[cfg(test)] fallback_checkpoint("published", stage.path());
+        Ok(true)
+    })();
+    // The NamedTempFile (including a failed persist's handle) was dropped
+    // inside the closure. Do not turn a completed publication into a failed
+    // write if only cleanup was deferred.
+    stage.finish(report);
+    result
+}
+
+/// A same-volume reflink is ideal for large DSF/FLAC files. Where unavailable,
+/// bounded copying remains cancellable. Both routes write only the private
+/// copy; native writers may journal/replace it without touching the original.
+fn stage_audio(path: &Path, target: &Path, check: &impl Fn()->Result<(),String>) -> Result<(), String> {
+    let mut source = fs::File::open(path).map_err(err)?;
+    let mut output = fs::OpenOptions::new().write(true).create_new(true).open(target).map_err(err)?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        const FICLONE: libc::c_ulong = 0x4004_9409;
+        if unsafe { libc::ioctl(output.as_raw_fd(), FICLONE, source.as_raw_fd()) } == 0 {
+            #[cfg(test)] if let Some(parent) = target.parent() { fallback_checkpoint("writing", parent); }
+            return check();
+        }
+        output.set_len(0).map_err(err)?;
+    }
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        check()?;
+        let count = source.read(&mut buffer).map_err(err)?;
+        if count == 0 { break; }
+        output.write_all(&buffer[..count]).map_err(err)?;
+        #[cfg(test)] if let Some(parent) = target.parent() { fallback_checkpoint("writing", parent); }
+    }
+    Ok(())
+}
+
+/// Work on a private snapshot even for native carriers: a killed process can
+/// interrupt a native journaled write, but the user file always remains the
+/// old complete generation until the single atomic publication boundary.
+#[cfg(test)]
+pub(super) fn reembed_checked(source: &Source, encoded: &Encoded, other: Option<&Path>,
+    configured: Option<&Path>, check: &impl Fn()->Result<(),String>,
+    cancel: &super::probe::MetadataWriteCancelFlag) -> Result<bool,String>
+{
+    reembed_checked_reporting(source, encoded, other, configured, check, cancel, &|_| {})
+}
+pub(super) fn reembed_checked_reporting(source: &Source, encoded: &Encoded, other: Option<&Path>,
+    configured: Option<&Path>, check: &impl Fn()->Result<(),String>,
+    cancel: &super::probe::MetadataWriteCancelFlag, report: &impl Fn(String)) -> Result<bool,String>
+{
+    use super::probe::{EditPublicationMetadata, GenericMetadataReplacementSnapshot};
+    check()?;
+    if cancel.is_cancelled() { return Err("Re-embed cancelled".into()); }
     let Source::Picture{path,tag,index,kind,description,digest,..}=source else {return Err("No embedded picture selected".into());};
     let tag=tag.ok_or("This artwork carrier is readable but has no supported artwork writer; choose File")?;
     let (mime,mime_text)=match encoded.format {Format::Jpeg=>(MimeType::Jpeg,"image/jpeg"),Format::Png=>(MimeType::Png,"image/png"),_=>return Err("Embedded artwork must be JPEG or PNG".into())};
-    if !fs::symlink_metadata(path).map_err(err)?.is_file() { return Err("Audio target must be a regular, non-symlink file".into()); }
-    let stamp=fs::symlink_metadata(path).map_err(err)?;
+    let _claim = claim_output(path)?;
+    if crate::dsf_tags::is_dsf(path) { crate::dsf_tags::check_editor_replacement_ready(path)?; }
+    let stamp = GenericMetadataReplacementSnapshot::capture(path)?;
+    let preservation = EditPublicationMetadata::capture(path)?;
     let original=lofty::read_from_path(path).map_err(err)?;
     let original_tag=original.tag(tag).ok_or("Picture tag disappeared")?;
     let selected=original_tag.pictures().get(*index).ok_or("Picture disappeared")?;
     if fingerprint(selected.data())!=*digest || selected.pic_type()!=*kind || selected.description()!=description.as_deref() { return Err("Picture changed; reopen Edit Image".into()); }
     if selected.data()==encoded.bytes.as_slice() { return Ok(false); }
     check()?;
-    if super::probe::replace_editor_picture_native(path,tag,*index,selected,mime_text,encoded.bytes.as_slice(),cancel)? { return Ok(true); }
-    let replacement=Picture::new_unchecked(selected.pic_type(),Some(mime),selected.description().map(str::to_owned),encoded.bytes.as_ref().clone());
-    let mut expected=original_tag.pictures().to_vec(); expected[*index]=replacement.clone();
-    let parent=path.parent().ok_or("Audio target has no parent")?;
-    let suffix=path.extension().and_then(|v|v.to_str()).map(|v|format!(".{v}")).unwrap_or_default();
-    let tmp=tempfile::Builder::new().suffix(&suffix).tempfile_in(parent).map_err(err)?;
-    fs::copy(path,tmp.path()).map_err(err)?;
-    check()?;
-    let mut staged=lofty::read_from_path(tmp.path()).map_err(err)?;
-    staged.tag_mut(tag).ok_or("Staged picture tag disappeared")?.set_picture(*index,replacement);
-    staged.save_to_path(tmp.path(),lofty::config::WriteOptions::default()).map_err(err)?;
-    let verify=lofty::read_from_path(tmp.path()).map_err(err)?;
-    let actual=verify.tag(tag).ok_or("Staged picture tag disappeared after writing")?.pictures();
-    if actual.len()!=expected.len() || actual.iter().zip(&expected).any(|(a,b)|a.data()!=b.data() || a.pic_type()!=b.pic_type() || a.description()!=b.description() || a.mime_type()!=b.mime_type()) { return Err("Audio picture verification failed".into()); }
-    for old_tag in original.tags() {
-        let new_tag = verify.tag(old_tag.tag_type()).ok_or("An audio tag disappeared")?;
-        if !new_tag.items().into_iter().eq(old_tag.items().into_iter()) { return Err("Unrelated audio metadata changed".into()); }
-        if old_tag.tag_type() == tag { continue; }
-        if new_tag.pictures().len()!=old_tag.pictures().len() || new_tag.pictures().iter().zip(old_tag.pictures()).any(|(a,b)| a.data()!=b.data() || a.pic_type()!=b.pic_type() || a.description()!=b.description() || a.mime_type()!=b.mime_type()) { return Err("Another audio tag's pictures changed".into()); }
-    }
-    check()?;
-    let now=fs::symlink_metadata(path).map_err(err)?;
-    if !now.is_file() {return Err("Audio file is no longer a regular file".into());}
-    if now.len()!=stamp.len() || now.modified().map_err(err)?!=stamp.modified().map_err(err)? { return Err("Audio file changed during editing".into()); }
-    tmp.as_file().set_permissions(stamp.permissions()).map_err(err)?; tmp.as_file().sync_all().map_err(err)?; tmp.persist(path).map_err(err)?; Ok(true)
+    let stage = publication_stage(path, other, configured, report)?;
+    let result = stage.with_authority(|| -> Result<bool, String> {
+        let mut staged_path = stage.path().join("audio");
+        if let Some(extension) = path.extension() { staged_path.set_extension(extension); }
+        stage_audio(path, &staged_path, check)?;
+        stamp.validate_unchanged(path)?;
+        check()?;
+        let replacement=Picture::new_unchecked(selected.pic_type(),Some(mime),selected.description().map(str::to_owned),encoded.bytes.as_ref().clone());
+        let mut expected=original_tag.pictures().to_vec(); expected[*index]=replacement.clone();
+        let native = super::probe::replace_editor_picture_native(&staged_path,tag,*index,selected,mime_text,encoded.bytes.as_slice(),cancel)?;
+        if !native {
+            let mut staged=lofty::read_from_path(&staged_path).map_err(err)?;
+            staged.tag_mut(tag).ok_or("Staged picture tag disappeared")?.set_picture(*index,replacement);
+            staged.save_to_path(&staged_path,lofty::config::WriteOptions::default()).map_err(err)?;
+        }
+        let verify=lofty::read_from_path(&staged_path).map_err(err)?;
+        let same_picture = |a: &Picture, b: &Picture| a.data()==b.data() && a.pic_type()==b.pic_type()
+            && a.description().unwrap_or("")==b.description().unwrap_or("") && a.mime_type()==b.mime_type();
+        let actual=verify.tag(tag).ok_or("Staged picture tag disappeared after writing")?.pictures();
+        if actual.len()!=expected.len() || !actual.iter().zip(&expected).all(|(a,b)|same_picture(a,b)) { return Err("Audio picture verification failed".into()); }
+        for old_tag in original.tags() {
+            let new_tag = verify.tag(old_tag.tag_type()).ok_or("An audio tag disappeared")?;
+            if !new_tag.items().into_iter().eq(old_tag.items().into_iter()) { return Err("Unrelated audio metadata changed".into()); }
+            if old_tag.tag_type() == tag { continue; }
+            if new_tag.pictures().len()!=old_tag.pictures().len() || !new_tag.pictures().iter().zip(old_tag.pictures()).all(|(a,b)|same_picture(a,b)) { return Err("Another audio tag's pictures changed".into()); }
+        }
+        // Native writers may have replaced the staging inode. Open the FINAL
+        // staged file, not the handle used before the native writer ran.
+        let ready = fs::OpenOptions::new().read(true).write(true).open(&staged_path).map_err(err)?;
+        preservation.apply(&staged_path)?;
+        ready.set_modified(std::time::SystemTime::now()).map_err(err)?;
+        ready.sync_all().map_err(err)?;
+        drop(ready);
+        #[cfg(test)] fallback_checkpoint("prepared", stage.path());
+        check()?;
+        if cancel.is_cancelled() { return Err("Re-embed cancelled".into()); }
+        stamp.validate_unchanged(path)?;
+        fs::rename(&staged_path,path).map_err(err)?;
+        flush_publication(path, stage.path());
+        #[cfg(test)] fallback_checkpoint("published", stage.path());
+        Ok(true)
+    });
+    stage.finish(report);
+    result
 }
 
 #[cfg(test)]
@@ -995,12 +1357,489 @@ mod tests {
         let d=tempfile::tempdir().unwrap();
         let p=d.path().join("cover.png");
         fs::write(&p,b"original").unwrap();
-        let calls=std::cell::Cell::new(0);
-        let check=|| { calls.set(calls.get()+1); if calls.get()>1 {Err("cancelled".into())} else {Ok(())} };
-        assert!(write_image_checked(&p,b"new",true,&check).is_err());
+        let commit=|| Err("cancelled".into());
+        assert!(write_image_with_commit(&p,b"new",true,None,None,&||Ok(()),&commit).is_err());
         assert_eq!(fs::read(&p).unwrap(),b"original");
         assert_eq!(fs::read_dir(d.path()).unwrap().count(),1);
     }
+    fn directory_names(path: &Path) -> std::collections::BTreeSet<std::ffi::OsString> {
+        fs::read_dir(path).unwrap().map(|entry| entry.unwrap().file_name()).collect()
+    }
+
+    #[test]
+    fn private_stage_prefers_configured_then_safe_defaults() {
+        let d = tempfile::tempdir().unwrap();
+        let album = d.path().join("album");
+        let destination = d.path().join("destination");
+        let scratch = d.path().join("scratch");
+        let cache = d.path().join("cache");
+        let data = d.path().join("data");
+        for path in [&album, &destination] { fs::create_dir(path).unwrap(); }
+        let image = destination.join("cover.png");
+        let source = album.join("source.png");
+        fs::write(&source, b"source").unwrap();
+        fs::write(destination.join(".keep"), b"keep").unwrap();
+        let before_album = directory_names(&album);
+        let before_destination = directory_names(&destination);
+        with_test_stage_roots(vec![cache.clone(), data.clone()], || {
+            let stage = private_stage(&image, Some(&source), Some(&scratch)).unwrap();
+            assert_eq!(stage.path().parent().unwrap(), fs::canonicalize(scratch.join("tonepoet-edit-image")).unwrap());
+            assert!(!cache.exists());
+            drop(stage);
+            // A configured root within a user folder may never be created,
+            // but must not prevent use of an otherwise safe cache.
+            let stage = private_stage(&image, Some(&source), Some(&album)).unwrap();
+            assert_eq!(stage.path().parent().unwrap(), fs::canonicalize(&cache).unwrap());
+            assert!(!data.exists());
+            drop(stage);
+        });
+        // Also exercise the data fallback when both earlier roots fail.
+        with_test_stage_roots(vec![destination.join("cache"), data.clone()], || {
+            let stage = private_stage(&image, Some(&source), Some(&album)).unwrap();
+            assert_eq!(stage.path().parent().unwrap(), fs::canonicalize(&data).unwrap());
+        });
+        assert_eq!(directory_names(&album), before_album);
+        assert_eq!(directory_names(&destination), before_destination);
+    }
+
+    #[test]
+    fn private_publication_preserves_exact_user_directory_sets() {
+        let _coordination=crate::concurrency::isolated_test_coordination_root();
+        let d=tempfile::tempdir().unwrap();
+        let album=d.path().join("album");let destination=d.path().join("destination");let work=d.path().join("private");
+        for folder in [&album,&destination,&work] {fs::create_dir(folder).unwrap();}
+        let audio=album.join("album.flac");let image=destination.join("cover.png");
+        fs::write(&audio,include_bytes!("../../tests/fixtures/browse_artwork/embedded_valid.flac")).unwrap();
+        fs::write(album.join(".keep"),b"unrelated").unwrap();fs::write(destination.join(".keep"),b"unrelated").unwrap();
+        let album_set=directory_names(&album);let dest_set=directory_names(&destination);
+        let observe=|| {assert_eq!(directory_names(&album),album_set);assert_eq!(directory_names(&destination),dest_set);Ok(())};
+        let refuse=|| {observe()?;Err("injected cancellation at publication boundary".into())};
+        assert!(write_image_with_commit(&image,b"image",false,Some(&audio),Some(&work),&observe,&refuse).is_err());
+        observe().unwrap();
+        // A real no-clobber publication failure with private data staged.
+        let existing=destination.join(".keep");
+        assert!(write_image_with_commit(&existing,b"replacement",false,Some(&audio),Some(&work),&observe,&observe).is_err());
+        assert_eq!(fs::read(&existing).unwrap(),b"unrelated");observe().unwrap();
+        // Protected-only root selection is covered by the destination-volume
+        // fallback tests below. This test retains the exact no-sibling
+        // assertions on every preferred-private publication path.
+        observe().unwrap();
+        assert!(write_image_with_commit(&image,b"image",false,Some(&audio),Some(&work),&observe,&observe).unwrap());
+        let mut published_set=dest_set.clone();published_set.insert(image.file_name().unwrap().to_owned());
+        let original=fs::read(&audio).unwrap();
+        let (sources,i)=pictures(&audio).unwrap();let source=&sources[i];let input=decode(source).unwrap();
+        let mut settings=Settings::new(true);settings.mode=Mode::Off;
+        settings.format=if input.format==Format::Png{Format::Jpeg}else{Format::Png};
+        let encoded=encode(&input,&settings).unwrap();
+        let cancel=super::super::probe::MetadataWriteCancelFlag::new();
+        let observed_staging=std::cell::Cell::new(false);
+        let observe_audio=|| -> Result<(),String> {
+            assert_eq!(directory_names(&album),album_set);assert_eq!(directory_names(&destination),published_set);
+            assert_eq!(fs::read(&audio).unwrap(),original);
+            let stage_root=work.join("tonepoet-edit-image");
+            if fs::read_dir(&stage_root).is_ok_and(|entries| entries.filter_map(Result::ok).any(|entry|entry.path().join("audio.flac").is_file())) {observed_staging.set(true);}
+            Ok(())
+        };
+        let refuse_audio=|| {observe_audio()?;if observed_staging.get(){Err("injected cancellation during audio staging".into())}else{Ok(())}};
+        assert!(reembed_checked(source,&encoded,Some(&image),Some(&work),&refuse_audio,&cancel).is_err());
+        assert!(observed_staging.get());observe_audio().unwrap();
+        observed_staging.set(false);
+        assert!(reembed_checked(source,&encoded,Some(&image),Some(&work),&observe_audio,&cancel).unwrap());
+        assert!(observed_staging.get());assert_eq!(directory_names(&album),album_set);assert_eq!(directory_names(&destination),published_set);
+        let audio_payload = |bytes: &[u8]| -> usize {
+            assert_eq!(&bytes[..4], b"fLaC");
+            let mut pos=4;
+            loop {
+                let last=bytes[pos]&0x80!=0;
+                let size=u32::from_be_bytes([0,bytes[pos+1],bytes[pos+2],bytes[pos+3]]) as usize;
+                pos+=4+size;
+                if last {return pos;}
+            }
+        };
+        let changed=fs::read(&audio).unwrap();
+        assert_eq!(&original[audio_payload(&original)..], &changed[audio_payload(&changed)..]);
+        let (after,i)=pictures(&audio).unwrap();assert_eq!(after[i].bytes().unwrap(),*encoded.bytes);
+        assert!(!reembed_checked(&after[i],&encoded,Some(&image),Some(&work),&||Ok(()),&cancel).unwrap());
+        assert!(directory_names(&work.join("tonepoet-edit-image")).is_empty());
+    }
+
+
+    // Re-exec isolates the journal and coordination root from parallel tests.
+    // The same worker and recovery dispatcher used by the UI run in the child.
+    const FALLBACK_FIXTURE: &str = "TONEPOET_EDIT_IMAGE_FALLBACK_FIXTURE";
+    fn fallback_child(root: &Path, test: &str, mode: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.arg("--exact").arg(test).arg("--nocapture")
+            .env(FALLBACK_FIXTURE, root)
+            .env("TONEPOET_FILE_OPERATION_JOURNAL_DIR", root.join("journal"))
+            .env("TONEPOET_CONCURRENCY_DIR", root.join("coordination"))
+            .env("TONEPOET_TEST_CONCURRENCY_DIR_INHERIT", "1")
+            .env("TONEPOET_EDIT_IMAGE_FALLBACK_MODE", mode)
+            .env_remove("TONEPOET_EDIT_IMAGE_FALLBACK_PHASE")
+            .env_remove("TONEPOET_EDIT_IMAGE_FALLBACK_AFTER");
+        cmd
+    }
+    fn fallback_fixture(root: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let album = root.join("album"); let output = root.join("output");
+        for dir in [&album, &output] {
+            fs::create_dir(dir).unwrap();
+            fs::write(dir.join(".keep"), b"unrelated").unwrap();
+            fs::create_dir(dir.join("unrelated-dir")).unwrap();
+        }
+        let audio = album.join("album.flac"); let image = output.join("cover.png");
+        fs::write(&audio, include_bytes!("../../tests/fixtures/browse_artwork/embedded_valid.flac")).unwrap();
+        image::DynamicImage::new_rgb8(8, 8).save(&image).unwrap();
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(8, 8, image::Rgb([20, 40, 60])))
+            .save(root.join("new.png")).unwrap();
+        (album, output, audio, image)
+    }
+    fn changed_artwork(audio: &Path) -> (Source, Encoded) {
+        let (sources, index) = pictures(audio).unwrap();
+        let source = sources[index].clone(); let input = decode(&source).unwrap();
+        let mut settings = Settings::new(true); settings.mode = Mode::Off;
+        settings.format = if input.format == Format::Png { Format::Jpeg } else { Format::Png };
+        (source, encode(&input, &settings).unwrap())
+    }
+    fn flac_payload(bytes: &[u8]) -> &[u8] {
+        assert_eq!(&bytes[..4], b"fLaC"); let mut pos = 4;
+        loop {
+            let last = bytes[pos] & 0x80 != 0;
+            pos += 4 + u32::from_be_bytes([0, bytes[pos+1], bytes[pos+2], bytes[pos+3]]) as usize;
+            if last { return &bytes[pos..]; }
+        }
+    }
+    fn assert_no_fallback_journals() {
+        assert!(super::super::file_task_runtime::recovery_surface_records().is_empty());
+    }
+    fn fallback_stage_in(dir: &Path) -> Option<PathBuf> {
+        fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).find(|path|
+            path.file_name().unwrap().to_string_lossy().starts_with(".edit-image.tonepoet-tree-"))
+    }
+    #[test]
+    fn destination_fallback_publication_and_cleanup() {
+        const TEST: &str = "tui::edit_image_pipeline::tests::destination_fallback_publication_and_cleanup";
+        let Some(root) = std::env::var_os(FALLBACK_FIXTURE).map(PathBuf::from) else {
+            let d = tempfile::tempdir().unwrap();
+            assert!(fallback_child(d.path(), TEST, "ordinary").status().unwrap().success());
+            return;
+        };
+        let (album, output, audio, image) = fallback_fixture(&root);
+        let before_album = directory_names(&album); let before_output = directory_names(&output);
+        let old_audio = fs::read(&audio).unwrap(); let old_image = fs::read(&image).unwrap();
+        let new_image = fs::read(root.join("new.png")).unwrap();
+        let private = root.join("private");
+        // No fallback journal is created by the preferred private path.
+        with_test_stage_roots(vec![private], || {
+            let stage = private_stage(&image, Some(&audio), Some(&album)).unwrap();
+            assert!(matches!(&stage, PublicationStage::Private(_)));
+            assert_eq!(directory_names(&album), before_album);
+            assert_eq!(directory_names(&output), before_output);
+            assert!(!super::super::file_task_runtime::file_task_journal_dir().exists());
+        });
+        let assert_clean = || {
+            assert_eq!(directory_names(&album), before_album);
+            assert_eq!(directory_names(&output), before_output);
+            assert_eq!(fs::read(album.join(".keep")).unwrap(), b"unrelated");
+            assert_eq!(fs::read(output.join(".keep")).unwrap(), b"unrelated");
+            assert_no_fallback_journals();
+        };
+        with_test_stage_roots(vec![album.join("cache"), output.join("data")], || {
+            let observed = std::cell::Cell::new(false);
+            let inspect = |dir: &Path| -> Result<(), String> {
+                if let Some(stage) = fallback_stage_in(dir) {
+                    use super::super::file_task_runtime::{recovery_surface_records, RecoverySurfaceAvailability};
+                    let records = recovery_surface_records(); assert_eq!(records.len(), 1);
+                    assert_eq!(records[0].availability, RecoverySurfaceAvailability::Live);
+                    assert_eq!(super::super::file_task_runtime::recovery_reservation_count(&records), 0);
+                    let record = records[0].record.as_ref().unwrap();
+                    assert!(record.is_edit_image_cleanup()); assert!(record.mappings.is_empty());
+                    assert_eq!(record.temp_artifacts.len(), 1);
+                    assert_eq!(record.temp_artifacts[0].path, fs::canonicalize(&stage).unwrap());
+                    let mut expected = if dir == album.as_path() { before_album.clone() } else { before_output.clone() };
+                    expected.insert(stage.file_name().unwrap().to_owned());
+                    assert_eq!(directory_names(dir), expected);
+                    assert_eq!(directory_names(if dir == album.as_path() { &output } else { &album }),
+                        if dir == album.as_path() { before_output.clone() } else { before_album.clone() });
+                    observed.set(true);
+                }
+                Ok(())
+            };
+            let stop = || { inspect(&output)?; Err("cancel at publication".into()) };
+            assert!(write_image_with_commit(&image, &new_image, true, Some(&audio), Some(&album), &|| inspect(&output), &stop).is_err());
+            assert!(observed.get()); assert_eq!(fs::read(&image).unwrap(), old_image); assert_clean();
+            observed.set(false);
+            assert!(write_image_with_commit(&image, &new_image, false, Some(&audio), Some(&album), &|| inspect(&output), &|| inspect(&output)).is_err());
+            assert!(observed.get()); assert_eq!(fs::read(&image).unwrap(), old_image); assert_clean();
+            // Inject a write-stage failure after the directory and file exist.
+            let write_error = || { inspect(&output)?; if observed.get() { Err("injected write failure".into()) } else { Ok(()) } };
+            observed.set(false);
+            assert!(write_image_with_commit(&image, &new_image, true, Some(&audio), Some(&album), &write_error, &|| Ok(())).is_err());
+            assert!(observed.get()); assert_eq!(fs::read(&image).unwrap(), old_image); assert_clean();
+            assert!(write_image_with_commit(&image, &new_image, true, Some(&audio), Some(&album), &|| inspect(&output), &|| inspect(&output)).unwrap());
+            assert_eq!(fs::read(&image).unwrap(), new_image); assert_clean();
+            let (source, encoded) = changed_artwork(&audio);
+            let cancel = super::super::probe::MetadataWriteCancelFlag::new(); observed.set(false);
+            let stop_audio = || { inspect(&album)?; if observed.get() { Err("cancel staged audio".into()) } else { Ok(()) } };
+            assert!(reembed_checked(&source, &encoded, Some(&image), Some(&output), &stop_audio, &cancel).is_err());
+            assert!(observed.get()); assert_eq!(fs::read(&audio).unwrap(), old_audio); assert_clean();
+            assert!(reembed_checked(&source, &encoded, Some(&image), Some(&output), &|| inspect(&album), &cancel).unwrap());
+            let changed = fs::read(&audio).unwrap(); assert_eq!(flac_payload(&changed), flac_payload(&old_audio));
+            let (after, index) = pictures(&audio).unwrap(); assert_eq!(after[index].bytes().unwrap(), *encoded.bytes);
+            assert_clean();
+        });
+        // Ordinary cleanup failure must retain the durable intent and report
+        // it to the worker, even though no writer remains. Exercise the same
+        // close path without requiring a real removable-device disconnect.
+        let stage = with_test_stage_roots(Vec::new(), || publication_stage(&image, Some(&audio), None, &|_| {}).unwrap());
+        let staged = stage.path().file_name().unwrap().to_owned();
+        fs::write(stage.path().join("temporary"), b"private work").unwrap();
+        let offline = root.join("offline-output");
+        fs::rename(&output, &offline).unwrap();
+        let warnings = std::cell::Cell::new(0);
+        stage.finish(&|_| warnings.set(warnings.get() + 1));
+        assert_eq!(warnings.get(), 1);
+        assert!(offline.join(&staged).is_dir());
+        let records = super::super::file_task_runtime::recovery_surface_records();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].record.as_ref().unwrap().is_edit_image_cleanup());
+        assert_eq!(records[0].availability, super::super::file_task_runtime::RecoverySurfaceAvailability::Recoverable);
+        fs::rename(&offline, &output).unwrap();
+        super::super::keybindings::discard_file_transfer_recovery(&records[0].journal_path, records[0].version.unwrap()).unwrap();
+        assert_clean();
+        assert_eq!(fs::read(&image).unwrap(), new_image);
+        // Actual second volume where available, without manufacturing mounts.
+        let external = std::env::var_os("TONEPOET_TEST_OTHER_VOLUME").map(PathBuf::from)
+            .or_else(|| if cfg!(target_os = "linux") { Some(PathBuf::from("/dev/shm")) } else { None });
+        if let Some(external) = external.filter(|p| p.is_dir() && !super::super::disc_browser::same_filesystem_paths(p, &root)) {
+            let volume = tempfile::Builder::new().prefix("tonepoet-fallback-").tempdir_in(external).unwrap();
+            let target = volume.path().join("cover.png");
+            with_test_stage_roots(vec![root.join("private")], || {
+                assert!(write_image_with_commit(&target, &new_image, false, Some(&audio), Some(&root), &|| Ok(()), &|| Ok(())).unwrap());
+            });
+            assert_eq!(directory_names(volume.path()), std::collections::BTreeSet::from([target.file_name().unwrap().to_owned()]));
+            assert_eq!(fs::read(&target).unwrap(), new_image); assert_no_fallback_journals();
+            let remote_audio = volume.path().join("album.flac");
+            fs::write(&remote_audio, &old_audio).unwrap();
+            let (source, encoded) = changed_artwork(&remote_audio);
+            let cancel = super::super::probe::MetadataWriteCancelFlag::new();
+            with_test_stage_roots(vec![root.join("private")], || {
+                assert!(reembed_checked(&source, &encoded, Some(&image), Some(&root), &|| Ok(()), &cancel).unwrap());
+            });
+            let actual = fs::read(&remote_audio).unwrap();
+            assert_eq!(flac_payload(&actual), flac_payload(&old_audio));
+            let (after, index) = pictures(&remote_audio).unwrap(); assert_eq!(after[index].bytes().unwrap(), *encoded.bytes);
+            assert_eq!(directory_names(volume.path()), std::collections::BTreeSet::from([
+                target.file_name().unwrap().to_owned(), remote_audio.file_name().unwrap().to_owned()]));
+            assert_no_fallback_journals();
+        } else { eprintln!("fallback second-volume fixture skipped: no distinct writable volume supplied"); }
+    }
+
+    #[test]
+    fn destination_fallback_recovers_killed_publication_boundaries() {
+        use super::super::file_task_runtime::{startup_file_task_recovery_inventory, RecoverySurfaceAvailability};
+        const TEST: &str = "tui::edit_image_pipeline::tests::destination_fallback_recovers_killed_publication_boundaries";
+        if let Some(root) = std::env::var_os(FALLBACK_FIXTURE).map(PathBuf::from) {
+                let mode = std::env::var("TONEPOET_EDIT_IMAGE_FALLBACK_MODE").unwrap();
+            if mode == "write" {
+                let audio = root.join("album/album.flac"); let image = root.join("output/cover.png");
+                if std::env::var("TONEPOET_EDIT_IMAGE_FALLBACK_KIND").unwrap() == "audio" {
+                    let (source, encoded) = changed_artwork(&audio);
+                    fs::write(root.join("expected-picture"), encoded.bytes.as_slice()).unwrap();
+                    let cancel = super::super::probe::MetadataWriteCancelFlag::new();
+                    reembed_checked(&source, &encoded, Some(&image), None, &|| Ok(()), &cancel).unwrap();
+                } else {
+                    write_image_with_commit(&image, &fs::read(root.join("new.png")).unwrap(), true, Some(&audio), None, &|| Ok(()), &|| Ok(())).unwrap();
+                }
+                panic!("writer passed checkpoint without termination");
+            }
+            let inventory = startup_file_task_recovery_inventory();
+            assert!(inventory.recoveries.is_empty()); assert!(inventory.unreconstructable_journals.is_empty());
+            if mode == "recover-empty" { assert!(inventory.recovery_surface_records.is_empty()); return; }
+            assert_eq!(inventory.recovery_surface_records.len(), 1);
+            let entry = &inventory.recovery_surface_records[0];
+            assert_eq!(entry.availability, RecoverySurfaceAvailability::Recoverable);
+            assert_eq!(super::super::file_task_runtime::recovery_reservation_count(&inventory.recovery_surface_records), 0);
+            let record = entry.record.as_ref().unwrap(); assert!(record.is_edit_image_cleanup());
+            assert_eq!(record.temp_artifacts.len(), 1);
+            let mut app = super::super::app::AppState::new_for_test(crate::config::TonepoetConfig::default());
+            use super::super::{message::AppMessage, recovery_ui};
+            recovery_ui::refresh_from_runtime(&mut app);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            recovery_ui::advance_stop_and_undo(&mut app, &tx);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                match rx.try_recv() {
+                    Ok(AppMessage::RecoveryDiscardComplete { journal_path, result }) => {
+                        assert_eq!(result.is_err(), mode == "recover-unavailable", "{result:?}");
+                        recovery_ui::complete_discard(&mut app, journal_path, result); break;
+                    }
+                    Ok(_) | Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {},
+                    Err(error) => panic!("recovery channel: {error}"),
+                }
+                assert!(std::time::Instant::now() < deadline, "startup cleanup was not dispatched");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            if mode == "recover-unavailable" {
+                let next = startup_file_task_recovery_inventory();
+                assert_eq!(next.recovery_surface_records.len(), 1);
+                assert_eq!(next.recovery_surface_records[0].record.as_ref().unwrap().temp_artifacts, record.temp_artifacts);
+                recovery_ui::advance_stop_and_undo(&mut app, &tx);
+                assert!(rx.try_recv().is_err()); // no busy-loop retries on an absent volume
+                let offline = root.join("offline-output");
+                assert!(offline.join(record.temp_artifacts[0].path.file_name().unwrap()).is_dir());
+                // Reattach and exercise the existing keyboard Tidy up action
+                // in the SAME application instance, without restarting it.
+                fs::rename(&offline, root.join("output")).unwrap();
+                recovery_ui::open_recovery_window(&mut app);
+                use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+                recovery_ui::handle_key(&mut app, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE), &tx);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                loop {
+                    match rx.try_recv() {
+                        Ok(AppMessage::RecoveryDiscardComplete { journal_path, result }) => {
+                            assert!(result.is_ok(), "{result:?}");
+                            recovery_ui::complete_discard(&mut app, journal_path, result); break;
+                        }
+                        Ok(_) | Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {},
+                        Err(error) => panic!("Tidy up channel: {error}"),
+                    }
+                    assert!(std::time::Instant::now() < deadline, "Tidy up did not finish after reattachment");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+            assert_no_fallback_journals();
+            return;
+        }
+        struct Child(std::process::Child);
+        impl Drop for Child { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+        for kind in ["image", "audio"] {
+            for phase in ["registered", "writing", "prepared", "published"] {
+                let d = tempfile::tempdir().unwrap(); let root = d.path();
+                let (album, output, audio, image) = fallback_fixture(root);
+                let before_album = directory_names(&album); let before_output = directory_names(&output);
+                let old_audio = fs::read(&audio).unwrap(); let old_image = fs::read(&image).unwrap();
+                let mut writer = Child(fallback_child(root, TEST, "write")
+                    .env("TONEPOET_EDIT_IMAGE_FALLBACK_KIND", kind)
+                    .env("TONEPOET_EDIT_IMAGE_FALLBACK_PHASE", phase).spawn().unwrap());
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !root.join("ready").is_file() {
+                    assert!(writer.0.try_wait().unwrap().is_none(), "{kind}/{phase} writer exited early");
+                    assert!(std::time::Instant::now() < deadline, "{kind}/{phase} checkpoint timeout");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                let stage = PathBuf::from(fs::read_to_string(root.join("ready")).unwrap());
+                let mut expected_album = before_album.clone(); let mut expected_output = before_output.clone();
+                if phase == "registered" { assert!(!stage.exists()); }
+                else {
+                    assert!(stage.is_dir());
+                    if kind == "audio" { expected_album.insert(stage.file_name().unwrap().to_owned()); }
+                    else { expected_output.insert(stage.file_name().unwrap().to_owned()); }
+                }
+                assert_eq!(directory_names(&album), expected_album); assert_eq!(directory_names(&output), expected_output);
+                let expected_image = if kind == "image" && phase == "published" { fs::read(root.join("new.png")).unwrap() } else { old_image };
+                let expected_audio = if kind == "audio" && phase == "published" {
+                    let bytes = fs::read(&audio).unwrap(); assert_eq!(flac_payload(&bytes), flac_payload(&old_audio));
+                    let (sources, i) = pictures(&audio).unwrap();
+                    assert_eq!(sources[i].bytes().unwrap(), fs::read(root.join("expected-picture")).unwrap()); bytes
+                } else { old_audio };
+                assert_eq!(fs::read(&audio).unwrap(), expected_audio); assert_eq!(fs::read(&image).unwrap(), expected_image);
+                writer.0.kill().unwrap(); assert!(!writer.0.wait().unwrap().success());
+                if kind == "image" && phase == "writing" {
+                    // The production endpoint check must not interpret a missing
+                    // anchor as evidence that its recorded staging is absent.
+                    let offline = root.join("offline-output"); fs::rename(&output, &offline).unwrap();
+                    assert!(fallback_child(root, TEST, "recover-unavailable").status().unwrap().success());
+                    assert!(!offline.exists());
+                } else {
+                    assert!(fallback_child(root, TEST, "recover").status().unwrap().success(), "{kind}/{phase} recovery");
+                }
+                assert!(fallback_child(root, TEST, "recover-empty").status().unwrap().success(), "{kind}/{phase} repeated recovery");
+                assert_eq!(directory_names(&album), before_album); assert_eq!(directory_names(&output), before_output);
+                assert_eq!(fs::read(&audio).unwrap(), expected_audio); assert_eq!(fs::read(&image).unwrap(), expected_image);
+            }
+        }
+    }
+
+    // A real subprocess is killed after private staging, with no destructor
+    // or cancellation path available. Keep all fixture and coordination data
+    // inside a disposable test directory, not the application's real cache.
+    #[test]
+    fn private_publication_killed_process_keeps_user_files_intact() {
+        const CHILD_ROOT:&str="TONEPOET_EDIT_IMAGE_KILL_FIXTURE";
+        const CHILD_KIND:&str="TONEPOET_EDIT_IMAGE_KILL_KIND";
+        if let Some(root)=std::env::var_os(CHILD_ROOT) {
+            let root=PathBuf::from(root);let work=root.join("private");
+            let _coordination=crate::concurrency::install_test_coordination_root(&root.join("coordination"));
+            let audio=root.join("album/album.flac");let image=root.join("output/cover.png");
+            let stop=||->Result<(),String>{
+                fs::write(work.join("ready"),b"private stage ready").map_err(err)?;
+                loop {std::thread::park();}
+            };
+            with_test_stage_roots(Vec::new(),||{
+                match std::env::var(CHILD_KIND).unwrap().as_str() {
+                    "image"=>{
+                        write_image_with_commit(&image,b"new image bytes",true,Some(&audio),Some(&work),&||Ok(()),&stop).unwrap();
+                    },
+                    "audio"=>{
+                        let (sources,index)=pictures(&audio).unwrap();let source=&sources[index];
+                        let input=decode(source).unwrap();let mut settings=Settings::new(true);settings.mode=Mode::Off;
+                        settings.format=if input.format==Format::Png{Format::Jpeg}else{Format::Png};
+                        let encoded=encode(&input,&settings).unwrap();
+                        let cancel=super::super::probe::MetadataWriteCancelFlag::new();
+                        let check=||->Result<(),String>{
+                            // The last check follows the native rewrite and
+                            // validation of the private FLAC. Earlier checks
+                            // see either no stage, a partial copy, or the old
+                            // embedded picture. Stop only on the new picture.
+                            if let Ok(entries)=fs::read_dir(work.join("tonepoet-edit-image")) {
+                                for entry in entries.filter_map(Result::ok) {
+                                    let staged=entry.path().join("audio.flac");
+                                    if let Ok((p,i))=pictures(&staged) {
+                                        if p[i].bytes().is_ok_and(|bytes|bytes.as_slice()==encoded.bytes.as_slice()) {return stop();}
+                                    }
+                                }
+                            }
+                            Ok(())
+                        };
+                        reembed_checked(source,&encoded,Some(&image),Some(&work),&check,&cancel).unwrap();
+                    },
+                    kind=>panic!("unexpected kill fixture kind: {kind}"),
+                }
+            });
+            panic!("child passed the publication boundary without stopping");
+        }
+        // Do not strand a blocked subprocess if any parent assertion fails.
+        struct Child(std::process::Child);
+        impl Drop for Child {fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
+        for kind in ["image","audio"] {
+            let d=tempfile::tempdir().unwrap();let root=d.path();
+            let album=root.join("album");let output=root.join("output");let work=root.join("private");
+            for folder in [&album,&output,&work]{fs::create_dir(folder).unwrap();}
+            let audio=album.join("album.flac");let image=output.join("cover.png");
+            fs::write(&audio,include_bytes!("../../tests/fixtures/browse_artwork/embedded_valid.flac")).unwrap();
+            fs::write(&image,b"old image bytes").unwrap();
+            fs::write(album.join(".keep"),b"album keep").unwrap();fs::write(output.join(".keep"),b"output keep").unwrap();
+            let album_set=directory_names(&album);let output_set=directory_names(&output);let original=fs::read(&audio).unwrap();
+            let assert_unchanged=||{
+                assert_eq!(directory_names(&album),album_set);assert_eq!(directory_names(&output),output_set);
+                assert_eq!(fs::read(&audio).unwrap(),original);assert_eq!(fs::read(&image).unwrap(),b"old image bytes");
+            };
+            let mut child=Child(std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact").arg("tui::edit_image_pipeline::tests::private_publication_killed_process_keeps_user_files_intact")
+                .arg("--nocapture").env(CHILD_ROOT,root).env(CHILD_KIND,kind).stdin(std::process::Stdio::null()).spawn().unwrap());
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(30);
+            while !work.join("ready").is_file() {
+                assert!(child.0.try_wait().unwrap().is_none(),"{kind} child exited before staging");
+                assert!(std::time::Instant::now()<deadline,"{kind} child did not reach staging boundary");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(!directory_names(&work.join("tonepoet-edit-image")).is_empty());
+            assert_unchanged();
+            child.0.kill().unwrap();assert!(!child.0.wait().unwrap().success());
+            assert_unchanged();
+        }
+    }
+
     #[test]
     fn exif_orientation_is_normalized_without_relocating_other_fields() {
         let mut exif=vec![b'I',b'I',42,0,8,0,0,0,1,0,0x12,1,3,0,1,0,0,0,6,0,0,0,0,0,0,0];

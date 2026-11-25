@@ -56529,6 +56529,94 @@ fn restore_discarded_native_rename(
     Ok(true)
 }
 
+/// Remove one exact journal-owned artifact using the same endpoint and
+/// namespace checks during ordinary worker exit and interrupted recovery.
+fn clean_recorded_temp_artifact(
+    handle: &super::file_task_runtime::FileTaskJournalHandle,
+    record: &super::file_task_runtime::DurableFileTaskRecord,
+    endpoints: &mut FileTaskEndpointVerificationCache<'_>,
+    artifact: &super::file_task_runtime::DurableTempArtifact,
+) -> Result<bool, String> {
+    verify_recovery_destination(endpoints, &artifact.destination)?;
+    if !artifact.is_safe_private_artifact(&record.job_id) {
+        return Err(format!(
+            "The incomplete file at {} no longer matches the reviewed operation; discard stopped without deleting it.",
+            artifact.path.display()
+        ));
+    }
+    let existed = match std::fs::symlink_metadata(&artifact.path) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(format!(
+                "Could not inspect incomplete output {}: {error}",
+                artifact.path.display()
+            ))
+        }
+    };
+    remove_derived_private_artifact(&artifact.path, artifact.kind).map_err(|error| {
+        log::warn!(
+            "interrupted-operation discard could not remove {}: {error}",
+            artifact.path.display()
+        );
+        format!("Could not delete incomplete output {}.", artifact.path.display())
+    })?;
+    // On a removable endpoint, NotFound is not proof of absence if the
+    // mount detached between the initial identity check and deletion.
+    // Recheck rather than using the cached result before retiring the
+    // Edit Image obligation. Recovery can retry after reattachment.
+    if record.is_edit_image_cleanup() {
+        let endpoint = destination_endpoint_identity(record, &artifact.destination)
+            .ok_or("Edit Image cleanup has no recorded destination endpoint")?;
+        verify_file_task_endpoint_attached(endpoint)?;
+        match std::fs::symlink_metadata(&artifact.path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Ok(_) => return Err(format!("Edit Image staging still exists at {}", artifact.path.display())),
+            Err(error) => return Err(format!("Could not confirm Edit Image staging removal at {}: {error}", artifact.path.display())),
+        }
+        // Match the journal's best-available directory durability convention:
+        // some removable/network filesystems cannot sync directories. The
+        // attached-volume and exact-absence checks remain authoritative.
+        if let Err(error) = crate::config::sync_parent_dir(&endpoint.anchor_path) {
+            log::warn!("Edit Image staging removed; directory flush for {} failed: {error}", endpoint.anchor_path.display());
+        }
+        verify_file_task_endpoint_attached(endpoint)?;
+    }
+    handle
+        .clear_recovered_temp_artifact(&artifact.path)
+        .map_err(|error| log_recovery_discard_persistence_failure("deleting an incomplete file", &error))?;
+    Ok(existed)
+}
+
+/// Called only after the Edit Image worker has closed its staged files and
+/// finished all possible writes. The live lease prevents startup/Tidy from
+/// cleaning the same directory under the worker. A failure leaves the exact
+/// durable obligation for the existing recovery surface.
+pub(super) fn finish_edit_image_stage(
+    handle: super::file_task_runtime::FileTaskJournalHandle,
+) -> Result<usize, String> {
+    let record = handle.load()?;
+    if !record.is_edit_image_cleanup() || !record.quarantine_artifacts.is_empty()
+        || !record.native_rename_intents.is_empty() || !record.mappings.is_empty()
+    {
+        return Err("refused non-cleanup Edit Image recovery record".into());
+    }
+    let mut endpoints = FileTaskEndpointVerificationCache::new(&record);
+    let mut removed = 0usize;
+    for artifact in &record.temp_artifacts {
+        if artifact.kind != super::file_task_runtime::DurableTempArtifactKind::Directory
+            || artifact.owner_generation != record.generation
+        {
+            return Err("invalid Edit Image staging cleanup obligation".into());
+        }
+        if clean_recorded_temp_artifact(&handle, &record, &mut endpoints, artifact)? {
+            removed += 1;
+        }
+    }
+    super::file_task_runtime::commit_recovery_discard(handle)?;
+    Ok(removed)
+}
+
 /// Apply the explicitly reviewed discard semantics for one interrupted copy or
 /// move. The durable runtime acquires and revalidates the exact record revision;
 /// this worker then reuses the normal transfer endpoint and filesystem safety
@@ -56553,6 +56641,13 @@ pub(super) fn discard_file_transfer_recovery(
         }
     };
 
+    if record.is_edit_image_cleanup() {
+        let released_paths = super::file_task_runtime::recovery_blocked_path_count(&record);
+        let deleted_incomplete = finish_edit_image_stage(handle)?;
+        return Ok(super::file_task_runtime::RecoveryDiscardSummary {
+            released_paths, deleted_incomplete, ..Default::default()
+        });
+    }
     if record.is_native_extraction() {
         // Native outputs are already committed, never rollback candidates.
         // Only exact journal-owned, hidden publication copies can be removed.
@@ -56571,35 +56666,8 @@ pub(super) fn discard_file_transfer_recovery(
     };
     let mut endpoints = FileTaskEndpointVerificationCache::new(&record);
 
-    for artifact in record.temp_artifacts.iter().cloned() {
-        verify_recovery_destination(&mut endpoints, &artifact.destination)?;
-        if !artifact.is_safe_private_artifact(&record.job_id) {
-            return Err(format!(
-                "The incomplete file at {} no longer matches the reviewed operation; discard stopped without deleting it.",
-                artifact.path.display()
-            ));
-        }
-        let existed = match std::fs::symlink_metadata(&artifact.path) {
-            Ok(_) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => {
-                return Err(format!(
-                    "Could not inspect incomplete output {}: {error}",
-                    artifact.path.display()
-                ))
-            }
-        };
-        remove_derived_private_artifact(&artifact.path, artifact.kind).map_err(|error| {
-            log::warn!(
-                "interrupted-operation discard could not remove {}: {error}",
-                artifact.path.display()
-            );
-            format!("Could not delete incomplete output {}.", artifact.path.display())
-        })?;
-        handle
-            .clear_recovered_temp_artifact(&artifact.path)
-            .map_err(|error| log_recovery_discard_persistence_failure("deleting an incomplete file", &error))?;
-        if existed {
+    for artifact in &record.temp_artifacts {
+        if clean_recorded_temp_artifact(&handle, &record, &mut endpoints, artifact)? {
             summary.deleted_incomplete = summary.deleted_incomplete.saturating_add(1);
         }
     }
@@ -64156,7 +64224,7 @@ fn capture_file_task_endpoint_volume(
     SystemFileTaskEndpointIdentityProvider.capture(anchor)
 }
 
-fn capture_file_task_endpoint_identity(
+pub(super) fn capture_file_task_endpoint_identity(
     role: super::file_task_runtime::DurableEndpointRole,
     operation_root: &std::path::Path,
     anchor_start: &std::path::Path,
@@ -64328,7 +64396,7 @@ fn verify_file_task_endpoint_attached_with<P: FileTaskEndpointIdentityProvider>(
     })
 }
 
-fn verify_file_task_endpoint_attached(
+pub(super) fn verify_file_task_endpoint_attached(
     endpoint: &super::file_task_runtime::DurableEndpointIdentity,
 ) -> Result<(), String> {
     verify_file_task_endpoint_attached_with(&SystemFileTaskEndpointIdentityProvider, endpoint)
@@ -64632,7 +64700,7 @@ fn copy_file_task_linux_xattrs(
 
 
 #[cfg(unix)]
-fn create_private_file_task_directory(path: &std::path::Path) -> std::io::Result<()> {
+pub(super) fn create_private_file_task_directory(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
 
     let mut builder = std::fs::DirBuilder::new();
@@ -64641,7 +64709,7 @@ fn create_private_file_task_directory(path: &std::path::Path) -> std::io::Result
 }
 
 #[cfg(not(unix))]
-fn create_private_file_task_directory(path: &std::path::Path) -> std::io::Result<()> {
+pub(super) fn create_private_file_task_directory(path: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir(path)
 }
 

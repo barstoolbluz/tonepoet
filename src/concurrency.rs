@@ -3358,7 +3358,7 @@ pub fn coordination_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".tonepoet-concurrency-v1"))
 }
 
-fn create_private_dir(path: &Path) -> Result<(), String> {
+pub(crate) fn create_private_dir(path: &Path) -> Result<(), String> {
     std::fs::create_dir_all(path).map_err(|e| format!("create coordination directory {}: {e}", path.display()))?;
     #[cfg(unix)]
     {

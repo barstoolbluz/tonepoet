@@ -18516,6 +18516,13 @@ impl AppState {
             }
             _ => {}
         }
+        let edit_cleanup_pending = match &mut self.active_overlay {
+            ActiveOverlay::EditImage(state) => std::mem::take(&mut state.cleanup_pending),
+            _ => false,
+        };
+        if edit_cleanup_pending {
+            crate::tui::recovery_ui::refresh_from_runtime(self);
+        }
         let finished_edit = match &mut self.active_overlay {
             ActiveOverlay::EditImage(state) => state.finished.take().map(|status| (status, state.wrote)),
             _ => None,
