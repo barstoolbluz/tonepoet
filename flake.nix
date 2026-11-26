@@ -174,7 +174,6 @@
 
           nativeBuildInputs = nativeBuildInputs ++ [
             pkgs.makeWrapper
-            pkgs.llvmPackages.libclang
             pkgs.clang
           ];
           buildInputs = buildInputs ++ [ referenceFfmpeg ];
@@ -212,7 +211,6 @@
             cargo-watch
             cargo-edit
             rust-analyzer
-            llvmPackages.libclang
             clang
           ]);
 
