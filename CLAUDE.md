@@ -15,7 +15,7 @@ nix develop --extra-experimental-features 'nix-command flakes'
 # Inside the dev shell:
 cargo build                  # Debug build
 cargo build --release        # Release build
-cargo test --workspace --no-fail-fast --exclude tonepoet-true-peak   # THE GATE
+cargo test --workspace --no-fail-fast --exclude true-peak   # THE GATE
                              # RUN IT IN THE BACKGROUND. It outruns the 600s Bash
                              # foreground timeout; a foreground run dies mid-suite
                              # and reports a misleadingly CLEAN partial result.
@@ -27,7 +27,7 @@ cargo test --workspace --no-fail-fast --exclude tonepoet-true-peak   # THE GATE
                              # rare coordination-contention flake.
 cargo test -p tonepoet-backend   # Backend tests only
 cargo test -p tonepoet-features  # Features tests only
-cargo test -p tonepoet-true-peak # True-peak + loudness core (~30 s on this AVX2 box;
+cargo test -p true-peak # True-peak + loudness core (~30 s on this AVX2 box;
                              #   ~41 min on the old pre-AVX2 Xeon — see ## The true-peak crate)
 cargo check                  # Fast type check
 
@@ -42,7 +42,7 @@ cargo run -- config
 nix build --extra-experimental-features 'nix-command flakes'
 ```
 
-**Do not use the system Rust toolchain.** The root `Cargo.toml` declares `rust-version = "1.82"` but `crates/tonepoet-true-peak` declares `1.93`, so the effective workspace MSRV is **1.93** — above the system toolchain. Always build inside `nix develop`, which supplies the pinned toolchain.
+**Do not use the system Rust toolchain.** The true-peak crate declares `rust-version = "1.95"` (Rust 1.93 and 1.94 crash compiling it in release), so the effective workspace MSRV is **1.95** — above the system toolchain. The flake pins Rust 1.99.1. Always build inside `nix develop`, which supplies the pinned toolchain.
 
 ## Workspace Structure
 
@@ -140,6 +140,17 @@ tonepoet (main binary + lib)
 ```
 
 ## The true-peak crate (`crates/tonepoet-true-peak`)
+
+**It is a git submodule.** The crate lives in its own repository
+(`barstoolbluz/true-peak`), is published as the package `true-peak`, and sits here as a
+submodule at `crates/tonepoet-true-peak`. TonePoet's `Cargo.toml` keeps the alias
+`tonepoet-true-peak`, so code here still writes `use tonepoet_true_peak::…`, while cargo
+commands name the package: `-p true-peak`, `--exclude true-peak`. Clone with
+`--recursive`, or run `git submodule update --init`. A change to the crate is a commit in
+that repository first, then a commit here moving the submodule pointer; push the crate
+before pushing TonePoet. `build.rs` hashes the crate's `src` and `Cargo.toml` at this
+path, so moving the pointer makes Reference requalification owed. `git archive` leaves
+submodules out, so bundles need the crate's files added by hand.
 
 **160 passed / 0 failed** (was 136 before the portable-Reference dispatch-tier work added
 24). Runtime is hardware-dependent and the spread is enormous: **~30 s on this
@@ -311,7 +322,7 @@ behind it.
 # THE GATE. Run it exactly like this, IN THE BACKGROUND: it runs well past the Bash
 # foreground timeout of 600s, and a foreground run dies mid-suite reporting a
 # misleadingly clean partial result. (~10 min of test execution plus build time.)
-cargo test --workspace --no-fail-fast --exclude tonepoet-true-peak
+cargo test --workspace --no-fail-fast --exclude true-peak
 
 # --no-fail-fast: without it, --workspace STOPS at the first failing test binary and
 #   every later target silently never runs.
@@ -331,15 +342,15 @@ cargo test --workspace --no-fail-fast --exclude tonepoet-true-peak
 #   (convert::processor::tests::the_name) and check the run says "1 passed",
 #   not "0 passed". A triage built on bare-name filters concluded two real
 #   regressions were flakes.
-# --exclude tonepoet-true-peak: that crate costs ~41 min on its own. Gate it separately
-#   at crate-delivery time:  cargo test -p tonepoet-true-peak --no-fail-fast
+# --exclude true-peak: that crate costs ~41 min on its own. Gate it separately
+#   at crate-delivery time:  cargo test -p true-peak --no-fail-fast
 
 cargo test -p tonepoet --lib       # root-crate unit tests only (~5,826; ~31s after build)
                                    #   the usual home of a real failure; the gate's
                                    #   biggest target by far
 cargo test -p tonepoet-backend     # ffmpeg builders, integration, channels
 cargo test -p tonepoet-features    # log writer, CUE generator
-cargo test -p tonepoet-true-peak   # BS.1770 true-peak + loudness core (~41 min)
+cargo test -p true-peak   # BS.1770 true-peak + loudness core (~41 min)
 ```
 
 Tests are in `crates/*/tests/` directories, `src/` (inline `#[cfg(test)]` modules), and `tests/` (integration/contract/sentinel tests). The workspace suite is ~7,210 tests across 57 targets, plus 160 in `tonepoet-true-peak`.
@@ -431,7 +442,7 @@ A failure that survives running the test alone is real. A failure that disappear
 isolation, with one of the messages above, is this known flake — rerun, and do not
 "fix" it by serializing the suite or relaxing a lock.
 
-`cargo test -p tonepoet-true-peak` is separate and IS at 160/0.
+`cargo test -p true-peak` is separate and IS at 160/0.
 
 Superseded 2026-09-29: the three deferred hard-ceiling failures now pass; the
 "persistent lease descriptor exceeds 1048576 bytes" flake was fixed by the schema-3

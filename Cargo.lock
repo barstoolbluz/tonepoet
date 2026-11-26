@@ -2795,8 +2795,8 @@ dependencies = [
  "tonepoet-backend",
  "tonepoet-features",
  "tonepoet-pipeline",
- "tonepoet-true-peak",
  "tonepoet-wizard",
+ "true-peak",
  "tui-file-picker",
  "uuid",
  "walkdir",
@@ -2842,13 +2842,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
-]
-
-[[package]]
-name = "tonepoet-true-peak"
-version = "0.1.0"
-dependencies = [
- "num-complex",
 ]
 
 [[package]]
@@ -2934,6 +2927,13 @@ checksum = "1ad61aed86bc3faea4300c7aee358b4c6d0c8d6ccc36524c96e4c92ccf26e77e"
 dependencies = [
  "num-integer",
  "strength_reduce",
+]
+
+[[package]]
+name = "true-peak"
+version = "0.1.0"
+dependencies = [
+ "num-complex",
 ]
 
 [[package]]

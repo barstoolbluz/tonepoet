@@ -2,6 +2,9 @@
   description = "tonepoet - standalone CLI + TUI audio conversion toolkit";
 
   inputs = {
+    # crates/tonepoet-true-peak is a git submodule; without this the flake's
+    # source leaves it out and the sandboxed build finds an empty directory.
+    self.submodules = true;
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay = {

@@ -13,12 +13,12 @@ license = "GPL-3.0-or-later"
 # tonepoet-true-peak is qualified with a single release codegen unit. Cargo
 # ignores profile settings declared in workspace member manifests, so keep the
 # integrated override here rather than widening the setting to every package.
-[profile.release.package.tonepoet-true-peak]
+[profile.release.package.true-peak]
 codegen-units = 1
 
 [dependencies]
 tonepoet-pipeline = { path = "tonepoet-pipeline", features = ["serde"] }
-tonepoet-true-peak = { path = "crates/tonepoet-true-peak" }
+tonepoet-true-peak = { package = "true-peak", path = "crates/tonepoet-true-peak" }
 fs2 = "0.4"
 same-file = "1"
 tonepoet-backend = { path = "crates/tonepoet-backend" }
